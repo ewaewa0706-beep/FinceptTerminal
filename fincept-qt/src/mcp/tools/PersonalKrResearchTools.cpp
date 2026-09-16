@@ -129,6 +129,29 @@ std::vector<ToolDef> get_personal_kr_research_tools() {
         tools.push_back(std::move(t));
     }
 
+    // ── kr_llm_smoke ───────────────────────────────────────────────────
+    {
+        ToolDef t;
+        t.name = "kr_llm_smoke";
+        t.description = "Verify the currently active Fincept LLM profile can complete a Personal-KR request. "
+                        "Credentials are passed to the child process over stdin only and are never returned.";
+        t.category = "equity-research";
+        t.default_timeout_ms = kProviderTimeoutMs;
+        t.supports_async = true;
+        t.auth_required = AuthLevel::Authenticated;
+        t.async_handler = [](const QJsonObject&, ToolContext ctx,
+                             std::shared_ptr<QPromise<ToolResult>> promise) {
+            const QJsonObject llm = fincept::services::equity::personal_kr_active_llm_config();
+            if (llm.isEmpty()) {
+                promise->addResult(ToolResult::fail("No active Fincept LLM profile is configured"));
+                promise->finish();
+                return;
+            }
+            run_kr_tool({"llm-smoke"}, QJsonObject{{"llm", llm}}, ctx, promise);
+        };
+        tools.push_back(std::move(t));
+    }
+
     // ── kr_select_top_candidates ────────────────────────────────────────
     {
         ToolDef t;

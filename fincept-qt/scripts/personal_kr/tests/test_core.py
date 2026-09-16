@@ -178,7 +178,8 @@ class CoreTests(unittest.TestCase):
                 return MacroSnapshot(as_of, "ECOS", {})
 
         kst = timezone(timedelta(hours=9))
-        cutoff = datetime(2026, 8, 20, 10, 0, tzinfo=kst)
+        # Still conservatively pre-final even on a delayed-close special session.
+        cutoff = datetime(2026, 8, 20, 16, 45, tzinfo=kst)
         candidate = QuantCandidate(
             self.instrument,
             date(2026, 8, 20),
@@ -479,6 +480,7 @@ class CoreTests(unittest.TestCase):
         class FakeKis:
             def daily_bars(self, instrument, as_of, lookback_days=120, *, price_mode="original"):
                 self.price_mode = price_mode
+                self.as_of = as_of
                 return MarketSnapshot(
                     instrument,
                     as_of,
@@ -492,13 +494,129 @@ class CoreTests(unittest.TestCase):
         with patch.object(cli, "_store", return_value=FakeStore()), patch.object(
             cli.KisClient, "from_env", return_value=fake_kis
         ), patch.object(cli, "load_yahoo_benchmark", return_value=()), patch.object(
-            cli, "_korea_today", return_value=date(2026, 9, 16)
+            cli,
+            "_korea_now",
+            return_value=datetime(2026, 9, 16, 16, 45, tzinfo=timezone(timedelta(hours=9))),
         ):
             result = cli.cmd_evaluate(args)
 
         self.assertEqual(fake_kis.price_mode, "adjusted")
+        self.assertEqual(fake_kis.as_of, date(2026, 9, 15))
         self.assertEqual(result["outcomes"], [])
         self.assertEqual(result["pending_horizons"], [1, 5])
+
+    def test_llm_smoke_uses_supplied_active_profile_over_stdin_contract(self):
+        class FakeLlm:
+            provider = "openai"
+            model = "gpt-test"
+
+            def complete(self, system, user):
+                self.call = (system, user)
+                return "FINCEPT_KR_LLM_OK"
+
+        fake = FakeLlm()
+        config = {"provider": "openai", "model_id": "gpt-test", "api_key": "secret"}
+        with patch.object(cli, "_optional_input_json", return_value={"llm": config}), patch.object(
+            cli, "llm_from_payload", return_value=fake
+        ) as factory:
+            result = cli.cmd_llm_smoke()
+
+        factory.assert_called_once_with(config)
+        self.assertEqual(result["provider"], "openai")
+        self.assertEqual(result["model"], "gpt-test")
+        self.assertEqual(result["source"], "fincept_active_profile")
+        self.assertEqual(result["response"], "FINCEPT_KR_LLM_OK")
+
+    def test_llm_smoke_tty_falls_back_without_reading_stdin(self):
+        class TtyOnly:
+            def isatty(self):
+                return True
+
+        class FakeLlm:
+            provider = "google"
+            model = "gemini-test"
+
+            def complete(self, system, user):
+                return "FINCEPT_KR_LLM_OK"
+
+        with patch.object(cli.sys, "stdin", TtyOnly()), patch.object(
+            cli, "llm_from_payload", return_value=FakeLlm()
+        ) as factory:
+            result = cli.cmd_llm_smoke()
+
+        factory.assert_called_once_with(None)
+        self.assertEqual(result["source"], "headless_google_env")
+        self.assertEqual(result["provider"], "google")
+
+    def test_cli_evaluate_admits_current_daily_bar_only_after_finality_cutoff(self):
+        decision = ResearchResult(
+            candidate=QuantCandidate(Instrument("005930", "삼성전자", "KOSPI"), date(2026, 9, 15), 90, 1),
+            signal="Hold",
+            market_report="m",
+            fundamentals_report="f",
+            news_macro_report="n",
+            bull_case="b+",
+            bear_case="b-",
+            research_manager="r",
+            trader="t",
+            risk_manager="risk",
+            portfolio_manager="SIGNAL: HOLD",
+            decision_id="decision-finality",
+        )
+
+        class FakeStore:
+            def __init__(self):
+                self.recorded = []
+
+            def get_decision(self, decision_id):
+                return decision if decision_id == "decision-finality" else None
+
+            def record_outcome(self, outcome):
+                self.recorded.append(outcome)
+                return outcome
+
+        class FakeKis:
+            def daily_bars(self, instrument, as_of, lookback_days=120, *, price_mode="original"):
+                self.as_of = as_of
+                return MarketSnapshot(
+                    instrument,
+                    as_of,
+                    (
+                        OHLCVBar(date(2026, 9, 15), 100, 101, 99, 100, 1000),
+                        OHLCVBar(date(2026, 9, 16), 101, 103, 100, 102, 1200),
+                    ),
+                    "KIS",
+                    price_mode,
+                )
+
+        benchmark = (
+            OHLCVBar(date(2026, 9, 15), 100, 101, 99, 100, 1000),
+            OHLCVBar(date(2026, 9, 16), 100, 102, 99, 101, 1000),
+        )
+        store = FakeStore()
+        fake_kis = FakeKis()
+        benchmark_end = []
+
+        def fake_benchmark(symbol, start, end):
+            benchmark_end.append(end)
+            return benchmark
+
+        args = SimpleNamespace(decision_id="decision-finality", horizons=[1])
+        with patch.object(cli, "_store", return_value=store), patch.object(
+            cli.KisClient, "from_env", return_value=fake_kis
+        ), patch.object(cli, "load_yahoo_benchmark", side_effect=fake_benchmark), patch.object(
+            cli,
+            "_korea_now",
+            return_value=datetime(2026, 9, 16, 17, 5, tzinfo=timezone(timedelta(hours=9))),
+        ):
+            result = cli.cmd_evaluate(args)
+
+        self.assertEqual(fake_kis.as_of, date(2026, 9, 16))
+        self.assertEqual(benchmark_end, [date(2026, 9, 16)])
+        self.assertEqual(result["pending_horizons"], [])
+        self.assertEqual(len(result["outcomes"]), 1)
+        self.assertEqual(result["outcomes"][0].end_date, date(2026, 9, 16))
+        self.assertEqual(len(store.recorded), 1)
 
     def test_http_retries_500_then_succeeds(self):
         calls = []
@@ -700,6 +818,66 @@ class CoreTests(unittest.TestCase):
             base["stock_source"] = ""
             with self.assertRaisesRegex(ValueError, "stock_source provenance is required"):
                 store.record_outcome(Outcome(**base))
+
+    def test_outcome_requires_finalized_daily_endpoint(self):
+        from personal_kr.evaluation import Outcome
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DecisionStore(Path(tmp) / "kr.db")
+            candidate = QuantCandidate(
+                Instrument("005930", "삼성전자", "KOSPI"),
+                date(2026, 9, 15),
+                90,
+                1,
+            )
+            decision = store.record_decision(
+                ResearchResult(
+                    candidate=candidate,
+                    signal="Hold",
+                    market_report="m",
+                    fundamentals_report="f",
+                    news_macro_report="n",
+                    bull_case="b+",
+                    bear_case="b-",
+                    research_manager="r",
+                    trader="t",
+                    risk_manager="risk",
+                    portfolio_manager="SIGNAL: HOLD",
+                )
+            )
+            base = dict(
+                decision_id=decision.decision_id or "",
+                horizon=1,
+                start_date=date(2026, 9, 16),
+                end_date=date(2026, 9, 16),
+                raw_return=0.01,
+                benchmark_return=0.005,
+                alpha_return=0.005,
+                max_gain=0.02,
+                max_drawdown=-0.01,
+                stock_ticker="005930",
+                stock_source="KIS",
+                stock_price_mode="adjusted",
+                benchmark_symbol="^KS11",
+                benchmark_source="Yahoo Finance",
+                benchmark_price_mode="raw_close",
+                stock_input_hash="a" * 64,
+                benchmark_input_hash="b" * 64,
+            )
+            kst = timezone(timedelta(hours=9))
+            with self.assertRaisesRegex(ValueError, "not finalized"):
+                store.record_outcome(
+                    Outcome(**base, evaluated_at=datetime(2026, 9, 16, 16, 45, tzinfo=kst))
+                )
+            with self.assertRaisesRegex(ValueError, "later than evaluated_at"):
+                store.record_outcome(
+                    Outcome(**base, evaluated_at=datetime(2026, 9, 15, 17, 0, tzinfo=kst))
+                )
+
+            recorded = store.record_outcome(
+                Outcome(**base, evaluated_at=datetime(2026, 9, 16, 17, 5, tzinfo=kst))
+            )
+            self.assertEqual(recorded.end_date, date(2026, 9, 16))
 
     def test_decision_first_write_wins_and_paper_guards(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1045,6 +1223,250 @@ class CoreTests(unittest.TestCase):
             self.assertEqual((quarantine, active), (1, 0))
             self.assertEqual(info["client_trade_id"][3], 1)
             self.assertEqual(info["decision_id"][3], 1)
+
+    def test_legacy_paper_migration_quarantines_duplicate_and_malformed_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "legacy-paper-invalid.db"
+            seed = DecisionStore(path, initial_cash=10_000)
+            decision = seed.record_decision(
+                ResearchResult(
+                    candidate=self.candidate,
+                    signal="Hold",
+                    market_report="m",
+                    fundamentals_report="f",
+                    news_macro_report="n",
+                    bull_case="b+",
+                    bear_case="b-",
+                    research_manager="r",
+                    trader="t",
+                    risk_manager="risk",
+                    portfolio_manager="SIGNAL: HOLD",
+                )
+            )
+            decision_id = decision.decision_id or ""
+            paper_date = datetime.now(timezone(timedelta(hours=9))).date().isoformat()
+
+            conn = sqlite3.connect(path)
+            conn.execute("DROP TABLE kr_paper_trades")
+            conn.execute(
+                """
+                CREATE TABLE kr_paper_trades(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    client_trade_id TEXT,
+                    decision_id TEXT,
+                    trade_date TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    quantity REAL NOT NULL,
+                    price REAL NOT NULL,
+                    fee REAL NOT NULL DEFAULT 0,
+                    tax REAL NOT NULL DEFAULT 0
+                )
+                """
+            )
+            conn.executemany(
+                """
+                INSERT INTO kr_paper_trades
+                    (client_trade_id,decision_id,trade_date,ticker,side,quantity,price,fee,tax)
+                VALUES(?,?,?,?,?,?,?,?,?)
+                """,
+                [
+                    ("legacy-valid", decision_id, paper_date, "005930", "BUY", 1, 100, 0, 0),
+                    ("legacy-valid", decision_id, paper_date, "005930", "BUY", 1, 100, 0, 0),
+                    ("legacy-bad-side", decision_id, paper_date, "005930", "HOLD", 1, 100, 0, 0),
+                    ("legacy-bad-qty", decision_id, paper_date, "005930", "BUY", 1.5, 100, 0, 0),
+                ],
+            )
+            conn.commit()
+            conn.close()
+
+            upgraded = DecisionStore(path, initial_cash=10_000)
+            cash, positions = upgraded.paper_summary()
+            self.assertEqual(cash, 9_900)
+            self.assertEqual(positions, {"005930": 1})
+
+            check = sqlite3.connect(path)
+            active = check.execute("SELECT COUNT(*) FROM kr_paper_trades").fetchone()[0]
+            reasons = [row[0] for row in check.execute("SELECT reason FROM kr_paper_trade_quarantine ORDER BY quarantine_id")]
+            stale = check.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='kr_paper_trades_strict'"
+            ).fetchone()[0]
+            info = {row[1]: row for row in check.execute("PRAGMA table_info(kr_paper_trades)")}
+            check.close()
+            self.assertEqual(active, 1)
+            self.assertEqual(len(reasons), 3)
+            self.assertTrue(any("duplicate client_trade_id" in reason for reason in reasons))
+            self.assertTrue(any("invalid paper trade" in reason for reason in reasons))
+            self.assertEqual(stale, 0)
+            self.assertEqual(info["client_trade_id"][3], 1)
+            self.assertEqual(info["decision_id"][3], 1)
+
+            reopened = DecisionStore(path, initial_cash=10_000)
+            self.assertEqual(reopened.paper_summary(), (9_900, {"005930": 1}))
+
+    def test_legacy_paper_migration_recovers_stranded_strict_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "legacy-paper-stranded.db"
+            seed = DecisionStore(path, initial_cash=10_000)
+            decision = seed.record_decision(
+                ResearchResult(
+                    candidate=self.candidate,
+                    signal="Hold",
+                    market_report="m",
+                    fundamentals_report="f",
+                    news_macro_report="n",
+                    bull_case="b+",
+                    bear_case="b-",
+                    research_manager="r",
+                    trader="t",
+                    risk_manager="risk",
+                    portfolio_manager="SIGNAL: HOLD",
+                )
+            )
+            decision_id = decision.decision_id or ""
+            paper_date = datetime.now(timezone(timedelta(hours=9))).date().isoformat()
+
+            conn = sqlite3.connect(path)
+            conn.execute("DROP TABLE kr_paper_trades")
+            conn.execute(
+                """
+                CREATE TABLE kr_paper_trades_strict(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    client_trade_id TEXT NOT NULL UNIQUE,
+                    decision_id TEXT NOT NULL,
+                    trade_date TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    side TEXT NOT NULL CHECK(side IN ('BUY','SELL')),
+                    quantity INTEGER NOT NULL CHECK(quantity > 0),
+                    price REAL NOT NULL CHECK(price > 0),
+                    fee REAL NOT NULL DEFAULT 0,
+                    tax REAL NOT NULL DEFAULT 0
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO kr_paper_trades_strict
+                    (client_trade_id,decision_id,trade_date,ticker,side,quantity,price,fee,tax)
+                VALUES(?,?,?,?,?,?,?,?,?)
+                """,
+                ("stranded-1", decision_id, paper_date, "005930", "BUY", 1, 100, 0, 0),
+            )
+            conn.commit()
+            conn.close()
+
+            recovered = DecisionStore(path, initial_cash=10_000)
+            self.assertEqual(recovered.paper_summary(), (9_900, {"005930": 1}))
+            check = sqlite3.connect(path)
+            stale = check.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='kr_paper_trades_strict'"
+            ).fetchone()[0]
+            active = check.execute("SELECT COUNT(*) FROM kr_paper_trades").fetchone()[0]
+            check.close()
+            self.assertEqual((stale, active), (0, 1))
+            self.assertEqual(DecisionStore(path, initial_cash=10_000).paper_summary(), (9_900, {"005930": 1}))
+
+    def test_strict_paper_ledger_reopen_does_not_revalidate_history_against_new_initial_cash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "strict-reopen.db"
+            store = DecisionStore(path, initial_cash=1_000)
+            decision = store.record_decision(
+                ResearchResult(
+                    candidate=self.candidate,
+                    signal="Hold",
+                    market_report="m",
+                    fundamentals_report="f",
+                    news_macro_report="n",
+                    bull_case="b+",
+                    bear_case="b-",
+                    research_manager="r",
+                    trader="t",
+                    risk_manager="risk",
+                    portfolio_manager="SIGNAL: HOLD",
+                )
+            )
+            paper_date = datetime.now(timezone(timedelta(hours=9))).date()
+            store.add_paper_trade(
+                trade_date=paper_date,
+                ticker="005930",
+                side="BUY",
+                quantity=1,
+                price=900,
+                decision_id=decision.decision_id,
+                client_trade_id="strict-history-1",
+            )
+
+            reopened = DecisionStore(path, initial_cash=500)
+            self.assertEqual(reopened.paper_summary(), (-400, {"005930": 1}))
+            check = sqlite3.connect(path)
+            active = check.execute("SELECT COUNT(*) FROM kr_paper_trades").fetchone()[0]
+            quarantine = check.execute("SELECT COUNT(*) FROM kr_paper_trade_quarantine").fetchone()[0]
+            check.close()
+            self.assertEqual((active, quarantine), (1, 0))
+
+    def test_concurrent_legacy_paper_initialization_is_serialized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "legacy-concurrent.db"
+            seed = DecisionStore(path, initial_cash=10_000)
+            decision = seed.record_decision(
+                ResearchResult(
+                    candidate=self.candidate,
+                    signal="Hold",
+                    market_report="m",
+                    fundamentals_report="f",
+                    news_macro_report="n",
+                    bull_case="b+",
+                    bear_case="b-",
+                    research_manager="r",
+                    trader="t",
+                    risk_manager="risk",
+                    portfolio_manager="SIGNAL: HOLD",
+                )
+            )
+            paper_date = datetime.now(timezone(timedelta(hours=9))).date().isoformat()
+            conn = sqlite3.connect(path)
+            conn.execute("DROP TABLE kr_paper_trades")
+            conn.execute(
+                """
+                CREATE TABLE kr_paper_trades(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    client_trade_id TEXT,
+                    decision_id TEXT,
+                    trade_date TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    price REAL NOT NULL,
+                    fee REAL NOT NULL DEFAULT 0,
+                    tax REAL NOT NULL DEFAULT 0
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO kr_paper_trades
+                    (client_trade_id,decision_id,trade_date,ticker,side,quantity,price)
+                VALUES(?,?,?,?,?,?,?)
+                """,
+                ("legacy-concurrent-1", decision.decision_id, paper_date, "005930", "BUY", 1, 100),
+            )
+            conn.commit()
+            conn.close()
+
+            def open_store(_: int):
+                opened = DecisionStore(path, initial_cash=10_000)
+                return opened.paper_summary()
+
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                summaries = list(pool.map(open_store, range(8)))
+
+            self.assertEqual(summaries, [(9_900, {"005930": 1})] * 8)
+            check = sqlite3.connect(path)
+            stale = check.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='kr_paper_trades_strict'"
+            ).fetchone()[0]
+            check.close()
+            self.assertEqual(stale, 0)
 
     def test_legacy_outcomes_without_provenance_are_quarantined_and_can_be_reevaluated(self):
         from personal_kr.evaluation import Outcome

@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 from personal_kr.http import HttpResponse, HttpStatusError
 from personal_kr.models import Instrument
-from personal_kr.providers import DartClient, EcosClient, KisClient, NaverNewsClient, _map_dart_accounts
+from personal_kr.providers import DartClient, EcosClient, KisClient, NaverNewsClient, _float, _map_dart_accounts
 
 
 class KisHttp:
@@ -190,6 +190,12 @@ class EcosErrorHttp:
 
 
 class ProviderContractTests(unittest.TestCase):
+    def test_provider_numeric_parser_rejects_non_finite_values(self):
+        self.assertIsNone(_float("NaN"))
+        self.assertIsNone(_float("Infinity"))
+        self.assertIsNone(_float("-Infinity"))
+        self.assertEqual(_float("1,234.5"), 1234.5)
+
     def setUp(self):
         self.instrument = Instrument("005930", "삼성전자", "KOSPI")
         self.kst = timezone(timedelta(hours=9))
@@ -291,6 +297,31 @@ class ProviderContractTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "later amendment"):
             client.fundamentals(self.instrument, date(2026, 3, 16))
 
+    def test_dart_requires_receipt_provenance_on_filing_and_every_financial_row(self):
+        class MissingReceiptHttp(DartHttp):
+            def __init__(self, *, missing_filing=False):
+                super().__init__()
+                self.missing_filing = missing_filing
+
+            def get_json(self, url, **kwargs):
+                payload = super().get_json(url, **kwargs)
+                if url.endswith("/list.json") and self.missing_filing:
+                    payload["list"][0].pop("rcept_no", None)
+                elif url.endswith("/fnlttSinglAcntAll.json"):
+                    payload["list"][0].pop("rcept_no", None)
+                    payload["list"][0]["thstrm_amount"] = "999999999"
+                return payload
+
+        with self.assertRaisesRegex(RuntimeError, "filing is missing receipt provenance"):
+            DartClient(
+                "dart", http=MissingReceiptHttp(missing_filing=True), base_url="https://dart.test/api"
+            ).fundamentals(self.instrument, date(2026, 3, 16))
+
+        with self.assertRaisesRegex(RuntimeError, "row is missing receipt provenance"):
+            DartClient("dart", http=MissingReceiptHttp(), base_url="https://dart.test/api").fundamentals(
+                self.instrument, date(2026, 3, 16)
+            )
+
     def test_dart_interim_income_statement_prefers_cumulative_amount(self):
         values = _map_dart_accounts(
             [
@@ -347,6 +378,67 @@ class ProviderContractTests(unittest.TestCase):
         )
         self.assertEqual([item.title for item in items], ["known before cutoff"])
 
+    def test_naver_fails_closed_when_api_window_cannot_reach_pre_cutoff_news(self):
+        kst = timezone(timedelta(hours=9))
+
+        class CeilingHttp:
+            def __init__(self):
+                self.starts = []
+
+            def get_json(self, url, **kwargs):
+                params = kwargs["params"]
+                start = int(params["start"])
+                display = int(params["display"])
+                self.starts.append(start)
+                return {
+                    "total": 2000,
+                    "items": [
+                        {
+                            "pubDate": format_datetime(datetime(2026, 9, 16, 14, 0, tzinfo=kst)),
+                            "title": f"too-new-{index}",
+                            "originallink": f"https://news/{start + index}",
+                        }
+                        for index in range(display)
+                    ],
+                }
+
+        http = CeilingHttp()
+        client = NaverNewsClient("id", "secret", http=http, now=lambda: self.now_kst)
+        with self.assertRaisesRegex(RuntimeError, "window exhausted"):
+            client.news(
+                self.instrument,
+                date(2026, 9, 16),
+                count=20,
+                cutoff_at=datetime(2026, 9, 16, 10, 0, tzinfo=kst),
+            )
+        self.assertEqual(http.starts, list(range(1, 1000, 100)))
+
+    def test_naver_declared_total_short_page_fails_closed(self):
+        kst = self.kst
+
+        class ShortPageHttp:
+            def get_json(self, url, **kwargs):
+                return {
+                    "total": 500,
+                    "items": [
+                        {
+                            "pubDate": format_datetime(datetime(2026, 9, 16, 9, 0, tzinfo=kst)),
+                            "title": f"item-{index}",
+                            "originallink": f"https://news/short-{index}",
+                        }
+                        for index in range(10)
+                    ],
+                }
+
+        client = NaverNewsClient("id", "secret", http=ShortPageHttp(), now=lambda: self.now_kst)
+        with self.assertRaisesRegex(RuntimeError, "declared result count"):
+            client.news(
+                self.instrument,
+                date(2026, 9, 16),
+                count=20,
+                cutoff_at=datetime(2026, 9, 16, 10, 0, tzinfo=self.kst),
+            )
+
     def test_naver_historical_news_fails_closed_without_vintage_snapshot(self):
         class MustNotCall:
             def get_json(self, url, **kwargs):
@@ -375,6 +467,64 @@ class ProviderContractTests(unittest.TestCase):
         self.assertIn("RuntimeError", snapshot.series_errors["usdkrw"])
         self.assertIn("one ECOS series unavailable", snapshot.series_errors["usdkrw"])
         self.assertLessEqual(snapshot.as_of, date(2026, 9, 16))
+
+    def test_ecos_paginates_declared_rows_before_selecting_latest_observation(self):
+        class PaginatedEcosHttp:
+            def __init__(self):
+                self.urls = []
+
+            def get_json(self, url, **kwargs):
+                self.urls.append(url)
+                parts = url.split("/")
+                # .../json/kr/{start}/{end}/{stat}/...
+                start = int(parts[-7])
+                rows = [
+                    {"TIME": f"2025{month:02d}{day:02d}", "DATA_VALUE": "1.0"}
+                    for month in range(1, 11)
+                    for day in range(1, 11)
+                ]
+                if start == 1:
+                    page = rows[:100]
+                elif start == 101:
+                    page = [
+                        {"TIME": "20260102", "DATA_VALUE": "2.0"}
+                    ] * 100
+                else:
+                    page = [
+                        {"TIME": "20260916", "DATA_VALUE": "1355.5"},
+                        {"TIME": "20260917", "DATA_VALUE": "9999"},
+                    ] + [
+                        {"TIME": "20260103", "DATA_VALUE": "3.0"}
+                    ] * 98
+                return {
+                    "StatisticSearch": {
+                        "list_total_count": 300,
+                        "row": page,
+                    }
+                }
+
+        http = PaginatedEcosHttp()
+        client = EcosClient("ecos", http=http, base_url="https://ecos.test")
+        point = client._series("731Y001", "D", "0000001", date(2026, 9, 16))
+        self.assertEqual(point, (date(2026, 9, 16), 1355.5))
+        self.assertEqual(len(http.urls), 3)
+        self.assertIn("/1/100/", http.urls[0])
+        self.assertIn("/101/200/", http.urls[1])
+        self.assertIn("/201/300/", http.urls[2])
+
+    def test_ecos_declared_total_premature_page_fails_closed(self):
+        class ShortEcosHttp:
+            def get_json(self, url, **kwargs):
+                return {
+                    "StatisticSearch": {
+                        "list_total_count": 250,
+                        "row": [{"TIME": "20260915", "DATA_VALUE": "2.5"}] * 50,
+                    }
+                }
+
+        client = EcosClient("ecos", http=ShortEcosHttp(), base_url="https://ecos.test")
+        with self.assertRaisesRegex(RuntimeError, "ended before all declared rows"):
+            client._series("731Y001", "D", "0000001", date(2026, 9, 16))
 
     def test_ecos_programming_error_is_not_downgraded_to_partial_series(self):
         client = EcosClient("ecos", http=EcosHttp(), base_url="https://ecos.test")

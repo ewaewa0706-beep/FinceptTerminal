@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import hashlib
 import json
+import math
 import os
 import re
 import time
@@ -32,9 +33,13 @@ def _float(value: Any) -> float | None:
     if value in (None, "", "-"):
         return None
     try:
-        return float(str(value).replace(",", ""))
+        parsed = float(str(value).replace(",", ""))
     except (TypeError, ValueError):
         return None
+    # JSON evidence must remain interoperable with strict parsers (including
+    # Qt's QJsonDocument). Python's json module otherwise serializes NaN/Infinity
+    # as non-standard tokens, so treat provider non-finite sentinels as missing.
+    return parsed if math.isfinite(parsed) else None
 
 
 def _clean_html(text: str) -> str:
@@ -447,6 +452,9 @@ class DartClient:
             report_name = str(row.get("report_nm", ""))
             report_code = _report_code_from_name(report_name)
             if report_code:
+                receipt_no = str(row.get("rcept_no") or "").strip()
+                if not receipt_no:
+                    raise RuntimeError("DART periodic filing is missing receipt provenance")
                 candidates.append((receipt_date, report_code, row))
         if not candidates:
             raise RuntimeError("no periodic DART filing available at analysis date")
@@ -459,7 +467,9 @@ class DartClient:
         receipt_date = datetime.strptime(str(filing["rcept_dt"]), "%Y%m%d").date()
         year = _business_year_from_filing(str(filing.get("report_nm", "")), filing["reprt_code"], receipt_date)
         report_code = filing["reprt_code"]
-        selected_receipt = str(filing.get("rcept_no") or "")
+        selected_receipt = str(filing.get("rcept_no") or "").strip()
+        if not selected_receipt:
+            raise RuntimeError("DART selected filing is missing receipt provenance")
         rows: list[dict[str, Any]] = []
         for fs_div in ("CFS", "OFS"):
             payload = self._check(
@@ -479,9 +489,12 @@ class DartClient:
                 break
         if not rows:
             raise RuntimeError("DART returned no financial statement rows")
-        row_receipts = {str(row.get("rcept_no")) for row in rows if row.get("rcept_no")}
-        if row_receipts and selected_receipt and row_receipts != {selected_receipt}:
-            raise RuntimeError("DART financial statement is from a later amendment")
+        for row in rows:
+            row_receipt = str(row.get("rcept_no") or "").strip()
+            if not row_receipt:
+                raise RuntimeError("DART financial statement row is missing receipt provenance")
+            if row_receipt != selected_receipt:
+                raise RuntimeError("DART financial statement is from a later amendment")
         values = _map_dart_accounts(rows)
         return FundamentalSnapshot(
             as_of=receipt_date,
@@ -598,7 +611,7 @@ class NaverNewsClient:
             if cutoff_kst > now_kst:
                 raise ValueError("Naver cutoff_at cannot be in the future")
             cutoff = cutoff_kst
-        display = min(max(count, 1), 100)
+        display = 100 if cutoff_at is not None else min(max(count, 1), 100)
         result: list[NewsItem] = []
         seen: set[str] = set()
         start = 1
@@ -617,7 +630,18 @@ class NaverNewsClient:
                 },
             )
             rows = payload.get("items") or []
+            raw_total = payload.get("total")
+            total: int | None = None
+            if raw_total not in (None, ""):
+                try:
+                    total = max(int(raw_total), 0)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError("Naver news returned invalid total result count") from exc
+            if total is not None and rows and total < start + len(rows) - 1:
+                raise ValueError("Naver news total result count is inconsistent with returned rows")
             if not rows:
+                if total is not None and total >= start:
+                    raise RuntimeError("Naver news pagination ended before the declared result count")
                 break
             for row in rows:
                 raw = str(row.get("pubDate", ""))
@@ -644,9 +668,21 @@ class NaverNewsClient:
                 )
                 if len(result) >= count:
                     break
-            if len(result) >= count or len(rows) < display:
+            if len(result) >= count:
                 break
-            start += display
+            covered_through = start + len(rows) - 1
+            if len(rows) < display:
+                if total is not None and total > covered_through:
+                    raise RuntimeError("Naver news pagination ended before the declared result count")
+                break
+            next_start = start + display
+            if next_start > 1000:
+                if total is None or total > covered_through:
+                    raise RuntimeError(
+                        "Naver news search window exhausted before point-in-time completeness could be proven"
+                    )
+                break
+            start = next_start
         return tuple(result[:count])
 
 
@@ -676,43 +712,92 @@ class EcosClient:
             start_s, end_s = start.strftime("%Y%m"), as_of.strftime("%Y%m")
         else:
             start_s, end_s = str(start.year), str(as_of.year)
-        url = f"{self.base_url}/{self.api_key}/json/kr/1/100/{stat}/{cycle}/{start_s}/{end_s}/{item}"
-        payload = self.http.get_json(url)
-        if not isinstance(payload, dict):
-            raise RuntimeError("ECOS returned a non-object response")
-        top_result = payload.get("RESULT") or {}
-        if isinstance(top_result, dict) and top_result:
-            code = str(top_result.get("CODE") or "")
-            if code == "INFO-200":
-                return None
-            if code and code != "INFO-000":
-                raise RuntimeError(f"ECOS error {code}: {top_result.get('MESSAGE') or ''}".strip())
-        search = payload.get("StatisticSearch") or {}
-        inner_result = search.get("RESULT") or {} if isinstance(search, dict) else {}
-        if isinstance(inner_result, dict) and inner_result:
-            code = str(inner_result.get("CODE") or "")
-            if code == "INFO-200":
-                return None
-            if code and code != "INFO-000":
-                raise RuntimeError(f"ECOS error {code}: {inner_result.get('MESSAGE') or ''}".strip())
-        rows = (search.get("row") or []) if isinstance(search, dict) else []
         best: tuple[date, float] | None = None
-        for row in rows:
-            raw = str(row.get("TIME", ""))
-            try:
-                if len(raw) == 8:
-                    obs_date = datetime.strptime(raw, "%Y%m%d").date()
-                elif len(raw) == 6:
-                    obs_date = datetime.strptime(raw + "01", "%Y%m%d").date()
-                else:
-                    obs_date = date(int(raw), 1, 1)
-            except (TypeError, ValueError):
-                continue
-            value = _float(row.get("DATA_VALUE"))
-            if value is None or obs_date > as_of:
-                continue
-            if best is None or obs_date > best[0]:
-                best = (obs_date, value)
+        page_size = 100
+        page_start = 1
+        expected_total: int | None = None
+        while True:
+            page_end = page_start + page_size - 1
+            url = (
+                f"{self.base_url}/{self.api_key}/json/kr/{page_start}/{page_end}/"
+                f"{stat}/{cycle}/{start_s}/{end_s}/{item}"
+            )
+            payload = self.http.get_json(url)
+            if not isinstance(payload, dict):
+                raise RuntimeError("ECOS returned a non-object response")
+            top_result = payload.get("RESULT") or {}
+            if isinstance(top_result, dict) and top_result:
+                code = str(top_result.get("CODE") or "")
+                if code == "INFO-200":
+                    if page_start == 1:
+                        return None
+                    if expected_total is None or page_start > expected_total:
+                        break
+                    raise RuntimeError("ECOS pagination became incomplete before the declared result range")
+                if code and code != "INFO-000":
+                    raise RuntimeError(f"ECOS error {code}: {top_result.get('MESSAGE') or ''}".strip())
+            if "StatisticSearch" not in payload:
+                raise ValueError("ECOS response is missing StatisticSearch data")
+            search = payload.get("StatisticSearch") or {}
+            if not isinstance(search, dict):
+                raise ValueError("ECOS StatisticSearch response is not an object")
+            inner_result = search.get("RESULT") or {}
+            if isinstance(inner_result, dict) and inner_result:
+                code = str(inner_result.get("CODE") or "")
+                if code == "INFO-200":
+                    if page_start == 1:
+                        return None
+                    if expected_total is None or page_start > expected_total:
+                        break
+                    raise RuntimeError("ECOS pagination became incomplete before the declared result range")
+                if code and code != "INFO-000":
+                    raise RuntimeError(f"ECOS error {code}: {inner_result.get('MESSAGE') or ''}".strip())
+            raw_total = search.get("list_total_count")
+            if raw_total not in (None, ""):
+                try:
+                    page_total = max(int(raw_total), 0)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError("ECOS returned invalid list_total_count") from exc
+                if expected_total is None:
+                    expected_total = page_total
+                elif page_total != expected_total:
+                    raise ValueError("ECOS list_total_count changed during pagination")
+            rows = search.get("row") or []
+            if not isinstance(rows, list):
+                raise ValueError("ECOS StatisticSearch rows are not a list")
+            if expected_total is not None and rows:
+                covered_through = page_start + len(rows) - 1
+                if expected_total == 0 or page_start > expected_total or covered_through > expected_total:
+                    raise ValueError("ECOS list_total_count is inconsistent with returned rows")
+            if not rows:
+                if expected_total is not None and page_start <= expected_total:
+                    raise RuntimeError("ECOS pagination ended before all declared rows were returned")
+                break
+            for row in rows:
+                raw = str(row.get("TIME", ""))
+                try:
+                    if len(raw) == 8:
+                        obs_date = datetime.strptime(raw, "%Y%m%d").date()
+                    elif len(raw) == 6:
+                        obs_date = datetime.strptime(raw + "01", "%Y%m%d").date()
+                    else:
+                        obs_date = date(int(raw), 1, 1)
+                except (TypeError, ValueError):
+                    continue
+                value = _float(row.get("DATA_VALUE"))
+                if value is None or obs_date > as_of:
+                    continue
+                if best is None or obs_date > best[0]:
+                    best = (obs_date, value)
+            covered_through = page_start + len(rows) - 1
+            if expected_total is not None:
+                if covered_through >= expected_total:
+                    break
+                if len(rows) < page_size:
+                    raise RuntimeError("ECOS pagination ended before all declared rows were returned")
+            elif len(rows) < page_size:
+                break
+            page_start += page_size
         return best
 
     def macro(self, as_of: date) -> MacroSnapshot:

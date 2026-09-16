@@ -19,8 +19,8 @@ from typing import Any
 from .engine import ResearchEngine
 from .benchmark import load_yahoo_benchmark
 from .evaluation import calculate_forward_return
-from .llm import GoogleGeminiLlm, llm_from_payload
-from .models import Instrument, QuantCandidate, to_jsonable
+from .llm import llm_from_payload
+from .models import KR_DAILY_FINALITY_TIME, Instrument, QuantCandidate, to_jsonable
 from .persistence import DecisionStore
 from .providers import DartClient, EcosClient, KisClient, NaverNewsClient
 from .ranking import candidate_from_mapping, select_top_candidates, select_top_candidates_isolated
@@ -32,6 +32,14 @@ _KST = timezone(timedelta(hours=9))
 def _input_json() -> dict[str, Any]:
     text = sys.stdin.read().strip()
     return json.loads(text) if text else {}
+
+
+def _optional_input_json() -> dict[str, Any]:
+    """Read stdin only when it is a pipe/file, never block an interactive TTY."""
+
+    if sys.stdin.isatty():
+        return {}
+    return _input_json()
 
 
 def _print(data: Any, *, success: bool = True, error: str | None = None) -> None:
@@ -82,6 +90,20 @@ def _korea_now() -> datetime:
     """Return a timezone-aware Korean civil timestamp for PIT cutoffs."""
 
     return datetime.now(_KST)
+
+
+def _finalized_daily_as_of(now_kst: datetime | None = None) -> date:
+    """Return the latest Korean civil date safe to treat as a finalized daily bar.
+
+    KIS/Yahoo daily endpoints can expose the current session before its final
+    close. Outcome rows are immutable, so freezing a still-moving bar would make
+    a partial intraday price the permanent 1/5/20/60-session endpoint. Mirror the
+    research PIT rule and only admit today's daily bar after the conservative
+    KRX daily-finality boundary.
+    """
+
+    now = (now_kst or _korea_now()).astimezone(_KST)
+    return now.date() if now.time() >= KR_DAILY_FINALITY_TIME else now.date() - timedelta(days=1)
 
 
 def _candidate_from_payload(payload: dict[str, Any]) -> QuantCandidate:
@@ -321,11 +343,11 @@ def cmd_evaluate(args: argparse.Namespace) -> Any:
     if decision is None:
         raise ValueError("decision not found")
     instrument = decision.candidate.instrument
-    today = _korea_today()
-    lookback_days = max(120, (today - decision.candidate.analysis_date).days + 30)
+    evaluation_as_of = _finalized_daily_as_of()
+    lookback_days = max(120, (evaluation_as_of - decision.candidate.analysis_date).days + 30)
     market = KisClient.from_env().daily_bars(
         instrument,
-        today,
+        evaluation_as_of,
         lookback_days=lookback_days,
         # Research evidence uses original prices for PIT stability. Realized
         # outcome measurement instead uses adjusted history so an in-horizon
@@ -336,7 +358,7 @@ def cmd_evaluate(args: argparse.Namespace) -> Any:
     benchmark = load_yahoo_benchmark(
         benchmark_symbol,
         decision.candidate.analysis_date - timedelta(days=14),
-        today,
+        evaluation_as_of,
     )
     outcomes = []
     pending_horizons: list[int] = []
@@ -405,14 +427,21 @@ def cmd_paper_trade() -> Any:
 
 
 def cmd_llm_smoke() -> Any:
-    llm = GoogleGeminiLlm.from_env()
+    payload = _optional_input_json()
+    llm_config = payload.get("llm") if isinstance(payload, dict) else None
+    llm = llm_from_payload(llm_config)
     response = llm.complete(
         "Return exactly FINCEPT_KR_LLM_OK and nothing else.",
         "Personal Korean-market research LLM connection smoke test.",
     )
     if response.strip() != "FINCEPT_KR_LLM_OK":
         raise RuntimeError(f"unexpected LLM smoke response: {response[:120]}")
-    return {"provider": "google", "model": llm.model, "response": response}
+    return {
+        "provider": str(getattr(llm, "provider", llm.__class__.__name__)).lower(),
+        "model": str(getattr(llm, "model", "")),
+        "source": "fincept_active_profile" if llm_config else "headless_google_env",
+        "response": response,
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:

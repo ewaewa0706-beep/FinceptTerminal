@@ -18,6 +18,7 @@ class CppWiringTests(unittest.TestCase):
         self.assertGreaterEqual(cmake.count("src/mcp/tools/PersonalKrResearchTools.cpp"), 2)
         for name in (
             "kr_research_status",
+            "kr_llm_smoke",
             "kr_select_top_candidates",
             "kr_research_batch",
             "kr_analyze_stock",
@@ -63,6 +64,7 @@ class CppWiringTests(unittest.TestCase):
         self.assertIn("ProviderCatalog::chat_endpoint", helper)
         self.assertIn('payload["llm"]', tools)
         self.assertIn('payload["llm"]', ui)
+        self.assertIn('run_kr_tool({"llm-smoke"}', tools)
         self.assertIn('run_kr_tool({"batch"}', tools)
         self.assertIn('"analysis_cutoff_at"', tools)
         self.assertIn('"analysis_cutoff_at"', ui)

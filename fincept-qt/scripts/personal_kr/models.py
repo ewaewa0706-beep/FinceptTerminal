@@ -4,8 +4,17 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
+
+
+# A deliberately conservative daily-bar finality boundary. Regular KRX trading
+# ends at 15:30, but exchange-designated special sessions can close later (for
+# example, the annual CSAT schedule has historically shifted the close to 16:30).
+# Without a trading-calendar dependency, 17:00 KST keeps date-only KIS/Yahoo bars
+# out of immutable research/outcome evidence until even those delayed sessions
+# have ended.
+KR_DAILY_FINALITY_TIME = time(17, 0)
 
 
 def _date(value: date | str) -> date:

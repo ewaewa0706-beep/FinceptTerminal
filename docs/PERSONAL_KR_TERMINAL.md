@@ -70,6 +70,12 @@ python personal_kr_terminal.py status
 python personal_kr_terminal.py llm-smoke
 ```
 
+Without stdin, `llm-smoke` uses the headless `GOOGLE_API_KEY` fallback. The
+desktop/MCP path instead sends the currently active Fincept LLM profile over
+stdin, so OpenAI/Anthropic/Gemini/OpenRouter/Fincept and the other configured
+providers are smoke-tested with the same provider/model used by deep research.
+Credentials are never placed on argv and are not returned in the smoke result.
+
 External Quant Ranking → Top N selection uses JSON over stdin:
 
 ```powershell
@@ -166,6 +172,7 @@ The result is displayed in the same tab and remains research-only.
 Internal MCP/agent tools:
 
 - `kr_research_status`
+- `kr_llm_smoke`
 - `kr_select_top_candidates`
 - `kr_research_batch`
 - `kr_analyze_stock`
@@ -190,8 +197,9 @@ than a side effect of research.
   treated as strict external PIT cutoffs;
 - market bars newer than the analysis cutoff are rejected. KIS daily price and
   investor-flow endpoints expose date-level data without a finality timestamp;
-  before 16:00 KST the same calendar day's KIS rows are therefore excluded and
-  the prior date is used conservatively;
+  before the conservative 17:00 KST daily-finality boundary the same calendar
+  day's KIS rows are therefore excluded and the prior date is used. The extra
+  buffer also covers exchange-designated delayed-close sessions;
 - historical KIS research bars request **original/unadjusted prices**
   (`FID_ORG_ADJ_PRC=1`). Later corporate actions can restate adjusted history,
   so adjusted prices are not used as frozen research evidence;
@@ -200,15 +208,22 @@ than a side effect of research.
   receipt-year error. Because the used DART interfaces do not provide a receipt
   time, an exact intraday batch cutoff conservatively excludes same-day filings;
 - a later DART amendment cannot overwrite an earlier point-in-time filing;
+- DART filing and financial-statement rows must carry the same nonblank
+  `rcept_no`; missing or mixed receipt provenance fails the enrichment closed
+  instead of attaching unprovenanced account values to a frozen decision;
 - Naver search is current-index/non-vintage. Today-only on-demand search is
   allowed, articles later than the exact batch cutoff are filtered and duplicates
-  are removed. Historical analysis fails this enrichment closed instead of
-  pretending the current search index is a historical snapshot;
+  are removed. If the API's maximum `start=1000` search window is exhausted
+  before enough pre-cutoff results can be reached, the enrichment fails closed
+  as incomplete. Historical analysis likewise fails closed instead of pretending
+  the current search index is a historical snapshot;
 - ECOS responses are non-vintage for this workflow. Historical/external exact
   PIT analysis fails the macro enrichment closed because the current-series
   response cannot prove what was visible at that old instant. A `live_request`
   may use the ECOS values actually observed during that run; those values and
-  any per-series errors are then frozen in decision evidence;
+  any per-series errors are then frozen in decision evidence. ECOS
+  `StatisticSearch` rows are paged through the declared `list_total_count` before
+  the latest observation is selected, avoiding stale first-page snapshots;
 - KIS HTTP 401 refreshes authentication once; 429/5xx/timeouts are bounded
   retries;
 - KIS daily history is split into bounded date windows to avoid silent provider
@@ -230,13 +245,18 @@ than a side effect of research.
 - repeated decision/outcome writes are first-write-wins only when immutable
   provenance matches; conflicting ranking, exact cutoff/mode, LLM/workflow, or
   frozen evidence fingerprint / outcome input provenance is rejected;
+- forward outcomes only admit a current-day daily endpoint after 17:00 KST;
+  before that cutoff the latest finalized prior session is used so an intraday
+  partial KIS/Yahoo daily bar cannot become an immutable outcome;
 - legacy outcome rows that predate source/price-mode/timestamp/input-hash
   provenance are moved to `kr_outcome_quarantine` during schema upgrade, freeing
   their decision/horizon key for a newly audited evaluation while preserving the
   old payload for inspection;
-- legacy paper rows without required decision/client provenance are quarantined
-  to `kr_paper_trade_quarantine` during schema upgrade rather than being counted
-  in the active ledger.
+- legacy paper rows without required provenance, with duplicate idempotency
+  keys, or with invalid ledger fields are quarantined to
+  `kr_paper_trade_quarantine` during schema upgrade rather than being counted in
+  the active ledger. The strict-table rebuild is transactional and recovers the
+  temporary table left by an interrupted older migration.
 
 When launched through the Fincept desktop UI/MCP bridge, single-stock KR research
 has a finite 20-minute outer watchdog and Top-N batch research has a finite

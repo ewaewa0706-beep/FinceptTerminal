@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import replace
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
 
 from .llm import Llm
@@ -18,6 +18,7 @@ from .models import (
     QuantCandidate,
     ResearchPacket,
     ResearchResult,
+    KR_DAILY_FINALITY_TIME,
     to_jsonable,
 )
 
@@ -269,7 +270,8 @@ def _pit_provider_dates(candidate: QuantCandidate):
     """Map an exact ranking cutoff onto providers that expose only dates.
 
     KIS daily bars/investor flow do not expose a finality timestamp, so an
-    intraday cutoff before 16:00 KST conservatively uses the prior calendar day.
+    intraday cutoff before the conservative KRX daily-finality boundary uses the
+    prior calendar day.
     DART list/financial endpoints expose receipt dates but not receipt times, so
     any exact intraday cutoff excludes same-day filings. News keeps the exact
     timestamp and is filtered by NaverNewsClient.
@@ -282,7 +284,7 @@ def _pit_provider_dates(candidate: QuantCandidate):
     cutoff_kst = candidate.analysis_cutoff_at.astimezone(kst)
     evidence_as_of = min(candidate.analysis_date, cutoff_kst.date())
     market_as_of = evidence_as_of
-    if cutoff_kst.date() == evidence_as_of and cutoff_kst.time() < time(16, 0):
+    if cutoff_kst.date() == evidence_as_of and cutoff_kst.time() < KR_DAILY_FINALITY_TIME:
         market_as_of = evidence_as_of - timedelta(days=1)
     filing_as_of = evidence_as_of - timedelta(days=1)
     return market_as_of, filing_as_of, evidence_as_of

@@ -13,7 +13,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from .evaluation import Outcome
-from .models import ResearchResult, to_jsonable, validate_ticker
+from .models import KR_DAILY_FINALITY_TIME, ResearchResult, to_jsonable, validate_ticker
 
 
 class DecisionStore:
@@ -36,9 +36,13 @@ class DecisionStore:
         with closing(self._connect()) as conn:
             with conn:
                 conn.execute("PRAGMA journal_mode=WAL")
-                conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS kr_decisions(
+                # Serialize schema inspection/migration. A deferred transaction
+                # lets concurrent constructors both inspect a legacy table and
+                # then collide when either starts DDL; take the write reservation
+                # before any schema work instead.
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS kr_decisions(
                     id TEXT PRIMARY KEY,
                     strategy_id TEXT NOT NULL,
                     ticker TEXT NOT NULL,
@@ -47,23 +51,29 @@ class DecisionStore:
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     UNIQUE(strategy_id,ticker,analysis_date)
-                );
-                CREATE TABLE IF NOT EXISTS kr_outcomes(
+                )"""
+                )
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS kr_outcomes(
                     decision_id TEXT NOT NULL,
                     horizon INTEGER NOT NULL,
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(decision_id,horizon)
-                );
-                CREATE TABLE IF NOT EXISTS kr_outcome_quarantine(
+                )"""
+                )
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS kr_outcome_quarantine(
                     quarantine_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     decision_id TEXT,
                     horizon INTEGER,
                     payload TEXT NOT NULL,
                     reason TEXT NOT NULL,
                     quarantined_at TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS kr_paper_trades(
+                )"""
+                )
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS kr_paper_trades(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     client_trade_id TEXT NOT NULL UNIQUE,
                     decision_id TEXT NOT NULL REFERENCES kr_decisions(id) ON DELETE RESTRICT,
@@ -74,15 +84,16 @@ class DecisionStore:
                     price REAL NOT NULL CHECK(price > 0),
                     fee REAL NOT NULL DEFAULT 0,
                     tax REAL NOT NULL DEFAULT 0
-                );
-                CREATE TABLE IF NOT EXISTS kr_paper_trade_quarantine(
+                )"""
+                )
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS kr_paper_trade_quarantine(
                     quarantine_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     original_id INTEGER,
                     payload TEXT NOT NULL,
                     reason TEXT NOT NULL,
                     quarantined_at TEXT NOT NULL
-                );
-                """
+                )"""
                 )
                 columns = {row[1] for row in conn.execute("PRAGMA table_info(kr_paper_trades)")}
                 if "client_trade_id" not in columns:
@@ -161,8 +172,9 @@ class DecisionStore:
             # look as though it had been frozen with the modern contract.
             if not str(raw.get(label) or "").strip() or not str(getattr(outcome, label) or "").strip():
                 return f"missing {label} provenance"
-        if outcome.evaluated_at is None or outcome.evaluated_at.tzinfo is None:
-            return "missing timezone-aware evaluated_at provenance"
+        finality_error = _outcome_finality_error(outcome)
+        if finality_error is not None:
+            return finality_error
         if not _is_sha256(outcome.stock_input_hash) or not _is_sha256(outcome.benchmark_input_hash):
             return "missing or invalid outcome input fingerprints"
         if outcome.benchmark_return is None or outcome.alpha_return is None:
@@ -183,36 +195,186 @@ class DecisionStore:
         return None
 
     def _migrate_paper_provenance(self, conn: sqlite3.Connection) -> None:
-        invalid = conn.execute(
+        """Run the paper migration atomically and recover an interrupted old rebuild."""
+
+        savepoint = "personal_kr_paper_migration"
+        conn.execute(f"SAVEPOINT {savepoint}")
+        try:
+            recovered_stale = self._recover_stale_paper_rebuild(conn)
+            if recovered_stale or not self._paper_schema_is_strict(conn):
+                self._migrate_paper_rows(conn)
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        except Exception:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+
+    def _paper_schema_is_strict(self, conn: sqlite3.Connection) -> bool:
+        info = {row[1]: row for row in conn.execute("PRAGMA table_info(kr_paper_trades)")}
+        if not (
+            info.get("client_trade_id")
+            and info["client_trade_id"][3]
+            and info.get("decision_id")
+            and info["decision_id"][3]
+        ):
+            return False
+        for index in conn.execute("PRAGMA index_list(kr_paper_trades)"):
+            if not index[2]:
+                continue
+            columns = [row[2] for row in conn.execute(f"PRAGMA index_info('{index[1]}')")]
+            if columns == ["client_trade_id"]:
+                return True
+        return False
+
+    def _recover_stale_paper_rebuild(self, conn: sqlite3.Connection) -> bool:
+        """Recover the temp table left by the pre-atomic migration implementation.
+
+        The old ``executescript`` rebuild could be interrupted after copying rows
+        and dropping the original table but before renaming the strict table. On
+        the next startup the base schema recreates an empty ``kr_paper_trades``;
+        restore the copied rows before discarding that stale temp table.
+        """
+
+        stale = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='kr_paper_trades_strict'"
+        ).fetchone()
+        if stale is None:
+            return False
+        main_count = int(conn.execute("SELECT COUNT(*) FROM kr_paper_trades").fetchone()[0])
+        stale_count = int(conn.execute("SELECT COUNT(*) FROM kr_paper_trades_strict").fetchone()[0])
+        if main_count == 0 and stale_count > 0:
+            conn.execute(
+                """
+                INSERT INTO kr_paper_trades
+                    (id,client_trade_id,decision_id,trade_date,ticker,side,quantity,price,fee,tax)
+                SELECT id,client_trade_id,decision_id,trade_date,ticker,side,quantity,price,fee,tax
+                FROM kr_paper_trades_strict ORDER BY id
+                """
+            )
+        conn.execute("DROP TABLE kr_paper_trades_strict")
+        return True
+
+    def _migrate_paper_rows(self, conn: sqlite3.Connection) -> None:
+        """Validate legacy paper rows before rebuilding the strict ledger schema.
+
+        Older databases can predate the UNIQUE/CHECK/FK constraints now enforced
+        by ``kr_paper_trades``. A bulk INSERT into the strict replacement table
+        therefore is not itself a migration strategy: one duplicate idempotency
+        key or malformed trade would abort startup with ``IntegrityError``. Walk
+        the ledger in its original id order, quarantine anything the current
+        runtime would reject, and only then rebuild the table.
+        """
+
+        rows = conn.execute(
             """
-            SELECT t.* FROM kr_paper_trades t
+            SELECT t.*,
+                   d.ticker AS decision_ticker,
+                   d.analysis_date AS decision_analysis_date,
+                   d.created_at AS decision_created_at
+            FROM kr_paper_trades t
             LEFT JOIN kr_decisions d ON d.id=t.decision_id
-            WHERE t.client_trade_id IS NULL OR t.client_trade_id=''
-               OR t.decision_id IS NULL OR t.decision_id=''
-               OR d.id IS NULL
             ORDER BY t.id
             """
         ).fetchall()
-        for row in invalid:
+        seen_client_ids: set[str] = set()
+        latest_trade_date: date | None = None
+        positions: dict[str, int] = {}
+
+        for row in rows:
+            reason: str | None = None
+            client_trade_id = str(row["client_trade_id"] or "").strip()
+            decision_id = str(row["decision_id"] or "").strip()
+            if not client_trade_id or not decision_id or row["decision_ticker"] is None:
+                reason = "missing or invalid decision/client provenance"
+            elif client_trade_id in seen_client_ids:
+                reason = "duplicate client_trade_id provenance"
+
+            trade_date: date | None = None
+            ticker = ""
+            side = ""
+            quantity = 0
+            price = fee = tax = 0.0
+            if reason is None:
+                try:
+                    ticker = validate_ticker(row["ticker"])
+                    if ticker != str(row["decision_ticker"]):
+                        raise ValueError("ticker does not match decision")
+                    side = str(row["side"] or "").strip().upper()
+                    raw_quantity = float(row["quantity"])
+                    if not math.isfinite(raw_quantity) or not raw_quantity.is_integer():
+                        raise ValueError("quantity must be a finite integer")
+                    quantity = int(raw_quantity)
+                    price = float(row["price"])
+                    fee = float(row["fee"])
+                    tax = float(row["tax"])
+                    if not all(math.isfinite(value) for value in (price, fee, tax)):
+                        raise ValueError("price/fee/tax must be finite")
+                    if side not in {"BUY", "SELL"} or quantity <= 0 or price <= 0 or fee < 0 or tax < 0:
+                        raise ValueError("invalid paper trade fields")
+                    trade_date = date.fromisoformat(str(row["trade_date"]))
+                    analysis_date = date.fromisoformat(str(row["decision_analysis_date"]))
+                    created_at = datetime.fromisoformat(str(row["decision_created_at"]))
+                    if created_at.tzinfo is None:
+                        created_at = created_at.replace(tzinfo=timezone.utc)
+                    created_korea_date = created_at.astimezone(timezone(timedelta(hours=9))).date()
+                    if trade_date < analysis_date or trade_date < created_korea_date:
+                        raise ValueError("paper trade predates decision provenance")
+                    if latest_trade_date is not None and trade_date < latest_trade_date:
+                        raise ValueError("paper trade backdates the ledger")
+                    held = positions.get(ticker, 0)
+                    if side == "SELL" and quantity > held:
+                        raise ValueError("paper trade oversells position")
+                except (TypeError, ValueError, OverflowError) as exc:
+                    reason = f"invalid paper trade provenance: {exc}"
+
+            if reason is not None:
+                conn.execute(
+                    "INSERT INTO kr_paper_trade_quarantine(original_id,payload,reason,quarantined_at) VALUES(?,?,?,?)",
+                    (
+                        row["id"],
+                        json.dumps(dict(row), ensure_ascii=False, separators=(",", ":"), default=str),
+                        reason,
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+                conn.execute("DELETE FROM kr_paper_trades WHERE id=?", (row["id"],))
+                continue
+
+            assert trade_date is not None
+            # Persist the same canonical values the current add_paper_trade path
+            # would store. This prevents a legacy row such as " buy " or a
+            # whitespace-padded id/ticker from passing semantic validation yet
+            # remaining a different replay key/string after the strict rebuild.
             conn.execute(
-                "INSERT INTO kr_paper_trade_quarantine(original_id,payload,reason,quarantined_at) VALUES(?,?,?,?)",
+                """
+                UPDATE kr_paper_trades
+                SET client_trade_id=?, decision_id=?, trade_date=?, ticker=?, side=?,
+                    quantity=?, price=?, fee=?, tax=?
+                WHERE id=?
+                """,
                 (
+                    client_trade_id,
+                    decision_id,
+                    trade_date.isoformat(),
+                    ticker,
+                    side,
+                    quantity,
+                    price,
+                    fee,
+                    tax,
                     row["id"],
-                    json.dumps(dict(row), ensure_ascii=False, separators=(",", ":")),
-                    "missing or invalid decision/client provenance",
-                    datetime.now(timezone.utc).isoformat(),
                 ),
             )
-            conn.execute("DELETE FROM kr_paper_trades WHERE id=?", (row["id"],))
+            seen_client_ids.add(client_trade_id)
+            latest_trade_date = trade_date
+            if side == "BUY":
+                positions[ticker] = positions.get(ticker, 0) + quantity
+            else:
+                positions[ticker] = positions.get(ticker, 0) - quantity
 
-        info = {row[1]: row for row in conn.execute("PRAGMA table_info(kr_paper_trades)")}
-        strict = bool(info.get("client_trade_id") and info["client_trade_id"][3]) and bool(
-            info.get("decision_id") and info["decision_id"][3]
-        )
-        if not strict:
-            conn.executescript(
-                """
-                CREATE TABLE kr_paper_trades_strict(
+        if not self._paper_schema_is_strict(conn):
+            conn.execute(
+                """CREATE TABLE kr_paper_trades_strict(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     client_trade_id TEXT NOT NULL UNIQUE,
                     decision_id TEXT NOT NULL REFERENCES kr_decisions(id) ON DELETE RESTRICT,
@@ -223,15 +385,16 @@ class DecisionStore:
                     price REAL NOT NULL CHECK(price > 0),
                     fee REAL NOT NULL DEFAULT 0,
                     tax REAL NOT NULL DEFAULT 0
-                );
-                INSERT INTO kr_paper_trades_strict
+                )"""
+            )
+            conn.execute(
+                """INSERT INTO kr_paper_trades_strict
                     (id,client_trade_id,decision_id,trade_date,ticker,side,quantity,price,fee,tax)
                 SELECT id,client_trade_id,decision_id,trade_date,ticker,side,quantity,price,fee,tax
-                FROM kr_paper_trades ORDER BY id;
-                DROP TABLE kr_paper_trades;
-                ALTER TABLE kr_paper_trades_strict RENAME TO kr_paper_trades;
-                """
+                FROM kr_paper_trades ORDER BY id"""
             )
+            conn.execute("DROP TABLE kr_paper_trades")
+            conn.execute("ALTER TABLE kr_paper_trades_strict RENAME TO kr_paper_trades")
 
     def record_decision(self, result: ResearchResult, *, strategy_id: str = "personal-kr") -> ResearchResult:
         ticker = result.candidate.instrument.ticker
@@ -318,8 +481,9 @@ class DecisionStore:
                 ):
                     if not str(value or "").strip():
                         raise ValueError(f"outcome {label} provenance is required")
-                if outcome.evaluated_at is None or outcome.evaluated_at.tzinfo is None:
-                    raise ValueError("outcome evaluated_at must be timezone-aware")
+                finality_error = _outcome_finality_error(outcome)
+                if finality_error is not None:
+                    raise ValueError(finality_error)
                 if not _is_sha256(outcome.stock_input_hash) or not _is_sha256(outcome.benchmark_input_hash):
                     raise ValueError("outcome stock/benchmark input hashes must be SHA-256 fingerprints")
                 if outcome.benchmark_return is None or outcome.alpha_return is None:
@@ -607,3 +771,17 @@ def _is_sha256(value: str | None) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _outcome_finality_error(outcome: Outcome) -> str | None:
+    """Validate that an immutable outcome only uses a finalized daily endpoint."""
+
+    if outcome.evaluated_at is None or outcome.evaluated_at.tzinfo is None:
+        return "outcome evaluated_at must be timezone-aware"
+    kst = timezone(timedelta(hours=9))
+    evaluated_kst = outcome.evaluated_at.astimezone(kst)
+    if outcome.end_date > evaluated_kst.date():
+        return "outcome end_date cannot be later than evaluated_at"
+    if outcome.end_date == evaluated_kst.date() and evaluated_kst.time() < KR_DAILY_FINALITY_TIME:
+        return "outcome current-day endpoint is not finalized before 17:00 KST"
+    return None
