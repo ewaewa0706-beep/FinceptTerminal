@@ -245,6 +245,38 @@ class CoreTests(unittest.TestCase):
         self.assertIsNotNone(packet.macro)
         self.assertNotIn("macro", packet.unavailable)
 
+    def test_live_request_cutoff_mode_roundtrips_decision_store(self):
+        kst = timezone(timedelta(hours=9))
+        candidate = QuantCandidate(
+            Instrument("005930", "삼성전자", "KOSPI"),
+            date(2026, 9, 16),
+            0,
+            1,
+            {},
+            analysis_cutoff_at=datetime(2026, 9, 16, 10, 15, tzinfo=kst),
+            analysis_cutoff_mode="live_request",
+        )
+        result = ResearchResult(
+            candidate=candidate,
+            signal="Hold",
+            market_report="m",
+            fundamentals_report="f",
+            news_macro_report="n",
+            bull_case="b+",
+            bear_case="b-",
+            research_manager="r",
+            trader="t",
+            risk_manager="risk",
+            portfolio_manager="SIGNAL: HOLD",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DecisionStore(Path(tmp) / "kr.db")
+            stored = store.record_decision(result, strategy_id="cutoff-roundtrip")
+            loaded = store.get_decision(stored.decision_id or "")
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded.candidate.analysis_cutoff_mode, "live_request")
+        self.assertEqual(loaded.candidate.analysis_cutoff_at, candidate.analysis_cutoff_at)
+
     def test_optional_provider_programming_error_fails_candidate(self):
         class BuggyNews(FakeProviders):
             error_type = TypeError

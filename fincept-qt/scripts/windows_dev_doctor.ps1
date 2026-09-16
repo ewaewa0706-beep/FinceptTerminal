@@ -37,12 +37,17 @@ function Get-FirstExistingPath {
 function Get-QtToolPath {
     param([Parameter(Mandatory = $true)][string]$ToolName)
 
-    $fromPath = Get-ExecutablePath @($ToolName, "$ToolName.exe")
-    if ($null -ne $fromPath) {
-        return $fromPath
-    }
-
     $candidates = @()
+    # Match CMake's configured Qt selection before consulting PATH. Otherwise a
+    # stale MinGW/older qmake earlier on PATH can make the doctor inspect a
+    # different kit than the one configure will actually use.
+    if (-not [string]::IsNullOrWhiteSpace($env:CMAKE_PREFIX_PATH)) {
+        foreach ($prefix in ($env:CMAKE_PREFIX_PATH -split ';')) {
+            if (-not [string]::IsNullOrWhiteSpace($prefix)) {
+                $candidates += Join-Path (Join-Path $prefix "bin") "$ToolName.exe"
+            }
+        }
+    }
     if (-not [string]::IsNullOrWhiteSpace($env:QT_DIR)) {
         $candidates += Join-Path (Join-Path $env:QT_DIR "bin") "$ToolName.exe"
     }
@@ -65,7 +70,12 @@ function Get-QtToolPath {
         }
     }
 
-    return Get-FirstExistingPath $candidates
+    $configured = Get-FirstExistingPath $candidates
+    if ($null -ne $configured) {
+        return $configured
+    }
+
+    return Get-ExecutablePath @($ToolName, "$ToolName.exe")
 }
 
 function Invoke-VersionCommand {
@@ -215,8 +225,11 @@ if ($null -eq $qmake) {
 }
 else {
     $version = Invoke-VersionCommand $qmake @("-query", "QT_VERSION")
-    $ok = $version -match ("^" + [regex]::Escape($qtMinor) + "(\.|$)")
-    Add-Check "Qt qmake" $true $(if ($ok) { "OK" } else { "FAIL" }) $version $qmake "Expected Qt $qtMinor.x"
+    $qtSpec = Invoke-VersionCommand $qmake @("-query", "QMAKE_XSPEC")
+    $versionOk = $version -match ("^" + [regex]::Escape($qtMinor) + "(\.|$)")
+    $abiOk = $qtSpec -match '(?i)msvc'
+    $ok = $versionOk -and $abiOk
+    Add-Check "Qt qmake" $true $(if ($ok) { "OK" } else { "FAIL" }) $version $qmake "Expected Qt $qtMinor.x MSVC kit (QMAKE_XSPEC=$qtSpec)"
 
     # qmake alone is not sufficient: Fincept's REQUIRED CMake components must
     # all be installed in the selected kit or configure will fail later. Check

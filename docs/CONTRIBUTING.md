@@ -37,7 +37,7 @@ Fincept Terminal is an open-source native C++20/Qt6 financial intelligence platf
 
 | Layer         | Technology                                                                           |
 |---------------|--------------------------------------------------------------------------------------|
-| Language      | **C++20** — MSVC 19.38 (VS 2022 17.8) / GCC 12.3 / Apple Clang 15.0                  |
+| Language      | **C++20** — MSVC 19.40+ (VS 2022 17.10+) / GCC 12.3 / Apple Clang 15.0               |
 | UI            | **Qt 6.8.3 EXACT** Widgets (pinned)                                                  |
 | Charts        | Qt6 Charts                                                                           |
 | Networking    | Qt6 Network + Qt6 WebSockets                                                         |
