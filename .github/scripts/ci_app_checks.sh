@@ -43,6 +43,7 @@ FALLBACK_SELFTESTS="
 --selftest-portfolio-monitor
 --selftest-portfolio-replication
 --selftest-arena
+--selftest-llm-tools
 "
 
 usage() {

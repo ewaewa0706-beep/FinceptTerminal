@@ -186,17 +186,52 @@ class DecisionStore:
     def record_outcome(self, outcome: Outcome) -> Outcome:
         if outcome.horizon < 1:
             raise ValueError("outcome horizon must be >= 1")
-        payload = json.dumps(to_jsonable(outcome), ensure_ascii=False, separators=(",", ":"))
         with closing(self._connect()) as conn:
             with conn:
                 conn.execute("BEGIN IMMEDIATE")
                 decision = conn.execute(
-                    "SELECT ticker FROM kr_decisions WHERE id=?", (outcome.decision_id,)
+                    "SELECT ticker,analysis_date,payload FROM kr_decisions WHERE id=?", (outcome.decision_id,)
                 ).fetchone()
                 if decision is None:
                     raise ValueError("outcome decision not found")
-                if outcome.stock_ticker and outcome.stock_ticker != decision["ticker"]:
+                decision_result = _result_from_payload(json.loads(decision["payload"]))
+                analysis_date = date.fromisoformat(decision["analysis_date"])
+                if outcome.start_date <= analysis_date:
+                    raise ValueError("outcome start_date must be after decision analysis_date")
+                if outcome.end_date < outcome.start_date:
+                    raise ValueError("outcome end_date cannot precede start_date")
+                if not outcome.stock_ticker:
+                    raise ValueError("outcome stock_ticker provenance is required")
+                if outcome.stock_ticker != decision["ticker"]:
                     raise ValueError("outcome ticker does not match decision")
+                expected_benchmark = decision_result.candidate.instrument.benchmark_symbol
+                if outcome.benchmark_symbol != expected_benchmark:
+                    raise ValueError("outcome benchmark_symbol does not match decision market")
+                for label, value in (
+                    ("stock_source", outcome.stock_source),
+                    ("stock_price_mode", outcome.stock_price_mode),
+                    ("benchmark_source", outcome.benchmark_source),
+                    ("benchmark_price_mode", outcome.benchmark_price_mode),
+                    ("evaluation_version", outcome.evaluation_version),
+                ):
+                    if not str(value or "").strip():
+                        raise ValueError(f"outcome {label} provenance is required")
+                if outcome.evaluated_at is None or outcome.evaluated_at.tzinfo is None:
+                    raise ValueError("outcome evaluated_at must be timezone-aware")
+                if not _is_sha256(outcome.stock_input_hash) or not _is_sha256(outcome.benchmark_input_hash):
+                    raise ValueError("outcome stock/benchmark input hashes must be SHA-256 fingerprints")
+                if outcome.benchmark_return is None or outcome.alpha_return is None:
+                    raise ValueError("outcome benchmark return and alpha are required")
+                numeric = (
+                    outcome.raw_return,
+                    outcome.benchmark_return,
+                    outcome.alpha_return,
+                    outcome.max_gain,
+                    outcome.max_drawdown,
+                )
+                if any(value is not None and not math.isfinite(float(value)) for value in numeric):
+                    raise ValueError("outcome metrics must be finite")
+                payload = json.dumps(to_jsonable(outcome), ensure_ascii=False, separators=(",", ":"))
                 existing_row = conn.execute(
                     "SELECT payload FROM kr_outcomes WHERE decision_id=? AND horizon=?",
                     (outcome.decision_id, outcome.horizon),
@@ -354,6 +389,7 @@ def _result_from_payload(data: dict) -> ResearchResult:
         c.get("ranking_source") or "",
         datetime.fromisoformat(c["ranking_generated_at"]) if c.get("ranking_generated_at") else None,
         c.get("ranking_payload_hash") or "",
+        datetime.fromisoformat(c["analysis_cutoff_at"]) if c.get("analysis_cutoff_at") else None,
     )
     return ResearchResult(
         candidate=candidate,
@@ -392,11 +428,14 @@ def _outcome_from_payload(data: dict) -> Outcome:
         max_drawdown=data.get("max_drawdown"),
         stock_ticker=data.get("stock_ticker"),
         stock_source=data.get("stock_source"),
+        stock_price_mode=data.get("stock_price_mode"),
         benchmark_symbol=data.get("benchmark_symbol"),
         benchmark_source=data.get("benchmark_source"),
+        benchmark_price_mode=data.get("benchmark_price_mode"),
         evaluated_at=datetime.fromisoformat(data["evaluated_at"]) if data.get("evaluated_at") else None,
         stock_input_hash=data.get("stock_input_hash"),
         benchmark_input_hash=data.get("benchmark_input_hash"),
+        evaluation_version=data.get("evaluation_version") or "personal-kr-outcome-v1",
     )
 
 
@@ -406,5 +445,25 @@ def _ranking_provenance_tuple(result: ResearchResult) -> tuple[str, str, str]:
     return candidate.ranking_source, generated, candidate.ranking_payload_hash
 
 
-def _outcome_provenance_tuple(outcome: Outcome) -> tuple[str, str]:
-    return outcome.stock_input_hash or "", outcome.benchmark_input_hash or ""
+def _outcome_provenance_tuple(outcome: Outcome) -> tuple[str, ...]:
+    return (
+        outcome.stock_ticker or "",
+        outcome.stock_source or "",
+        outcome.stock_price_mode or "",
+        outcome.benchmark_symbol or "",
+        outcome.benchmark_source or "",
+        outcome.benchmark_price_mode or "",
+        outcome.stock_input_hash or "",
+        outcome.benchmark_input_hash or "",
+        outcome.evaluation_version or "",
+    )
+
+
+def _is_sha256(value: str | None) -> bool:
+    if value is None or len(value) != 64:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True

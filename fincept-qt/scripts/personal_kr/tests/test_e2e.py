@@ -137,6 +137,12 @@ class PersonalKrTerminalE2ETests(unittest.TestCase):
                 candidates[0].analysis_date,
                 5,
                 benchmark,
+                stock_ticker="005930",
+                stock_source="KIS",
+                stock_price_mode="original",
+                benchmark_symbol="^KS11",
+                benchmark_source="Yahoo Finance",
+                benchmark_price_mode="raw_close",
             )
             frozen = store.record_outcome(outcome)
             expected_raw = (105 - 101) / 101

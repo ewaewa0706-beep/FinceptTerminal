@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 
@@ -83,6 +83,7 @@ class MarketSnapshot:
     as_of: date
     bars: tuple[OHLCVBar, ...]
     source: str = "KIS"
+    price_mode: str = "original"
 
     def __post_init__(self) -> None:
         as_of = _date(self.as_of)
@@ -90,6 +91,10 @@ class MarketSnapshot:
         bars = tuple(self.bars)
         if any(bar.trade_date > as_of for bar in bars):
             raise ValueError("market snapshot contains future bars")
+        price_mode = str(self.price_mode).strip().lower()
+        if price_mode not in {"original", "adjusted"}:
+            raise ValueError("market price_mode must be original or adjusted")
+        object.__setattr__(self, "price_mode", price_mode)
         object.__setattr__(self, "bars", tuple(sorted(bars, key=lambda b: b.trade_date)))
 
 
@@ -127,6 +132,10 @@ class NewsItem:
     link: str
     source: str = "Naver"
 
+    def __post_init__(self) -> None:
+        if self.published_at.tzinfo is None:
+            raise ValueError("news published_at must include a timezone")
+
 
 @dataclass(frozen=True)
 class MacroSnapshot:
@@ -148,6 +157,7 @@ class QuantCandidate:
     ranking_source: str = ""
     ranking_generated_at: datetime | None = None
     ranking_payload_hash: str = ""
+    analysis_cutoff_at: datetime | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "analysis_date", _date(self.analysis_date))
@@ -160,6 +170,12 @@ class QuantCandidate:
         object.__setattr__(self, "factors", cleaned)
         if self.ranking_generated_at is not None and self.ranking_generated_at.tzinfo is None:
             raise ValueError("ranking_generated_at must include a timezone")
+        if self.analysis_cutoff_at is not None and self.analysis_cutoff_at.tzinfo is None:
+            raise ValueError("analysis_cutoff_at must include a timezone")
+        if self.analysis_cutoff_at is not None:
+            kst = timezone(timedelta(hours=9))
+            if self.analysis_cutoff_at.astimezone(kst).date() > self.analysis_date:
+                raise ValueError("analysis_cutoff_at cannot be later than analysis_date")
 
 
 @dataclass(frozen=True)
@@ -174,16 +190,22 @@ class ResearchPacket:
     unavailable_reasons: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        cutoff = self.candidate.analysis_date
-        if self.market.as_of > cutoff:
+        cutoff_date = self.candidate.analysis_date
+        cutoff_at = self.candidate.analysis_cutoff_at
+        if cutoff_at is not None:
+            cutoff_date = min(cutoff_date, cutoff_at.astimezone(timezone(timedelta(hours=9))).date())
+        if self.market.as_of > cutoff_date:
             raise ValueError("market snapshot is newer than analysis_date")
-        if self.fundamentals and self.fundamentals.as_of > cutoff:
+        if self.fundamentals and self.fundamentals.as_of > cutoff_date:
             raise ValueError("fundamentals are newer than analysis_date")
-        if self.flow and self.flow.as_of > cutoff:
+        if self.flow and self.flow.as_of > cutoff_date:
             raise ValueError("investor flow is newer than analysis_date")
-        if self.macro and self.macro.as_of > cutoff:
+        if self.macro and self.macro.as_of > cutoff_date:
             raise ValueError("macro snapshot is newer than analysis_date")
-        if any(item.published_at.date() > cutoff for item in self.news):
+        if cutoff_at is not None:
+            if any(item.published_at > cutoff_at.astimezone(item.published_at.tzinfo) for item in self.news):
+                raise ValueError("news contains articles newer than analysis_cutoff_at")
+        elif any(item.published_at.astimezone(timezone(timedelta(hours=9))).date() > cutoff_date for item in self.news):
             raise ValueError("news contains future articles")
         object.__setattr__(
             self,
@@ -214,6 +236,10 @@ class ResearchResult:
     llm_provider: str = ""
     llm_model_id: str = ""
     workflow_version: str = "personal-kr-v1"
+
+    def __post_init__(self) -> None:
+        if self.signal not in {"Buy", "Hold", "Sell"}:
+            raise ValueError("signal must be Buy, Hold, or Sell")
 
 
 def to_jsonable(value: Any) -> Any:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Any, Protocol
 
 from .llm import Llm
@@ -35,7 +35,9 @@ class FundamentalProvider(Protocol):
 
 
 class NewsProvider(Protocol):
-    def news(self, instrument, as_of, count: int = 20) -> tuple[NewsItem, ...]: ...
+    def news(
+        self, instrument, as_of, count: int = 20, *, cutoff_at: datetime | None = None
+    ) -> tuple[NewsItem, ...]: ...
 
 
 class MacroProvider(Protocol):
@@ -63,7 +65,8 @@ class ResearchEngine:
         self.llm = llm
 
     def packet(self, candidate: QuantCandidate, *, lookback_days: int = 120) -> ResearchPacket:
-        market = self.market.daily_bars(candidate.instrument, candidate.analysis_date, lookback_days)
+        market_as_of, filing_as_of, evidence_as_of = _pit_provider_dates(candidate)
+        market = self.market.daily_bars(candidate.instrument, market_as_of, lookback_days)
         unavailable: list[str] = []
         unavailable_reasons: dict[str, str] = {}
 
@@ -76,7 +79,7 @@ class ResearchEngine:
                 return None
 
         flow = (
-            optional("investor_flow", lambda: self.flow.investor_flow(candidate.instrument, candidate.analysis_date))
+            optional("investor_flow", lambda: self.flow.investor_flow(candidate.instrument, market_as_of))
             if self.flow
             else None
         )
@@ -84,7 +87,7 @@ class ResearchEngine:
             unavailable.append("investor_flow")
             unavailable_reasons["investor_flow"] = "not configured"
         fundamentals = (
-            optional("fundamentals", lambda: self.fundamentals.fundamentals(candidate.instrument, candidate.analysis_date))
+            optional("fundamentals", lambda: self.fundamentals.fundamentals(candidate.instrument, filing_as_of))
             if self.fundamentals
             else None
         )
@@ -92,14 +95,35 @@ class ResearchEngine:
             unavailable.append("fundamentals")
             unavailable_reasons["fundamentals"] = "not configured"
         news_items = (
-            optional("news", lambda: self.news.news(candidate.instrument, candidate.analysis_date, 20))
+            optional(
+                "news",
+                lambda: (
+                    self.news.news(
+                        candidate.instrument,
+                        evidence_as_of,
+                        20,
+                        cutoff_at=candidate.analysis_cutoff_at,
+                    )
+                    if candidate.analysis_cutoff_at is not None
+                    else self.news.news(candidate.instrument, evidence_as_of, 20)
+                ),
+            )
             if self.news
             else None
         )
         if self.news is None:
             unavailable.append("news")
             unavailable_reasons["news"] = "not configured"
-        macro = optional("macro", lambda: self.macro.macro(candidate.analysis_date)) if self.macro else None
+        if self.macro is not None and candidate.analysis_cutoff_at is not None:
+            # ECOS current-series responses are not vintage snapshots and expose
+            # no observation publication timestamp. Once a Quant ranking freezes
+            # an exact intraday cutoff, replaying ECOS later cannot prove what was
+            # visible at that instant, so this enrichment must fail closed.
+            macro = None
+            unavailable.append("macro")
+            unavailable_reasons["macro"] = "exact intraday PIT unavailable for non-vintage ECOS series"
+        else:
+            macro = optional("macro", lambda: self.macro.macro(evidence_as_of)) if self.macro else None
         if self.macro is None:
             unavailable.append("macro")
             unavailable_reasons["macro"] = "not configured"
@@ -118,7 +142,11 @@ class ResearchEngine:
         packet = self.packet(candidate)
         compact = json.dumps(to_jsonable(packet), ensure_ascii=False, separators=(",", ":"))
         identity = f"{candidate.instrument.name}({candidate.instrument.ticker}, {candidate.instrument.market})"
-        cutoff = candidate.analysis_date.isoformat()
+        cutoff = (
+            candidate.analysis_cutoff_at.isoformat()
+            if candidate.analysis_cutoff_at is not None
+            else candidate.analysis_date.isoformat()
+        )
         base_rule = (
             f"분석 기준일은 {cutoff}이다. 기준일 이후 정보는 사용하지 말고, 결측 데이터는 추정하지 말고 명시하라. "
             "한국 주식시장 맥락과 원화 기준을 우선한다."
@@ -213,14 +241,39 @@ def with_decision_id(result: ResearchResult, decision_id: str) -> ResearchResult
 
 
 def _parse_signal(text: str) -> str:
-    # Portfolio Manager is required to put the final signal on the last line.
-    # Use the last explicit marker rather than checking BUY first: a rationale
-    # can legitimately mention rejected alternatives ("not SIGNAL: BUY") before
-    # ending with SIGNAL: SELL.
-    matches = re.findall(r"(?im)^\s*SIGNAL\s*:\s*(BUY|HOLD|SELL)\s*$", text)
-    if matches:
-        return matches[-1].title()
-    raise ValueError("Portfolio Manager response is missing a valid explicit SIGNAL: BUY|HOLD|SELL line")
+    # The prompt contract is intentionally strict: the last non-blank line must
+    # be the signal marker. Accepting an earlier marker followed by prose lets a
+    # malformed/truncated Portfolio Manager response silently become tradable.
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        raise ValueError("Portfolio Manager response must end with explicit SIGNAL: BUY|HOLD|SELL")
+    valid = {"SIGNAL: BUY": "Buy", "SIGNAL: HOLD": "Hold", "SIGNAL: SELL": "Sell"}
+    if lines[-1] not in valid:
+        raise ValueError("Portfolio Manager response must end with explicit SIGNAL: BUY|HOLD|SELL")
+    return valid[lines[-1]]
+
+
+def _pit_provider_dates(candidate: QuantCandidate):
+    """Map an exact ranking cutoff onto providers that expose only dates.
+
+    KIS daily bars/investor flow do not expose a finality timestamp, so an
+    intraday cutoff before 16:00 KST conservatively uses the prior calendar day.
+    DART list/financial endpoints expose receipt dates but not receipt times, so
+    any exact intraday cutoff excludes same-day filings. News keeps the exact
+    timestamp and is filtered by NaverNewsClient.
+    """
+
+    if candidate.analysis_cutoff_at is None:
+        return candidate.analysis_date, candidate.analysis_date, candidate.analysis_date
+
+    kst = timezone(timedelta(hours=9))
+    cutoff_kst = candidate.analysis_cutoff_at.astimezone(kst)
+    evidence_as_of = min(candidate.analysis_date, cutoff_kst.date())
+    market_as_of = evidence_as_of
+    if cutoff_kst.date() == evidence_as_of and cutoff_kst.time() < time(16, 0):
+        market_as_of = evidence_as_of - timedelta(days=1)
+    filing_as_of = evidence_as_of - timedelta(days=1)
+    return market_as_of, filing_as_of, evidence_as_of
 
 
 def _safe_unavailable_reason(exc: Exception) -> str:

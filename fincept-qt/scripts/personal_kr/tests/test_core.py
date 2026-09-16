@@ -5,9 +5,13 @@ import sqlite3
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
+import personal_kr.cli as cli
 from personal_kr.engine import ResearchEngine, _parse_signal
 from personal_kr.evaluation import calculate_forward_return
 from personal_kr.http import HttpResponse, RetryHttpClient
@@ -97,6 +101,18 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(any("ticker" in message for message in errors.values()))
         self.assertTrue(any("KOSPI or KOSDAQ" in message for message in errors.values()))
 
+        selected, errors = select_top_candidates_isolated(
+            [
+                {"ticker": "005930", "market": "KOSPI", "score": 91},
+                {"ticker": "000660", "name": "SK하이닉스", "score": 89},
+            ],
+            date(2026, 8, 20),
+            5,
+        )
+        self.assertEqual(selected, [])
+        self.assertTrue(any("explicit name" in message for message in errors.values()))
+        self.assertTrue(any("explicit market" in message for message in errors.values()))
+
     def test_zero_ticker_rejected(self):
         with self.assertRaises(ValueError):
             Instrument("000000", "invalid")
@@ -124,7 +140,69 @@ class CoreTests(unittest.TestCase):
             _parse_signal("The portfolio should probably hold for now.")
         with self.assertRaisesRegex(ValueError, "explicit SIGNAL"):
             _parse_signal("SIGNAL: WAIT")
+        with self.assertRaisesRegex(ValueError, "explicit SIGNAL"):
+            _parse_signal("signal: hold")
         self.assertEqual(_parse_signal("rationale\nSIGNAL: HOLD"), "Hold")
+        with self.assertRaisesRegex(ValueError, "must end"):
+            _parse_signal("SIGNAL: BUY\ntrailing explanation")
+
+    def test_exact_intraday_cutoff_conservatively_excludes_date_only_same_day_data(self):
+        class RecordingProviders(FakeProviders):
+            def __init__(self):
+                super().__init__()
+                self.market_as_of = None
+                self.flow_as_of = None
+                self.fundamental_as_of = None
+                self.news_cutoff = None
+                self.macro_called = False
+
+            def daily_bars(self, instrument, as_of, lookback_days=120):
+                self.market_as_of = as_of
+                return MarketSnapshot(instrument, as_of, (), "KIS")
+
+            def investor_flow(self, instrument, as_of):
+                self.flow_as_of = as_of
+                return InvestorFlowSnapshot(as_of, "KIS", 1, 1)
+
+            def fundamentals(self, instrument, as_of):
+                self.fundamental_as_of = as_of
+                return FundamentalSnapshot(as_of, "DART", revenue=1)
+
+            def news(self, instrument, as_of, count=20, *, cutoff_at=None):
+                self.news_cutoff = cutoff_at
+                return (NewsItem(cutoff_at - timedelta(minutes=1), "known", "https://known"),)
+
+            def macro(self, as_of):
+                self.macro_called = True
+                return MacroSnapshot(as_of, "ECOS", {})
+
+        kst = timezone(timedelta(hours=9))
+        cutoff = datetime(2026, 8, 20, 10, 0, tzinfo=kst)
+        candidate = QuantCandidate(
+            self.instrument,
+            date(2026, 8, 20),
+            90,
+            1,
+            {},
+            analysis_cutoff_at=cutoff,
+        )
+        providers = RecordingProviders()
+        packet = ResearchEngine(
+            market=providers,
+            flow=providers,
+            fundamentals=providers,
+            news=providers,
+            macro=providers,
+            llm=ScriptedLlm(),
+        ).packet(candidate)
+
+        self.assertEqual(providers.market_as_of, date(2026, 8, 19))
+        self.assertEqual(providers.flow_as_of, date(2026, 8, 19))
+        self.assertEqual(providers.fundamental_as_of, date(2026, 8, 19))
+        self.assertEqual(providers.news_cutoff, cutoff)
+        self.assertFalse(providers.macro_called)
+        self.assertIn("macro", packet.unavailable)
+        self.assertIn("exact intraday PIT", packet.unavailable_reasons["macro"])
 
     def test_partial_data_continues_when_news_fails(self):
         providers = FakeProviders(fail_news=True)
@@ -228,6 +306,104 @@ class CoreTests(unittest.TestCase):
         self.assertEqual([r.candidate.instrument.ticker for r in results], ["005930"])
         self.assertRegex(errors["000660"], "explicit SIGNAL")
 
+    def test_cli_batch_checkpoints_each_success_before_analyzing_next_candidate(self):
+        payload = {
+            "analysis_date": "2026-08-20",
+            "ranking_source": "unit-quant-v1",
+            "ranking_generated_at": "2026-08-20T16:30:00+09:00",
+            "limit": 2,
+            "rows": [
+                {"ticker": "005930", "name": "삼성전자", "market": "KOSPI", "score": 90},
+                {"ticker": "000660", "name": "SK하이닉스", "market": "KOSPI", "score": 80},
+            ],
+        }
+
+        class RecordingStore:
+            def __init__(self):
+                self.recorded = []
+
+            def record_decision(self, result, *, strategy_id):
+                self.recorded.append(result.candidate.instrument.ticker)
+                return result
+
+        store = RecordingStore()
+
+        class CheckpointAwareEngine:
+            def analyze(self, candidate):
+                if candidate.instrument.ticker == "000660":
+                    if store.recorded != ["005930"]:
+                        raise RuntimeError("first decision was not checkpointed")
+                    raise RuntimeError("second candidate failed")
+                return ResearchResult(
+                    candidate=candidate,
+                    signal="Hold",
+                    market_report="m",
+                    fundamentals_report="f",
+                    news_macro_report="n",
+                    bull_case="b+",
+                    bear_case="b-",
+                    research_manager="r",
+                    trader="t",
+                    risk_manager="risk",
+                    portfolio_manager="SIGNAL: HOLD",
+                )
+
+        with patch.object(cli, "_input_json", return_value=payload), patch.object(
+            cli, "_engine", return_value=CheckpointAwareEngine()
+        ), patch.object(cli, "_store", return_value=store):
+            result = cli.cmd_batch()
+
+        self.assertEqual(store.recorded, ["005930"])
+        self.assertEqual([item.candidate.instrument.ticker for item in result["results"]], ["005930"])
+        self.assertEqual(result["errors"]["000660"], "second candidate failed")
+
+    def test_cli_evaluate_reports_pending_horizons_without_writing_partial_outcome(self):
+        decision = ResearchResult(
+            candidate=QuantCandidate(Instrument("005930", "삼성전자", "KOSPI"), date(2026, 9, 15), 90, 1),
+            signal="Hold",
+            market_report="m",
+            fundamentals_report="f",
+            news_macro_report="n",
+            bull_case="b+",
+            bear_case="b-",
+            research_manager="r",
+            trader="t",
+            risk_manager="risk",
+            portfolio_manager="SIGNAL: HOLD",
+            decision_id="decision-1",
+        )
+
+        class FakeStore:
+            def get_decision(self, decision_id):
+                return decision if decision_id == "decision-1" else None
+
+            def record_outcome(self, outcome):
+                raise AssertionError("pending horizons must not be persisted")
+
+        class FakeKis:
+            def daily_bars(self, instrument, as_of, lookback_days=120, *, price_mode="original"):
+                self.price_mode = price_mode
+                return MarketSnapshot(
+                    instrument,
+                    as_of,
+                    (OHLCVBar(date(2026, 9, 15), 100, 101, 99, 100, 1000),),
+                    "KIS",
+                    price_mode,
+                )
+
+        fake_kis = FakeKis()
+        args = SimpleNamespace(decision_id="decision-1", horizons=[1, 5])
+        with patch.object(cli, "_store", return_value=FakeStore()), patch.object(
+            cli.KisClient, "from_env", return_value=fake_kis
+        ), patch.object(cli, "load_yahoo_benchmark", return_value=()), patch.object(
+            cli, "_korea_today", return_value=date(2026, 9, 16)
+        ):
+            result = cli.cmd_evaluate(args)
+
+        self.assertEqual(fake_kis.price_mode, "original")
+        self.assertEqual(result["outcomes"], [])
+        self.assertEqual(result["pending_horizons"], [1, 5])
+
     def test_http_retries_500_then_succeeds(self):
         calls = []
 
@@ -271,8 +447,6 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(out.end_date, date(2026, 8, 23))
 
     def test_outcome_first_write_wins(self):
-        from personal_kr.evaluation import Outcome
-
         with tempfile.TemporaryDirectory() as tmp:
             store = DecisionStore(Path(tmp) / "kr.db")
             decision = store.record_decision(
@@ -290,36 +464,27 @@ class CoreTests(unittest.TestCase):
                     portfolio_manager="p",
                 )
             )
-            first = Outcome(
+            first = calculate_forward_return(
                 decision.decision_id or "",
+                bars(1.0, days=10),
+                self.candidate.analysis_date,
                 5,
-                date(2026, 8, 20),
-                date(2026, 8, 25),
-                0.05,
-                0.02,
-                0.03,
-                0.06,
-                -0.01,
+                bars(0.5, days=10),
+                stock_ticker="005930",
+                stock_source="KIS",
+                stock_price_mode="original",
+                benchmark_symbol="^KS11",
+                benchmark_source="Yahoo Finance",
+                benchmark_price_mode="raw_close",
             )
-            second = Outcome(
-                decision.decision_id or "",
-                5,
-                date(2026, 8, 20),
-                date(2026, 8, 25),
-                0.50,
-                0.20,
-                0.30,
-                0.60,
-                -0.10,
-            )
+            second = replace(first, raw_return=0.50, benchmark_return=0.20, alpha_return=0.30)
             stored_first = store.record_outcome(first)
             stored_second = store.record_outcome(second)
-            self.assertEqual(stored_first.raw_return, 0.05)
-            self.assertEqual(stored_second.raw_return, 0.05)
+            self.assertEqual(stored_second.raw_return, stored_first.raw_return)
             history = store.list_outcomes(decision.decision_id or "")
             self.assertEqual(len(history), 1)
             self.assertEqual(history[0].horizon, 5)
-            self.assertEqual(history[0].raw_return, 0.05)
+            self.assertEqual(history[0].raw_return, stored_first.raw_return)
 
     def test_outcome_rejects_replay_with_different_price_input_fingerprint(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -347,8 +512,10 @@ class CoreTests(unittest.TestCase):
                 bars(0.5, days=10),
                 stock_ticker="005930",
                 stock_source="KIS",
+                stock_price_mode="original",
                 benchmark_symbol="^KS11",
                 benchmark_source="Yahoo Finance",
+                benchmark_price_mode="raw_close",
             )
             changed = calculate_forward_return(
                 decision.decision_id or "",
@@ -358,8 +525,10 @@ class CoreTests(unittest.TestCase):
                 bars(0.75, days=10),
                 stock_ticker="005930",
                 stock_source="KIS",
+                stock_price_mode="original",
                 benchmark_symbol="^KS11",
                 benchmark_source="Yahoo Finance",
+                benchmark_price_mode="raw_close",
             )
             frozen = store.record_outcome(first)
             self.assertEqual(frozen.stock_input_hash, first.stock_input_hash)
@@ -386,6 +555,55 @@ class CoreTests(unittest.TestCase):
                         stock_ticker="005930",
                     )
                 )
+
+    def test_outcome_rejects_same_day_or_missing_source_provenance(self):
+        from personal_kr.evaluation import Outcome
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DecisionStore(Path(tmp) / "kr.db")
+            decision = store.record_decision(
+                ResearchResult(
+                    candidate=self.candidate,
+                    signal="Hold",
+                    market_report="m",
+                    fundamentals_report="f",
+                    news_macro_report="n",
+                    bull_case="b+",
+                    bear_case="b-",
+                    research_manager="r",
+                    trader="t",
+                    risk_manager="risk",
+                    portfolio_manager="SIGNAL: HOLD",
+                )
+            )
+            base = dict(
+                decision_id=decision.decision_id or "",
+                horizon=1,
+                start_date=self.candidate.analysis_date,
+                end_date=self.candidate.analysis_date + timedelta(days=1),
+                raw_return=0.01,
+                benchmark_return=0.005,
+                alpha_return=0.005,
+                max_gain=0.02,
+                max_drawdown=-0.01,
+                stock_ticker="005930",
+                stock_source="KIS",
+                stock_price_mode="original",
+                benchmark_symbol="^KS11",
+                benchmark_source="Yahoo Finance",
+                benchmark_price_mode="raw_close",
+                evaluated_at=datetime.now(timezone.utc),
+                stock_input_hash="a" * 64,
+                benchmark_input_hash="b" * 64,
+            )
+            with self.assertRaisesRegex(ValueError, "start_date must be after"):
+                store.record_outcome(Outcome(**base))
+
+            base["start_date"] = self.candidate.analysis_date + timedelta(days=1)
+            base["end_date"] = self.candidate.analysis_date + timedelta(days=1)
+            base["stock_source"] = ""
+            with self.assertRaisesRegex(ValueError, "stock_source provenance is required"):
+                store.record_outcome(Outcome(**base))
 
     def test_decision_first_write_wins_and_paper_guards(self):
         with tempfile.TemporaryDirectory() as tmp:

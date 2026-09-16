@@ -191,7 +191,7 @@ std::vector<ToolDef> get_personal_kr_research_tools() {
                 .length(20, 64)
                 .integer("limit", "Maximum deep-analysis candidates")
                 .default_int(5)
-                .between(1, 50)
+                .between(1, 10)
                 .build();
         t.default_timeout_ms = kBatchResearchTimeoutMs;
         t.supports_async = true;

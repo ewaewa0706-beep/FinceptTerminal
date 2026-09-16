@@ -82,7 +82,7 @@ def _candidate_from_payload(payload: dict[str, Any]) -> QuantCandidate:
     if "instrument" in payload:
         inst = payload["instrument"]
         return QuantCandidate(
-            Instrument(inst["ticker"], inst["name"], inst.get("market", "KOSPI")),
+            Instrument(inst["ticker"], inst["name"], inst["market"]),
             analysis_date,
             float(payload.get("score", 0)),
             payload.get("rank"),
@@ -177,15 +177,17 @@ def cmd_batch() -> Any:
     if analysis_date > _korea_today():
         raise ValueError("analysis_date cannot be in the future")
     ranking_source, ranking_generated_at, ranking_hash = _ranking_provenance(payload, analysis_date)
-    candidates, input_errors = select_top_candidates_isolated(
-        payload["rows"], analysis_date, int(payload.get("limit", 5))
-    )
+    limit = int(payload.get("limit", 5))
+    if limit < 1 or limit > 10:
+        raise ValueError("production batch limit must be between 1 and 10")
+    candidates, input_errors = select_top_candidates_isolated(payload["rows"], analysis_date, limit)
     candidates = [
         replace(
             candidate,
             ranking_source=ranking_source,
             ranking_generated_at=ranking_generated_at,
             ranking_payload_hash=ranking_hash,
+            analysis_cutoff_at=ranking_generated_at,
         )
         for candidate in candidates
     ]
@@ -197,18 +199,20 @@ def cmd_batch() -> Any:
             "errors": {},
             "execution_mode": "research_only",
         }
-    engine = _engine(payload.get("llm"))
-    results, errors = engine.analyze_many(candidates)
     store = _store()
+    engine = _engine(payload.get("llm"))
     strategy_id = str(payload.get("strategy_id") or "personal-kr-quant")
     stored = []
-    for result in results:
+    errors: dict[str, str] = {}
+    # Analyze and freeze one candidate at a time. If a later candidate stalls,
+    # fails, or the outer subprocess watchdog fires, earlier completed decisions
+    # have already been checkpointed in SQLite instead of being lost in memory.
+    for candidate in candidates:
         try:
+            result = engine.analyze(candidate)
             stored.append(store.record_decision(result, strategy_id=strategy_id))
         except Exception as exc:
-            # Persistence/provenance conflict for one Top-N name must not erase
-            # successfully frozen decisions for the rest of the batch.
-            errors[result.candidate.instrument.ticker] = f"decision persistence failed: {exc}"
+            errors[candidate.instrument.ticker] = str(exc)
     return {
         "selected": candidates,
         "results": stored,
@@ -258,7 +262,12 @@ def cmd_evaluate(args: argparse.Namespace) -> Any:
     instrument = decision.candidate.instrument
     today = _korea_today()
     lookback_days = max(120, (today - decision.candidate.analysis_date).days + 30)
-    market = KisClient.from_env().daily_bars(instrument, today, lookback_days=lookback_days)
+    market = KisClient.from_env().daily_bars(
+        instrument,
+        today,
+        lookback_days=lookback_days,
+        price_mode="original",
+    )
     benchmark_symbol = instrument.benchmark_symbol
     benchmark = load_yahoo_benchmark(
         benchmark_symbol,
@@ -266,6 +275,7 @@ def cmd_evaluate(args: argparse.Namespace) -> Any:
         today,
     )
     outcomes = []
+    pending_horizons: list[int] = []
     for horizon in args.horizons:
         try:
             outcome = calculate_forward_return(
@@ -276,15 +286,22 @@ def cmd_evaluate(args: argparse.Namespace) -> Any:
                 benchmark,
                 stock_ticker=instrument.ticker,
                 stock_source=market.source,
+                stock_price_mode=market.price_mode,
                 benchmark_symbol=benchmark_symbol,
                 benchmark_source="Yahoo Finance",
+                benchmark_price_mode="raw_close",
             )
         except ValueError as exc:
-            if "insufficient future trading sessions" in str(exc):
+            if str(exc) in {"insufficient future trading sessions", "no future trading session after analysis date"}:
+                pending_horizons.append(horizon)
                 continue
             raise
         outcomes.append(store.record_outcome(outcome))
-    return outcomes
+    return {
+        "decision_id": args.decision_id,
+        "outcomes": outcomes,
+        "pending_horizons": pending_horizons,
+    }
 
 
 def cmd_outcomes(args: argparse.Namespace) -> Any:

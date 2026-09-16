@@ -107,7 +107,10 @@ $batch | python personal_kr_terminal.py batch
 The batch freezes a SHA-256 hash of the canonical ranking payload. Re-running
 the same strategy/ticker/date with different ranking source, generation time or
 payload hash is rejected as a provenance conflict for that candidate instead of
-silently mixing two ranking runs.
+silently mixing two ranking runs. Production deep-research batches are capped at
+10 names. Each completed candidate is persisted immediately before the next name
+starts, so a later candidate failure or outer watchdog timeout does not erase
+already completed research.
 
 Live Korean data only, without LLM analysis:
 
@@ -144,9 +147,11 @@ KIS, and `^KS11` / `^KQ11` benchmark bars are fetched server-side from Yahoo
 Finance's chart endpoint before raw return, benchmark return and alpha are
 persisted. The stock horizon is counted on stock trading sessions, never by
 dropping dates that are missing from the benchmark. Missing benchmark horizon
-endpoints fail closed. Each frozen outcome also stores `evaluated_at` and
-canonical SHA-256 fingerprints of the stock and benchmark price inputs; a later
-replay with different input fingerprints is surfaced as a provenance conflict.
+endpoints fail closed. Horizons that do not yet have enough future stock sessions
+are returned in `pending_horizons` rather than written as failures. Each frozen
+outcome stores the stock/benchmark source, price mode, evaluation version,
+`evaluated_at`, and canonical SHA-256 fingerprints of both price inputs. A later
+replay with different immutable provenance is surfaced as a provenance conflict.
 KIS stock bars are currently original-price bars, so outcomes are deterministic
 price-return measurements rather than split/dividend-adjusted total returns.
 Corporate-action-aware total-return accounting remains a separate enhancement.
@@ -176,21 +181,29 @@ than a side effect of research.
 
 ## Point-in-time and failure behavior
 
-- market bars newer than the analysis date are rejected;
+- the timezone-aware external `ranking_generated_at` is frozen as the exact
+  analysis cutoff for production batch research;
+- market bars newer than the analysis cutoff are rejected. KIS daily price and
+  investor-flow endpoints expose date-level data without a finality timestamp;
+  before 16:00 KST the same calendar day's KIS rows are therefore excluded and
+  the prior date is used conservatively;
 - historical KIS research bars request **original/unadjusted prices**
   (`FID_ORG_ADJ_PRC=1`). Later corporate actions can restate adjusted history,
   so adjusted prices are not used as frozen research evidence;
-- DART uses filing receipt time for availability and resolves the statement
+- DART uses filing receipt date for availability and resolves the statement
   business year from the report period, preventing the common annual-report
-  receipt-year error;
+  receipt-year error. Because the used DART interfaces do not provide a receipt
+  time, an exact intraday batch cutoff conservatively excludes same-day filings;
 - a later DART amendment cannot overwrite an earlier point-in-time filing;
 - Naver search is current-index/non-vintage. Today-only on-demand search is
-  allowed, future articles are filtered and duplicates are removed. Historical
-  analysis fails this enrichment closed instead of pretending the current search
-  index is a historical snapshot;
+  allowed, articles later than the exact batch cutoff are filtered and duplicates
+  are removed. Historical analysis fails this enrichment closed instead of
+  pretending the current search index is a historical snapshot;
 - ECOS responses are non-vintage for this workflow. Historical analysis fails
-  the macro enrichment closed; for today's snapshot one missing series does not
-  abort the other macro series;
+  the macro enrichment closed. Exact intraday batch research also marks ECOS
+  unavailable because the current-series response cannot prove what was visible
+  at that exact timestamp; for an ordinary today's on-demand snapshot, one
+  missing series does not abort the other macro series;
 - KIS HTTP 401 refreshes authentication once; 429/5xx/timeouts are bounded
   retries;
 - KIS daily history is split into bounded date windows to avoid silent provider
@@ -199,9 +212,12 @@ than a side effect of research.
   as unavailable enrichments rather than discarding an otherwise valid result.
   Sanitized failure reasons are frozen in `unavailable_reasons` without URLs or
   credential/token values;
-- Portfolio Manager output must contain an explicit `SIGNAL: BUY`,
-  `SIGNAL: HOLD`, or `SIGNAL: SELL` line. Missing/malformed output fails closed;
-- one failed Top-N candidate does not discard successful candidates;
+- the final nonblank Portfolio Manager line must be exactly `SIGNAL: BUY`,
+  `SIGNAL: HOLD`, or `SIGNAL: SELL`. Missing markers or trailing prose fail closed;
+- ranking rows used by the production batch require an explicit Korean company
+  name and `KOSPI`/`KOSDAQ` market instead of silently defaulting either field;
+- one failed Top-N candidate does not discard successful candidates, and each
+  success is checkpointed before analysis proceeds to the next candidate;
 - repeated decision/outcome writes are first-write-wins only when immutable
   provenance matches; conflicting ranking or outcome input provenance is rejected;
 - legacy paper rows without required decision/client provenance are quarantined
@@ -250,8 +266,9 @@ ctest --test-dir build\win-dev --output-on-failure
 ```
 
 The lightweight GitHub Actions workflow `.github/workflows/personal-kr-python.yml`
-runs the Personal KR Python regression/compile gate independently from the much
-heavier native Qt workflows.
+runs the Personal KR regression/syntax/status gate on Ubuntu 24.04 and Windows
+Server 2022 with Python 3.11 and 3.12, independently from the much heavier native
+Qt workflows. It requires no provider secrets and makes no live API calls.
 
 ## Tests
 

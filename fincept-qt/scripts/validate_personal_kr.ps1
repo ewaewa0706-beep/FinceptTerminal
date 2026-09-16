@@ -60,6 +60,9 @@ print(f"syntax OK: {len(paths)} Python files")
     Write-Host "Personal KR: unittest regression suite"
     Invoke-PythonChecked @("-m", "unittest", "discover", "-s", "personal_kr/tests", "-v")
 
+    Write-Host "Personal KR: headless status contract"
+    Invoke-PythonChecked @("personal_kr_terminal.py", "status")
+
     Write-Host "Personal KR validation passed."
 }
 finally {

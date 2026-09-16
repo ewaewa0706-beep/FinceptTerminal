@@ -75,6 +75,11 @@ class CppWiringTests(unittest.TestCase):
         self.assertIn("run_opts.timeout_ms = 20 * 60 * 1000", ui)
         self.assertIn("run_with_options", ui)
 
+    def test_production_batch_is_bounded_to_ten_deep_research_names(self):
+        tools = (QT_ROOT / "src/mcp/tools/PersonalKrResearchTools.cpp").read_text(encoding="utf-8")
+        batch = tools.split('t.name = "kr_research_batch"', 1)[1].split('t.name = "kr_analyze_stock"', 1)[0]
+        self.assertIn(".between(1, 10)", batch)
+
 
 if __name__ == "__main__":
     unittest.main()

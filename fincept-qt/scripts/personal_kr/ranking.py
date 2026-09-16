@@ -27,8 +27,12 @@ def candidate_from_mapping(row: dict[str, Any], analysis_date: date | str) -> Qu
     ticker = row.get("ticker") or row.get("symbol") or row.get("code")
     if ticker is None or not str(ticker).strip():
         raise ValueError("ranking row requires ticker/symbol/code")
-    name = row.get("name") or row.get("company_name") or str(ticker)
-    market = row.get("market") or row.get("exchange") or "KOSPI"
+    name = row.get("name") or row.get("company_name")
+    if name is None or not str(name).strip():
+        raise ValueError("ranking row requires explicit name/company_name")
+    market = row.get("market") or row.get("exchange")
+    if market is None or not str(market).strip():
+        raise ValueError("ranking row requires explicit market/exchange")
     score = row.get("score", row.get("total_score"))
     if score is None:
         raise ValueError("ranking row requires score/total_score")

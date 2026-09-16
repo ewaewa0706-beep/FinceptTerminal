@@ -255,7 +255,18 @@ class KisClient:
             self._sleep(remaining)
         self._last_request_monotonic = time.monotonic()
 
-    def daily_bars(self, instrument: Instrument, as_of: date, lookback_days: int = 120) -> MarketSnapshot:
+    def daily_bars(
+        self,
+        instrument: Instrument,
+        as_of: date,
+        lookback_days: int = 120,
+        *,
+        price_mode: str = "original",
+    ) -> MarketSnapshot:
+        price_mode = str(price_mode).strip().lower()
+        if price_mode not in {"original", "adjusted"}:
+            raise ValueError("KIS price_mode must be original or adjusted")
+        kis_price_flag = "1" if price_mode == "original" else "0"
         start = date.fromordinal(max(1, as_of.toordinal() - lookback_days))
         bars: list[OHLCVBar] = []
         # KIS can cap the number of daily rows returned from one request. Split
@@ -273,10 +284,10 @@ class KisClient:
                     "FID_INPUT_DATE_1": window_start.strftime("%Y%m%d"),
                     "FID_INPUT_DATE_2": window_end.strftime("%Y%m%d"),
                     "FID_PERIOD_DIV_CODE": "D",
-                    # Strict historical research uses original prices. KIS
-                    # adjusted history can be restated by later corporate
-                    # actions, which would leak information into old PIT runs.
-                    "FID_ORG_ADJ_PRC": "1",
+                    # Strict historical research defaults to original prices.
+                    # Adjusted history can be requested explicitly by a caller
+                    # whose provenance contract allows it.
+                    "FID_ORG_ADJ_PRC": kis_price_flag,
                 },
             )
             rows = payload.get("output2") or []
@@ -309,7 +320,13 @@ class KisClient:
         if not bars:
             raise RuntimeError(f"KIS returned no daily bars for {instrument.ticker}")
         deduped = {bar.trade_date: bar for bar in bars}
-        return MarketSnapshot(instrument, as_of, tuple(deduped[day] for day in sorted(deduped)), "KIS")
+        return MarketSnapshot(
+            instrument,
+            as_of,
+            tuple(deduped[day] for day in sorted(deduped)),
+            "KIS",
+            price_mode,
+        )
 
     def investor_flow(self, instrument: Instrument, as_of: date) -> InvestorFlowSnapshot:
         payload = self._get(
@@ -541,7 +558,14 @@ class NaverNewsClient:
     def from_env(cls, **kwargs: Any) -> "NaverNewsClient":
         return cls(os.getenv("NAVER_CLIENT_ID", ""), os.getenv("NAVER_CLIENT_SECRET", ""), **kwargs)
 
-    def news(self, instrument: Instrument, as_of: date, count: int = 20) -> tuple[NewsItem, ...]:
+    def news(
+        self,
+        instrument: Instrument,
+        as_of: date,
+        count: int = 20,
+        *,
+        cutoff_at: datetime | None = None,
+    ) -> tuple[NewsItem, ...]:
         kst = timezone(timedelta(hours=9))
         now_kst = self._now().astimezone(kst)
         if as_of < now_kst.date():
@@ -549,6 +573,15 @@ class NaverNewsClient:
         if as_of > now_kst.date():
             raise ValueError("Naver news as_of cannot be in the future")
         cutoff = now_kst
+        if cutoff_at is not None:
+            if cutoff_at.tzinfo is None:
+                raise ValueError("Naver cutoff_at must include a timezone")
+            cutoff_kst = cutoff_at.astimezone(kst)
+            if cutoff_kst.date() != as_of:
+                raise ValueError("Naver cutoff_at date must match as_of")
+            if cutoff_kst > now_kst:
+                raise ValueError("Naver cutoff_at cannot be in the future")
+            cutoff = cutoff_kst
         display = min(max(count, 1), 100)
         result: list[NewsItem] = []
         seen: set[str] = set()

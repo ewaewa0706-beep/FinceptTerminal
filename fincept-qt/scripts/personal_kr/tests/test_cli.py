@@ -179,8 +179,13 @@ class CliIntegrationTests(unittest.TestCase):
                     -0.02,
                     stock_ticker="005930",
                     stock_source="KIS",
+                    stock_price_mode="original",
                     benchmark_symbol="^KS11",
                     benchmark_source="Yahoo Finance",
+                    benchmark_price_mode="raw_close",
+                    evaluated_at=datetime.now(timezone.utc),
+                    stock_input_hash="a" * 64,
+                    benchmark_input_hash="b" * 64,
                 )
             )
             proc, body = run_cli("outcomes", decision.decision_id or "", data_dir=tmp)

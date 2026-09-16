@@ -24,11 +24,14 @@ class Outcome:
     max_drawdown: float | None
     stock_ticker: str | None = None
     stock_source: str | None = None
+    stock_price_mode: str | None = None
     benchmark_symbol: str | None = None
     benchmark_source: str | None = None
+    benchmark_price_mode: str | None = None
     evaluated_at: datetime | None = None
     stock_input_hash: str | None = None
     benchmark_input_hash: str | None = None
+    evaluation_version: str = "personal-kr-outcome-v1"
 
 
 def calculate_forward_return(
@@ -40,8 +43,10 @@ def calculate_forward_return(
     *,
     stock_ticker: str | None = None,
     stock_source: str | None = None,
+    stock_price_mode: str | None = None,
     benchmark_symbol: str | None = None,
     benchmark_source: str | None = None,
+    benchmark_price_mode: str | None = None,
 ) -> Outcome:
     if horizon < 1:
         raise ValueError("horizon must be >= 1")
@@ -86,8 +91,10 @@ def calculate_forward_return(
         max_drawdown=drawdown,
         stock_ticker=stock_ticker,
         stock_source=stock_source,
+        stock_price_mode=stock_price_mode,
         benchmark_symbol=benchmark_symbol,
         benchmark_source=benchmark_source,
+        benchmark_price_mode=benchmark_price_mode,
         evaluated_at=datetime.now(timezone.utc),
         stock_input_hash=_bars_hash(path),
         benchmark_input_hash=benchmark_input_hash,

@@ -208,7 +208,20 @@ class ProviderContractTests(unittest.TestCase):
             self.assertEqual(params["FID_PERIOD_DIV_CODE"], "D")
             self.assertEqual(params["FID_ORG_ADJ_PRC"], "1")
         self.assertTrue(all(bar.trade_date <= date(2026, 9, 16) for bar in snapshot.bars))
+        self.assertEqual(snapshot.price_mode, "original")
         self.assertEqual(http.token_calls, 1)
+
+        adjusted_http = KisHttp()
+        adjusted = KisClient("app", "secret", http=adjusted_http, base_url="https://kis.test").daily_bars(
+            self.instrument,
+            date(2026, 9, 16),
+            lookback_days=1,
+            price_mode="adjusted",
+        )
+        adjusted_calls = [call for call in adjusted_http.get_calls if "itemchartprice" in call[0]]
+        self.assertTrue(adjusted_calls)
+        self.assertTrue(all(call[1]["params"]["FID_ORG_ADJ_PRC"] == "0" for call in adjusted_calls))
+        self.assertEqual(adjusted.price_mode, "adjusted")
 
     def test_kis_401_refreshes_token_once_and_investor_flow_is_point_in_time(self):
         http = KisHttp(first_401=True)
@@ -305,6 +318,34 @@ class ProviderContractTests(unittest.TestCase):
         self.assertEqual(http.params["sort"], "date")
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0].title, "Samsung today")
+
+    def test_naver_exact_intraday_cutoff_excludes_later_same_day_news(self):
+        kst = timezone(timedelta(hours=9))
+
+        class IntradayHttp:
+            def get_json(self, url, **kwargs):
+                return {
+                    "items": [
+                        {
+                            "pubDate": format_datetime(datetime(2026, 9, 16, 9, 0, tzinfo=kst)),
+                            "title": "known before cutoff",
+                            "originallink": "https://news/before",
+                        },
+                        {
+                            "pubDate": format_datetime(datetime(2026, 9, 16, 14, 0, tzinfo=kst)),
+                            "title": "later same day",
+                            "originallink": "https://news/after",
+                        },
+                    ]
+                }
+
+        client = NaverNewsClient("id", "secret", http=IntradayHttp(), now=lambda: self.now_kst)
+        items = client.news(
+            self.instrument,
+            date(2026, 9, 16),
+            cutoff_at=datetime(2026, 9, 16, 10, 0, tzinfo=kst),
+        )
+        self.assertEqual([item.title for item in items], ["known before cutoff"])
 
     def test_naver_historical_news_fails_closed_without_vintage_snapshot(self):
         class MustNotCall:
