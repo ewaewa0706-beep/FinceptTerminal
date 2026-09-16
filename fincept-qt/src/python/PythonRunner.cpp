@@ -159,6 +159,9 @@ static const QStringList kManagedCredentialKeys = {
 #define FINCEPT_KEYED_CRED(KEY, NAME) KEY, // NOLINT(cppcoreguidelines-macro-usage) — X-macro list expansion
 #include "config/KeyedConnectorCredentials.inc"
 #undef FINCEPT_KEYED_CRED
+#define FINCEPT_KR_CRED(KEY, NAME) KEY, // NOLINT(cppcoreguidelines-macro-usage) — shared credential catalogue
+#include "config/PersonalKrCredentials.inc"
+#undef FINCEPT_KR_CRED
 };
 
 // ── Sensitive shell-env stripping ────────────────────────────────────────────

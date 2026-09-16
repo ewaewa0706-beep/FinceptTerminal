@@ -32,6 +32,7 @@
 #include "mcp/tools/NewsTools.h"
 #include "mcp/tools/NotesTools.h"
 #include "mcp/tools/PaperTradingTools.h"
+#include "mcp/tools/PersonalKrResearchTools.h"
 #include "mcp/tools/PortfolioTools.h"
 #include "mcp/tools/ProfileTools.h"
 #include "mcp/tools/PythonTools.h"
@@ -191,6 +192,10 @@ void initialize_all_tools() {
 
     // equity-research — symbol search, load, financials, technicals, peers, news, sentiment
     provider.register_tools(tools::get_equity_research_tools());
+
+    // personal KR research — external quant Top-N → Korean data → multi-stage AI research
+    // Read/research-only: live order submission is intentionally not exposed here.
+    provider.register_tools(tools::get_personal_kr_research_tools());
 
     // workspace — monitors, windows, panels, layouts, snapshots, symbol groups, actions, command-bar
     provider.register_tools(tools::get_workspace_tools());

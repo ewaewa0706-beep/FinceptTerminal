@@ -50,6 +50,9 @@ const QList<CredDef> CRED_KEYS = {
 #define FINCEPT_KEYED_CRED(KEY, NAME) {KEY, NAME}, // NOLINT(cppcoreguidelines-macro-usage) — X-macro list expansion
 #include "config/KeyedConnectorCredentials.inc"
 #undef FINCEPT_KEYED_CRED
+#define FINCEPT_KR_CRED(KEY, NAME) {KEY, NAME}, // NOLINT(cppcoreguidelines-macro-usage) — shared credential catalogue
+#include "config/PersonalKrCredentials.inc"
+#undef FINCEPT_KR_CRED
 };
 
 } // namespace

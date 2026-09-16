@@ -5,7 +5,9 @@
 // price-target gauge (hero) above a 3×2 grid of color-coded verdict cards
 // (Valuation, Financial Health, Cash Flow, Profitability, Growth, Risk).
 //
-// Every rating is computed purely from StockInfo — no extra backend calls.
+// Every built-in rating is computed purely from StockInfo. Korean listings also
+// expose an explicit user-triggered deep-research panel at the bottom; it makes
+// no call until the user presses the button.
 // The heuristics are absolute screening signals (not sector-adjusted), so
 // rationales stay factual. i18n follows the existing pattern: static labels
 // register an English source key in i18n_labels_; dynamic verdict/hero text
@@ -13,16 +15,25 @@
 // replays it on a language change.
 #include "screens/equity_research/EquityAnalysisTab.h"
 
+#include "python/PythonRunner.h"
+#include "services/equity/PersonalKrLlmConfig.h"
 #include "services/equity/EquityResearchService.h"
 #include "ui/theme/Theme.h"
 
+#include <QDate>
+#include <QDateTime>
 #include <QEvent>
 #include <QFontMetrics>
 #include <QFrame>
 #include <QGridLayout>
 #include <QHBoxLayout>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QPainter>
+#include <QPlainTextEdit>
+#include <QPointer>
 #include <QPolygonF>
+#include <QPushButton>
 #include <QScrollArea>
 #include <QVBoxLayout>
 
@@ -209,7 +220,16 @@ void EquityAnalysisTab::set_symbol(const QString& symbol) {
         return;
     current_symbol_ = symbol;
     info_loaded_ = false;
+    cached_info_ = {};
     loading_overlay_->show_loading(tr("LOADING ANALYSIS…"));
+    if (kr_panel_)
+        kr_panel_->setVisible(is_korean_symbol_());
+    if (kr_status_)
+        kr_status_->setText(tr("On-demand · research_only · no live order submission"));
+    if (kr_result_)
+        kr_result_->clear();
+    if (kr_research_btn_)
+        kr_research_btn_->setEnabled(!kr_market_().isEmpty());
 }
 
 void EquityAnalysisTab::build_ui() {
@@ -263,10 +283,151 @@ void EquityAnalysisTab::build_ui() {
 
     root->addWidget(grid_host, 1);
 
+    // Korean-market AI research is an explicit, on-demand action. Keeping it
+    // inside the existing Analysis tab avoids adding a parallel screen while
+    // still giving users a visible path to the new KIS/DART/Naver/ECOS engine.
+    kr_panel_ = build_kr_research_panel_();
+    kr_panel_->setVisible(is_korean_symbol_());
+    root->addWidget(kr_panel_);
+
     scroll->setWidget(content);
     auto* ol = new QVBoxLayout(this);
     ol->setContentsMargins(0, 0, 0, 0);
     ol->addWidget(scroll);
+}
+
+QFrame* EquityAnalysisTab::build_kr_research_panel_() {
+    auto* panel = make_panel_(QT_TR_NOOP("KR AI RESEARCH"), ui::colors::CYAN());
+    auto* vl = static_cast<QVBoxLayout*>(panel->layout());
+
+    auto* description = new QLabel(
+        tr("Deep research for Korean listings using KIS market/foreign-institution flow and optional "
+           "DART, Naver News and ECOS enrichment. Analysis is on-demand and research-only."));
+    description->setWordWrap(true);
+    vl->addWidget(description);
+
+    auto* controls = new QWidget(nullptr);
+    auto* hl = new QHBoxLayout(controls);
+    hl->setContentsMargins(0, 0, 0, 0);
+    hl->setSpacing(10);
+
+    kr_research_btn_ = new QPushButton(tr("RUN KR AI DEEP RESEARCH"));
+    kr_research_btn_->setCursor(Qt::PointingHandCursor);
+    connect(kr_research_btn_, &QPushButton::clicked, this, &EquityAnalysisTab::on_kr_research_clicked);
+    hl->addWidget(kr_research_btn_);
+
+    kr_status_ = new QLabel(tr("On-demand · research_only · no live order submission"));
+    hl->addWidget(kr_status_, 1);
+    vl->addWidget(controls);
+
+    kr_result_ = new QPlainTextEdit;
+    kr_result_->setReadOnly(true);
+    kr_result_->setPlaceholderText(tr("Run KR AI Deep Research to view the point-in-time research result here."));
+    kr_result_->setMinimumHeight(240);
+    vl->addWidget(kr_result_);
+    return panel;
+}
+
+void EquityAnalysisTab::on_kr_research_clicked() {
+    if (!is_korean_symbol_() || !kr_research_btn_ || !kr_result_)
+        return;
+
+    const QString market = kr_market_();
+    if (market.isEmpty()) {
+        kr_status_->setText(tr("KR market unresolved · wait for symbol info or use .KS/.KQ"));
+        return;
+    }
+    const QString company_name = cached_info_.company_name.trimmed().isEmpty() ? kr_ticker_() : cached_info_.company_name;
+    const QDate korea_today = QDateTime::currentDateTimeUtc().addSecs(9 * 60 * 60).date();
+    QJsonObject payload{
+        {"instrument", QJsonObject{{"ticker", kr_ticker_()},
+                                   {"name", company_name},
+                                   {"market", market},
+                                   {"currency", "KRW"}}},
+        {"analysis_date", korea_today.toString(Qt::ISODate)},
+        {"score", 0.0},
+        {"strategy_id", "personal-kr-ui"},
+    };
+    const QJsonObject llm = fincept::services::equity::personal_kr_active_llm_config();
+    if (!llm.isEmpty())
+        payload["llm"] = llm;
+
+    kr_research_btn_->setEnabled(false);
+    kr_status_->setText(tr("Running KR AI research…"));
+    kr_result_->setPlainText(tr("Collecting Korean market data and running the research chain…"));
+
+    const QByteArray input = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+    QPointer<EquityAnalysisTab> self(this);
+    const QString launch_symbol = current_symbol_;
+    python::PythonRunner::instance().run(
+        "personal_kr_terminal.py", {"analyze"},
+        [self, launch_symbol](python::PythonResult result) {
+            if (!self)
+                return;
+            if (self->current_symbol_ != launch_symbol)
+                return;
+            if (self->kr_research_btn_)
+                self->kr_research_btn_->setEnabled(true);
+            if (!result.success) {
+                if (self->kr_status_)
+                    self->kr_status_->setText(self->tr("KR AI research unavailable"));
+                if (self->kr_result_)
+                    self->kr_result_->setPlainText(result.error);
+                return;
+            }
+
+            const QJsonDocument doc = QJsonDocument::fromJson(python::extract_json(result.output).toUtf8());
+            if (!doc.isObject() || !doc.object().value("success").toBool(false)) {
+                const QString error = doc.isObject() ? doc.object().value("error").toString() : result.output;
+                if (self->kr_status_)
+                    self->kr_status_->setText(self->tr("KR AI research unavailable"));
+                if (self->kr_result_)
+                    self->kr_result_->setPlainText(error);
+                return;
+            }
+            const QJsonObject data = doc.object().value("data").toObject();
+            const QString signal = data.value("signal").toString(QStringLiteral("Hold"));
+            if (self->kr_status_)
+                self->kr_status_->setText(self->tr("Completed · signal: %1 · research_only").arg(signal));
+            if (self->kr_result_)
+                self->kr_result_->setPlainText(QString::fromUtf8(QJsonDocument(data).toJson(QJsonDocument::Indented)));
+        },
+        {}, input);
+}
+
+bool EquityAnalysisTab::is_korean_symbol_() const {
+    const QString symbol = current_symbol_.trimmed().toUpper();
+    auto is_six_digits = [](const QString& value) {
+        if (value.size() != 6)
+            return false;
+        for (const QChar ch : value) {
+            if (!ch.isDigit())
+                return false;
+        }
+        return value != QLatin1String("000000");
+    };
+    if (is_six_digits(symbol))
+        return true;
+    if ((symbol.endsWith(QLatin1String(".KS")) || symbol.endsWith(QLatin1String(".KQ"))) && symbol.size() == 9)
+        return is_six_digits(symbol.left(6));
+    return false;
+}
+
+QString EquityAnalysisTab::kr_ticker_() const {
+    const QString symbol = current_symbol_.trimmed().toUpper();
+    return symbol.size() >= 6 ? symbol.left(6) : symbol;
+}
+
+QString EquityAnalysisTab::kr_market_() const {
+    const QString symbol = current_symbol_.trimmed().toUpper();
+    const QString exchange = cached_info_.exchange.trimmed().toUpper();
+    if (symbol.endsWith(QLatin1String(".KQ")) || exchange.contains(QLatin1String("KOSDAQ")) ||
+        exchange == QLatin1String("KOE"))
+        return QStringLiteral("KOSDAQ");
+    if (symbol.endsWith(QLatin1String(".KS")) || exchange.contains(QLatin1String("KOSPI")) ||
+        exchange == QLatin1String("KSC"))
+        return QStringLiteral("KOSPI");
+    return {};
 }
 
 QFrame* EquityAnalysisTab::build_hero_() {
@@ -375,6 +536,8 @@ void EquityAnalysisTab::on_info_loaded(services::equity::StockInfo info) {
     cached_info_ = info;
     info_loaded_ = true;
     loading_overlay_->hide_loading();
+    if (kr_research_btn_)
+        kr_research_btn_->setEnabled(!kr_market_().isEmpty());
 
     populate_hero_(info);
 
@@ -791,6 +954,12 @@ void EquityAnalysisTab::changeEvent(QEvent* event) {
 void EquityAnalysisTab::retranslateUi() {
     for (auto it = i18n_labels_.constBegin(); it != i18n_labels_.constEnd(); ++it)
         it.key()->setText(tr(it.value()));
+    if (kr_research_btn_)
+        kr_research_btn_->setText(tr("RUN KR AI DEEP RESEARCH"));
+    if (kr_status_)
+        kr_status_->setText(tr("On-demand · research_only · no live order submission"));
+    if (kr_result_)
+        kr_result_->setPlaceholderText(tr("Run KR AI Deep Research to view the point-in-time research result here."));
     if (info_loaded_)
         on_info_loaded(cached_info_);
 }

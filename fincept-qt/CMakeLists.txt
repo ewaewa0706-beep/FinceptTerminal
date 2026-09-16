@@ -1124,6 +1124,7 @@ set(MCP_SOURCES
     src/mcp/tools/DBnomicsTools.cpp
     src/mcp/tools/GovDataTools.cpp
     src/mcp/tools/EquityResearchTools.cpp
+    src/mcp/tools/PersonalKrResearchTools.cpp
     # WorkspaceTools split by section; see WorkspaceTools.cpp header.
     src/mcp/tools/WorkspaceTools.cpp
     src/mcp/tools/WorkspaceTools_MonitorsWindows.cpp
@@ -2699,6 +2700,7 @@ set_source_files_properties(
     src/mcp/tools/DBnomicsTools.cpp
     src/mcp/tools/GovDataTools.cpp
     src/mcp/tools/EquityResearchTools.cpp
+    src/mcp/tools/PersonalKrResearchTools.cpp
     src/mcp/tools/WorkspaceTools.cpp
     src/mcp/tools/WorkspaceTools_MonitorsWindows.cpp
     src/mcp/tools/WorkspaceTools_Panels.cpp

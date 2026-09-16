@@ -13,6 +13,8 @@
 #include <cstdint>
 
 class QFrame;
+class QPlainTextEdit;
+class QPushButton;
 
 namespace fincept::screens {
 
@@ -23,9 +25,9 @@ class AnalysisPriceTargetGauge;
 //
 // Unlike Overview (which lists raw fundamentals), this tab *interprets* the
 // same StockInfo into decisions: an analyst price-target gauge plus six
-// color-coded verdict cards. All ratings are computed purely from StockInfo —
-// no extra backend calls. Heuristics are absolute screening signals (not
-// sector-adjusted); rationales stay factual rather than prescriptive.
+// color-coded verdict cards. Those ratings are computed purely from StockInfo.
+// Korean listings additionally expose an explicit on-demand AI research panel;
+// it is user-triggered and does not change the lightweight default tab load.
 class EquityAnalysisTab : public QWidget {
     Q_OBJECT
   public:
@@ -34,6 +36,7 @@ class EquityAnalysisTab : public QWidget {
 
   private slots:
     void on_info_loaded(services::equity::StockInfo info);
+    void on_kr_research_clicked();
 
   protected:
     void changeEvent(QEvent* event) override;
@@ -64,6 +67,7 @@ class EquityAnalysisTab : public QWidget {
     // ── Build ───────────────────────────────────────────────────────────────
     void build_ui();
     QFrame* build_hero_();
+    QFrame* build_kr_research_panel_();
     VerdictCard build_verdict_card_(QWidget* parent_grid_cell, const char* title_key, const QString& accent);
     void retranslateUi();
 
@@ -88,6 +92,9 @@ class EquityAnalysisTab : public QWidget {
     QString fmt_money(double v) const; ///< currency-symbol prefixed price
     QString cur_symbol_() const;       ///< $/₹/€/£ from cached_info_.currency
     QString color_for_(Tone t) const;
+    bool is_korean_symbol_() const;
+    QString kr_ticker_() const;
+    QString kr_market_() const;
 
     // ── State ──────────────────────────────────────────────────────────────────
     QHash<QLabel*, const char*> i18n_labels_; ///< static label → English source key
@@ -105,6 +112,13 @@ class EquityAnalysisTab : public QWidget {
 
     // Verdict cards (one per Dim)
     std::array<VerdictCard, kDimCount> cards_{};
+
+    // Personal Korean-market AI research. This is deliberately research-only:
+    // it invokes the Python research engine and never routes to the order ticket.
+    QFrame* kr_panel_ = nullptr;
+    QPushButton* kr_research_btn_ = nullptr;
+    QLabel* kr_status_ = nullptr;
+    QPlainTextEdit* kr_result_ = nullptr;
 
     ui::LoadingOverlay* loading_overlay_ = nullptr;
 };
