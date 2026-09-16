@@ -38,28 +38,29 @@ Fincept Terminal is an open-source native C++20/Qt6 financial intelligence platf
 | Layer         | Technology                                                                           |
 |---------------|--------------------------------------------------------------------------------------|
 | Language      | **C++20** — MSVC 19.40+ (VS 2022 17.10+) / GCC 12.3 / Apple Clang 15.0               |
-| UI            | **Qt 6.8.3 EXACT** Widgets (pinned)                                                  |
+| UI            | **Qt 6.8.x** Widgets (FINCEPT_RELEASE_BUILD=ON pins 6.8.3 exactly)                |
 | Charts        | Qt6 Charts                                                                           |
 | Networking    | Qt6 Network + Qt6 WebSockets                                                         |
 | Database      | Qt6 Sql (SQLite)                                                                     |
 | Analytics     | Embedded **Python 3.11.9** (4000+ scripts)                                           |
 | Excel I/O     | QXlsx v1.4.9 (FetchContent, pinned commit)                                           |
 | Mapping       | QGeoView (pinned commit)                                                             |
-| Build         | **CMake 3.27.7 + Ninja 1.11.1** (pinned, unity build)                                |
+| Build         | **CMake 3.27+ + Ninja**                                                             |
 
 ---
 
 ## Prerequisites
 
-Pinned toolchain versions — enforced by CMake. Mismatch produces a clear fail-fast error.
+Supported toolchain versions. CMake enforces its minimum version, the MSVC floor,
+and the configured Qt pin mode; CI may pin exact patch versions for reproducibility.
 
 | Tool          | Version                                                                                 |
 |---------------|-----------------------------------------------------------------------------------------|
 | C++ compiler  | MSVC 19.40+ (VS 2022 17.10+) / GCC 12.3 / Apple Clang 15.0 (Xcode 15.2)                |
-| CMake         | **3.27.7** — [cmake.org](https://cmake.org/download/)                                   |
-| Ninja         | **1.11.1** — [releases](https://github.com/ninja-build/ninja/releases)                  |
-| Qt            | **6.8.3** — [Qt Online Installer](https://www.qt.io/download-qt-installer)              |
-| Python        | **3.11.9** — [python.org](https://www.python.org/downloads/release/python-3119/)        |
+| CMake         | **3.27+** — [cmake.org](https://cmake.org/download/)                                     |
+| Ninja         | **1.11.1 recommended** — [releases](https://github.com/ninja-build/ninja/releases)      |
+| Qt            | **6.8.x** (`FINCEPT_RELEASE_BUILD=ON`: 6.8.3 EXACT) — [Qt Installer](https://www.qt.io/download-qt-installer) |
+| Python        | **3.11.x** (managed env currently 3.11.9) — [python.org](https://www.python.org/)       |
 | Git           | latest — [git-scm.com](https://git-scm.com)                                             |
 
 Optional (speeds up rebuilds): **ccache 4.13.4** on Windows is auto-detected.
@@ -103,15 +104,21 @@ cmake --build --preset macos-release      # macOS
 
 > **Older or RAM-constrained machines:** add `--parallel 4` (or any small number) to cap concurrent compile jobs. The default saturates every core, which can overheat older CPUs and slow the rest of your system. Example: `cmake --build --preset macos-release --parallel 4`.
 
-Debug builds: replace `release` with `debug` in both commands.
+The checked-in presets currently provide `win-dev`, `win-release`,
+`linux-release`, and `macos-release`. Use `win-dev` for the fast Windows
+RelWithDebInfo development build; there are no checked-in `*-debug` presets.
 
 Manual configure if presets can't resolve Qt:
 
 ```powershell
 cmake -B build/win-release -G Ninja -DCMAKE_BUILD_TYPE=Release `
-  -DCMAKE_PREFIX_PATH="C:/Qt/6.8.3/msvc2022_64"
+  -DCMAKE_PREFIX_PATH="C:/Qt/6.8.3/msvc2022_64" `
+  -DOPENSSL_ROOT_DIR="C:/vcpkg/installed/x64-windows"
 cmake --build build/win-release
 ```
+
+If OpenSSL is installed elsewhere, point `OPENSSL_ROOT_DIR` at that x64 root or
+configure the build with your vcpkg toolchain instead.
 
 ---
 

@@ -111,8 +111,10 @@ cd FinceptTerminal
 # Linux / macOS — 一鍵建置
 chmod +x setup.sh && ./setup.sh
 
-# Windows（在 VS 2022 Developer Command Prompt 執行）
-setup.bat
+# Windows：目前沒有 setup.bat/setup.ps1。
+# 請在 VS 2022 Developer PowerShell 中安裝必要工具後使用 CMake presets；
+# 可先執行唯讀檢查：
+powershell -ExecutionPolicy Bypass -File .\fincept-qt\scripts\windows_dev_doctor.ps1
 ```
 
 ### 安裝 Python 相依套件

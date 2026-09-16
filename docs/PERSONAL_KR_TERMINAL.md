@@ -228,15 +228,19 @@ than a side effect of research.
 - one failed Top-N candidate does not discard successful candidates, and each
   success is checkpointed before analysis proceeds to the next candidate;
 - repeated decision/outcome writes are first-write-wins only when immutable
-  provenance matches; conflicting ranking or outcome input provenance is rejected;
+  provenance matches; conflicting ranking, exact cutoff/mode, LLM/workflow, or
+  frozen evidence fingerprint / outcome input provenance is rejected;
 - legacy paper rows without required decision/client provenance are quarantined
   to `kr_paper_trade_quarantine` during schema upgrade rather than being counted
   in the active ledger.
 
-Single-stock KR research has a finite 20-minute watchdog and Top-N batch research
-has a finite 60-minute watchdog. Provider-only calls keep the shorter provider
+When launched through the Fincept desktop UI/MCP bridge, single-stock KR research
+has a finite 20-minute outer watchdog and Top-N batch research has a finite
+60-minute outer watchdog. Provider-only MCP calls keep the shorter provider
 budget. These values are intentionally long enough for the nine sequential LLM
-stages while still preventing permanently wedged Python subprocess slots.
+stages while still preventing permanently wedged Python subprocess slots. Direct
+command-line invocation of `personal_kr_terminal.py` does not add a second
+process-level watchdog; use the Fincept UI/MCP path for managed orchestration.
 
 ## Windows portability / another server
 

@@ -376,6 +376,18 @@ class ProviderContractTests(unittest.TestCase):
         self.assertIn("one ECOS series unavailable", snapshot.series_errors["usdkrw"])
         self.assertLessEqual(snapshot.as_of, date(2026, 9, 16))
 
+    def test_ecos_programming_error_is_not_downgraded_to_partial_series(self):
+        client = EcosClient("ecos", http=EcosHttp(), base_url="https://ecos.test")
+
+        def buggy_series(stat, cycle, item, as_of):
+            if item == "0000001":
+                return (as_of, 2.5)
+            raise KeyError("unexpected ECOS schema")
+
+        client._series = buggy_series
+        with self.assertRaisesRegex(KeyError, "unexpected ECOS schema"):
+            client.macro(date(2026, 9, 16))
+
     def test_ecos_http_200_error_envelope_is_not_false_success(self):
         client = EcosClient("bad", http=EcosErrorHttp(), base_url="https://ecos.test")
         with self.assertRaisesRegex(RuntimeError, "ECOS unavailable"):

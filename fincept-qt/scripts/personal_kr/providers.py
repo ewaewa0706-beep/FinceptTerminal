@@ -727,6 +727,11 @@ class EcosClient:
         for name, (stat, cycle, item) in self.DEFAULT_SERIES.items():
             try:
                 point = self._series(stat, cycle, item, as_of)
+            except (AssertionError, TypeError, AttributeError, NameError, KeyError, IndexError, ValueError):
+                # These indicate a programming/schema contract failure rather
+                # than an unavailable ECOS series.  Let ResearchEngine fail the
+                # candidate instead of freezing a misleading partial-data result.
+                raise
             except Exception as exc:
                 point = None
                 errors[name] = _safe_provider_message(exc)

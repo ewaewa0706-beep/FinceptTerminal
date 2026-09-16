@@ -26,6 +26,7 @@ from personal_kr.models import (
     OHLCVBar,
     QuantCandidate,
     ResearchResult,
+    to_jsonable,
 )
 from personal_kr.persistence import DecisionStore
 from personal_kr.ranking import select_top_candidates, select_top_candidates_isolated
@@ -887,6 +888,74 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(replay.decision_id, frozen.decision_id)
             with self.assertRaisesRegex(ValueError, "provenance conflict"):
                 store.record_decision(result(second_candidate), strategy_id="personal-kr-quant")
+
+    def test_decision_rejects_same_day_rerun_with_different_cutoff_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DecisionStore(Path(tmp) / "kr.db")
+            kst = timezone(timedelta(hours=9))
+            first_candidate = QuantCandidate(
+                self.instrument,
+                self.candidate.analysis_date,
+                0,
+                1,
+                {},
+                analysis_cutoff_at=datetime(2026, 8, 20, 10, 0, tzinfo=kst),
+                analysis_cutoff_mode="live_request",
+            )
+            later_candidate = replace(
+                first_candidate,
+                analysis_cutoff_at=datetime(2026, 8, 20, 11, 0, tzinfo=kst),
+            )
+
+            def result(candidate):
+                return ResearchResult(
+                    candidate=candidate,
+                    signal="Hold",
+                    market_report="m",
+                    fundamentals_report="f",
+                    news_macro_report="n",
+                    bull_case="b+",
+                    bear_case="b-",
+                    research_manager="r",
+                    trader="t",
+                    risk_manager="risk",
+                    portfolio_manager="SIGNAL: HOLD",
+                    llm_provider="scripted",
+                    llm_model_id="deterministic-test-double",
+                )
+
+            frozen = store.record_decision(result(first_candidate), strategy_id="personal-kr-ui")
+            replay = store.record_decision(result(first_candidate), strategy_id="personal-kr-ui")
+            self.assertEqual(replay.decision_id, frozen.decision_id)
+            equivalent_utc = replace(
+                first_candidate,
+                analysis_cutoff_at=datetime(2026, 8, 20, 1, 0, tzinfo=timezone.utc),
+            )
+            equivalent_replay = store.record_decision(result(equivalent_utc), strategy_id="personal-kr-ui")
+            self.assertEqual(equivalent_replay.decision_id, frozen.decision_id)
+            engine_shaped = replace(
+                result(first_candidate),
+                evidence={"candidate": to_jsonable(first_candidate), "market": {"source": "KIS"}},
+            )
+            equivalent_engine_shaped = replace(
+                result(equivalent_utc),
+                evidence={"candidate": to_jsonable(equivalent_utc), "market": {"source": "KIS"}},
+            )
+            with tempfile.TemporaryDirectory() as shaped_tmp:
+                shaped_store = DecisionStore(Path(shaped_tmp) / "kr.db")
+                shaped_frozen = shaped_store.record_decision(engine_shaped, strategy_id="personal-kr-ui")
+                shaped_replay = shaped_store.record_decision(
+                    equivalent_engine_shaped, strategy_id="personal-kr-ui"
+                )
+            self.assertEqual(shaped_replay.decision_id, shaped_frozen.decision_id)
+            with self.assertRaisesRegex(ValueError, "provenance conflict"):
+                store.record_decision(result(later_candidate), strategy_id="personal-kr-ui")
+            changed_model = replace(result(first_candidate), llm_model_id="different-model")
+            with self.assertRaisesRegex(ValueError, "provenance conflict"):
+                store.record_decision(changed_model, strategy_id="personal-kr-ui")
+            changed_evidence = replace(result(first_candidate), evidence={"market": {"source": "restated"}})
+            with self.assertRaisesRegex(ValueError, "provenance conflict"):
+                store.record_decision(changed_evidence, strategy_id="personal-kr-ui")
 
     def test_concurrent_decision_and_paper_writes_remain_first_write_wins(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -6,20 +6,22 @@ This guide covers C++ development for Fincept Terminal — 40+ screens, core inf
 
 ---
 
-## Pinned Toolchain (non-negotiable)
+## Supported Toolchain
 
-CMake enforces these versions with `FATAL_ERROR`. Use exactly these versions when developing, reviewing, or submitting patches:
+CMake enforces the minimum compiler/CMake requirements and the configured Qt
+pin mode. CI/setup scripts may use exact patch versions for reproducibility, but
+local development is not required to match every patch number exactly:
 
 | Tool | Version |
 |------|---------|
 | C++ standard | C++20 |
-| MSVC (Windows) | 19.38 — VS 2022 17.8 |
-| GCC (Linux) | 12.3 |
-| Apple Clang (macOS) | 15.0 — Xcode 15.2 |
-| CMake | 3.27.7 |
-| Ninja | 1.11.1 |
-| Qt | 6.7.2 (LTS) — `find_package` uses `EXACT` |
-| Python | 3.11.9 |
+| MSVC (Windows) | 19.40+ — VS 2022 17.10+ |
+| GCC (Linux) | 12.3+ |
+| Apple Clang (macOS) | 15.0+ |
+| CMake | 3.27+ |
+| Ninja | 1.11.1 recommended |
+| Qt | 6.8.x — `FINCEPT_RELEASE_BUILD=ON` pins 6.8.3 exactly |
+| Python | 3.11.x (managed env currently 3.11.9) |
 
 **Configure + build** via CMake presets:
 ```bash
@@ -29,9 +31,14 @@ cmake --build --preset <same-preset>
 
 > **RAM-constrained machines:** the build now **auto-caps** concurrent compiles from your available RAM (a Ninja job pool in `CMakeLists.txt`) — 12-wide MSVC/Qt compiles otherwise need 15–48 GB and will swap a 16 GB box until the whole OS hangs. Override per-machine with `-DFINCEPT_MAX_COMPILE_JOBS=N` (or cap ninja directly with `--parallel N`). Also keep **≥5 GB RAM free** while building: the 1000+ object link needs ~3–4 GB and pages badly when starved (a one-line rebuild can jump from ~5 s to minutes). Full rationale: *Build performance & machine requirements* in `CLAUDE.md`.
 
-Debug variants: `win-debug`, `linux-debug`, `macos-debug`. See `fincept-qt/CMakePresets.json`.
+The checked-in variants are `win-dev`, `win-release`, `linux-release`, and
+`macos-release`. `win-dev` is the fast RelWithDebInfo preset; no `*-debug`
+presets are currently checked in. See `fincept-qt/CMakePresets.json`.
 
-**Emergency override only** — pass `-DFINCEPT_ALLOW_QT_DRIFT=ON` to bypass the Qt `EXACT` check for local experiments. Never commit work built this way; CI rejects it.
+**Emergency override only** — pass `-DFINCEPT_ALLOW_QT_DRIFT=ON` to map the Qt
+pin mode to `ANY` for local experiments instead of the normal developer `MINOR`
+(6.8.x) constraint. Do not rely on such a build when validating portability or
+release compatibility.
 
 ---
 

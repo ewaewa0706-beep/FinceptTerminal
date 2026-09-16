@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import sqlite3
@@ -146,11 +147,11 @@ class DecisionStore:
                 ).fetchone()
                 if row:
                     existing = _result_from_payload(json.loads(row["payload"]))
-                    incoming_provenance = _ranking_provenance_tuple(result)
-                    if any(incoming_provenance) and incoming_provenance != _ranking_provenance_tuple(existing):
+                    incoming_provenance = _decision_provenance_tuple(result)
+                    if incoming_provenance != _decision_provenance_tuple(existing):
                         raise ValueError(
-                            "decision provenance conflict: an immutable decision already exists for a different "
-                            "quant ranking run"
+                            "decision provenance conflict: an immutable decision already exists for different "
+                            "research inputs"
                         )
                     return existing
                 decision_id = str(uuid.uuid4())
@@ -440,10 +441,47 @@ def _outcome_from_payload(data: dict) -> Outcome:
     )
 
 
-def _ranking_provenance_tuple(result: ResearchResult) -> tuple[str, str, str]:
+def _decision_provenance_tuple(result: ResearchResult) -> tuple[str, ...]:
     candidate = result.candidate
-    generated = candidate.ranking_generated_at.isoformat() if candidate.ranking_generated_at else ""
-    return candidate.ranking_source, generated, candidate.ranking_payload_hash
+    ranking_generated = (
+        candidate.ranking_generated_at.astimezone(timezone.utc).isoformat()
+        if candidate.ranking_generated_at
+        else ""
+    )
+    cutoff = candidate.analysis_cutoff_at.astimezone(timezone.utc).isoformat() if candidate.analysis_cutoff_at else ""
+    candidate_payload = to_jsonable(candidate)
+    if isinstance(candidate_payload, dict):
+        if candidate.ranking_generated_at is not None:
+            candidate_payload["ranking_generated_at"] = ranking_generated
+        if candidate.analysis_cutoff_at is not None:
+            candidate_payload["analysis_cutoff_at"] = cutoff
+    candidate_hash = hashlib.sha256(
+        json.dumps(candidate_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+    evidence_payload = to_jsonable(result.evidence)
+    if isinstance(evidence_payload, dict):
+        # ResearchEngine freezes the full ResearchPacket, including the
+        # candidate. Candidate provenance is already hashed above after UTC
+        # normalization, so exclude that duplicate subtree here; otherwise the
+        # same instant expressed with a different UTC offset would hash
+        # differently even though its provenance is semantically identical.
+        evidence_payload = {key: value for key, value in evidence_payload.items() if key != "candidate"}
+    evidence_hash = hashlib.sha256(
+        json.dumps(evidence_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return (
+        candidate.ranking_source,
+        ranking_generated,
+        candidate.ranking_payload_hash,
+        cutoff,
+        candidate.analysis_cutoff_mode,
+        candidate_hash,
+        evidence_hash,
+        result.llm_provider,
+        result.llm_model_id,
+        result.workflow_version,
+    )
 
 
 def _outcome_provenance_tuple(outcome: Outcome) -> tuple[str, ...]:
