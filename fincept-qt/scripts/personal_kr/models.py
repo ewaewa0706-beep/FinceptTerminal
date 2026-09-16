@@ -142,9 +142,15 @@ class MacroSnapshot:
     as_of: date
     source: str
     indicators: dict[str, float | str | None] = field(default_factory=dict)
+    series_errors: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "as_of", _date(self.as_of))
+        object.__setattr__(
+            self,
+            "series_errors",
+            {str(key): str(value) for key, value in self.series_errors.items()},
+        )
 
 
 @dataclass(frozen=True)
@@ -158,6 +164,7 @@ class QuantCandidate:
     ranking_generated_at: datetime | None = None
     ranking_payload_hash: str = ""
     analysis_cutoff_at: datetime | None = None
+    analysis_cutoff_mode: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "analysis_date", _date(self.analysis_date))
@@ -172,6 +179,18 @@ class QuantCandidate:
             raise ValueError("ranking_generated_at must include a timezone")
         if self.analysis_cutoff_at is not None and self.analysis_cutoff_at.tzinfo is None:
             raise ValueError("analysis_cutoff_at must include a timezone")
+        cutoff_mode = str(self.analysis_cutoff_mode or "").strip().lower()
+        if self.analysis_cutoff_at is None:
+            if cutoff_mode not in {"", "date"}:
+                raise ValueError("analysis_cutoff_mode requires analysis_cutoff_at")
+            cutoff_mode = "date"
+        else:
+            # Persisted decisions created before cutoff-mode provenance existed
+            # are conservatively interpreted as externally frozen PIT cutoffs.
+            cutoff_mode = cutoff_mode or "external"
+            if cutoff_mode not in {"external", "live_request"}:
+                raise ValueError("analysis_cutoff_mode must be external or live_request")
+        object.__setattr__(self, "analysis_cutoff_mode", cutoff_mode)
         if self.analysis_cutoff_at is not None:
             kst = timezone(timedelta(hours=9))
             if self.analysis_cutoff_at.astimezone(kst).date() > self.analysis_date:

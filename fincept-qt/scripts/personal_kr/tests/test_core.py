@@ -204,6 +204,69 @@ class CoreTests(unittest.TestCase):
         self.assertIn("macro", packet.unavailable)
         self.assertIn("exact intraday PIT", packet.unavailable_reasons["macro"])
 
+    def test_manual_today_candidate_freezes_exact_kst_request_cutoff(self):
+        kst = timezone(timedelta(hours=9))
+        now = datetime(2026, 9, 16, 10, 15, 30, tzinfo=kst)
+        payload = {
+            "analysis_date": "2026-09-16",
+            "instrument": {"ticker": "005930", "name": "삼성전자", "market": "KOSPI"},
+            "score": 0,
+        }
+        with patch.object(cli, "_korea_now", return_value=now):
+            candidate = cli._candidate_from_payload(payload)
+        self.assertEqual(candidate.analysis_cutoff_at, now)
+        self.assertEqual(candidate.analysis_cutoff_mode, "live_request")
+
+        explicit = datetime(2026, 9, 16, 9, 5, tzinfo=kst)
+        payload["analysis_cutoff_at"] = explicit.isoformat()
+        with patch.object(cli, "_korea_now", return_value=now):
+            candidate = cli._candidate_from_payload(payload)
+        self.assertEqual(candidate.analysis_cutoff_at, explicit)
+        self.assertEqual(candidate.analysis_cutoff_mode, "external")
+
+    def test_live_request_cutoff_keeps_observed_current_macro(self):
+        kst = timezone(timedelta(hours=9))
+        cutoff = datetime(2026, 9, 16, 10, 15, tzinfo=kst)
+        candidate = QuantCandidate(
+            Instrument("005930", "삼성전자", "KOSPI"),
+            date(2026, 9, 16),
+            0,
+            1,
+            {},
+            analysis_cutoff_at=cutoff,
+            analysis_cutoff_mode="live_request",
+        )
+        providers = FakeProviders()
+        packet = ResearchEngine(
+            market=providers,
+            macro=providers,
+            llm=ScriptedLlm(),
+        ).packet(candidate)
+        self.assertIsNotNone(packet.macro)
+        self.assertNotIn("macro", packet.unavailable)
+
+    def test_optional_provider_programming_error_fails_candidate(self):
+        class BuggyNews(FakeProviders):
+            error_type = TypeError
+
+            def news(self, instrument, as_of, count=20):
+                raise self.error_type("developer bug")
+
+        providers = BuggyNews()
+        engine = ResearchEngine(
+            market=providers,
+            flow=providers,
+            fundamentals=providers,
+            news=providers,
+            macro=providers,
+            llm=ScriptedLlm(),
+        )
+        for error_type in (TypeError, KeyError, IndexError, ValueError):
+            with self.subTest(error_type=error_type.__name__):
+                providers.error_type = error_type
+                with self.assertRaises(error_type):
+                    engine.packet(self.candidate)
+
     def test_partial_data_continues_when_news_fails(self):
         providers = FakeProviders(fail_news=True)
         engine = ResearchEngine(
@@ -400,7 +463,7 @@ class CoreTests(unittest.TestCase):
         ):
             result = cli.cmd_evaluate(args)
 
-        self.assertEqual(fake_kis.price_mode, "original")
+        self.assertEqual(fake_kis.price_mode, "adjusted")
         self.assertEqual(result["outcomes"], [])
         self.assertEqual(result["pending_horizons"], [1, 5])
 

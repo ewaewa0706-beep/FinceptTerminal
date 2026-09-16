@@ -41,6 +41,22 @@ def _clean_html(text: str) -> str:
     return unescape(re.sub(r"<[^>]+>", "", text or "")).strip()
 
 
+def _safe_provider_message(exc: Exception) -> str:
+    """Keep per-series diagnostics without freezing URLs or credential values."""
+
+    message = " ".join(str(exc).split())
+    message = re.sub(r"https?://\S+", "<redacted-url>", message, flags=re.IGNORECASE)
+    message = re.sub(
+        r"(?i)((?:api[_ -]?key|app[_ -]?secret|client[_ -]?secret|access[_ -]?token|token)\s*[=:]\s*)[^\s,;]+",
+        r"\1<redacted>",
+        message,
+    )
+    if len(message) > 240:
+        message = message[:237] + "..."
+    label = exc.__class__.__name__
+    return f"{label}: {message}" if message else label
+
+
 class KisClient:
     BASE = "https://openapi.koreainvestment.com:9443"
 
@@ -713,7 +729,7 @@ class EcosClient:
                 point = self._series(stat, cycle, item, as_of)
             except Exception as exc:
                 point = None
-                errors[name] = str(exc)
+                errors[name] = _safe_provider_message(exc)
             indicators[name] = point[1] if point else None
             if point:
                 observed_dates.append(point[0])
@@ -721,4 +737,4 @@ class EcosClient:
             detail = "; ".join(f"{name}: {message}" for name, message in errors.items())
             raise RuntimeError(f"ECOS unavailable: {detail}")
         snapshot_date = max(observed_dates) if observed_dates else as_of
-        return MacroSnapshot(snapshot_date, "ECOS", indicators)
+        return MacroSnapshot(snapshot_date, "ECOS", indicators, errors)

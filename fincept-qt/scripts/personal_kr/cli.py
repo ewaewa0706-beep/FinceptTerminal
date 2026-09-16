@@ -26,6 +26,9 @@ from .providers import DartClient, EcosClient, KisClient, NaverNewsClient
 from .ranking import candidate_from_mapping, select_top_candidates, select_top_candidates_isolated
 
 
+_KST = timezone(timedelta(hours=9))
+
+
 def _input_json() -> dict[str, Any]:
     text = sys.stdin.read().strip()
     return json.loads(text) if text else {}
@@ -72,13 +75,53 @@ def _korea_today() -> date:
     # Korea has used UTC+09:00 year-round since 1988.  A fixed offset avoids a
     # hidden dependency on the optional `tzdata` wheel, which Windows Python
     # installations commonly do not include.
-    return datetime.now(timezone(timedelta(hours=9))).date()
+    return _korea_now().date()
+
+
+def _korea_now() -> datetime:
+    """Return a timezone-aware Korean civil timestamp for PIT cutoffs."""
+
+    return datetime.now(_KST)
 
 
 def _candidate_from_payload(payload: dict[str, Any]) -> QuantCandidate:
     analysis_date = date.fromisoformat(payload["analysis_date"])
-    if analysis_date > _korea_today():
+    now_kst = _korea_now()
+    if analysis_date > now_kst.date():
         raise ValueError("analysis_date cannot be in the future")
+    raw_cutoff = str(payload.get("analysis_cutoff_at") or "").strip()
+    raw_cutoff_mode = str(payload.get("analysis_cutoff_mode") or "").strip().lower()
+    analysis_cutoff_at: datetime | None = None
+    analysis_cutoff_mode = "date"
+    if raw_cutoff:
+        try:
+            analysis_cutoff_at = datetime.fromisoformat(raw_cutoff.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("analysis_cutoff_at must be ISO-8601") from exc
+        if analysis_cutoff_at.tzinfo is None:
+            raise ValueError("analysis_cutoff_at must include a timezone")
+        cutoff_kst = analysis_cutoff_at.astimezone(_KST)
+        if cutoff_kst.date() != analysis_date:
+            raise ValueError("analysis_cutoff_at date must match analysis_date")
+        if cutoff_kst > now_kst:
+            raise ValueError("analysis_cutoff_at cannot be in the future")
+        analysis_cutoff_mode = raw_cutoff_mode or "external"
+        if analysis_cutoff_mode == "live_request":
+            # Only the desktop's current request (or an equivalent immediate
+            # caller) may claim live observation semantics. Stale timestamps must
+            # remain external PIT cutoffs so non-vintage ECOS cannot leak.
+            if analysis_date != now_kst.date() or now_kst - cutoff_kst > timedelta(minutes=5):
+                raise ValueError("live_request cutoff must be a current KST request timestamp")
+        elif analysis_cutoff_mode != "external":
+            raise ValueError("analysis_cutoff_mode must be external or live_request")
+    elif raw_cutoff_mode:
+        raise ValueError("analysis_cutoff_mode requires analysis_cutoff_at")
+    elif analysis_date == now_kst.date():
+        # Manual/UI/MCP research on today's market must freeze the exact request
+        # instant. A date-only cutoff could otherwise consume a later close,
+        # flow row or news item when the same decision is reconstructed.
+        analysis_cutoff_at = now_kst
+        analysis_cutoff_mode = "live_request"
     if "instrument" in payload:
         inst = payload["instrument"]
         return QuantCandidate(
@@ -87,8 +130,15 @@ def _candidate_from_payload(payload: dict[str, Any]) -> QuantCandidate:
             float(payload.get("score", 0)),
             payload.get("rank"),
             {str(k): float(v) for k, v in (payload.get("factors") or {}).items()},
+            analysis_cutoff_at=analysis_cutoff_at,
+            analysis_cutoff_mode=analysis_cutoff_mode,
         )
-    return candidate_from_mapping(payload, payload["analysis_date"])
+    candidate = candidate_from_mapping(payload, payload["analysis_date"])
+    return replace(
+        candidate,
+        analysis_cutoff_at=analysis_cutoff_at,
+        analysis_cutoff_mode=analysis_cutoff_mode,
+    )
 
 
 def _engine(llm_config: dict[str, Any] | None = None) -> ResearchEngine:
@@ -188,6 +238,7 @@ def cmd_batch() -> Any:
             ranking_generated_at=ranking_generated_at,
             ranking_payload_hash=ranking_hash,
             analysis_cutoff_at=ranking_generated_at,
+            analysis_cutoff_mode="external",
         )
         for candidate in candidates
     ]
@@ -242,10 +293,20 @@ def cmd_providers_only(args: argparse.Namespace) -> Any:
 
 
 def cmd_full(args: argparse.Namespace) -> Any:
-    as_of = date.fromisoformat(args.analysis_date or _korea_today().isoformat())
-    if as_of > _korea_today():
+    now_kst = _korea_now()
+    as_of = date.fromisoformat(args.analysis_date or now_kst.date().isoformat())
+    if as_of > now_kst.date():
         raise ValueError("analysis_date cannot be in the future")
-    candidate = QuantCandidate(Instrument(args.ticker, args.name, args.market), as_of, 0.0, 1, {})
+    cutoff_at = now_kst if as_of == now_kst.date() else None
+    candidate = QuantCandidate(
+        Instrument(args.ticker, args.name, args.market),
+        as_of,
+        0.0,
+        1,
+        {},
+        analysis_cutoff_at=cutoff_at,
+        analysis_cutoff_mode="live_request" if cutoff_at is not None else "date",
+    )
     result = _engine().analyze(candidate)
     return _store().record_decision(result)
 
@@ -266,7 +327,10 @@ def cmd_evaluate(args: argparse.Namespace) -> Any:
         instrument,
         today,
         lookback_days=lookback_days,
-        price_mode="original",
+        # Research evidence uses original prices for PIT stability. Realized
+        # outcome measurement instead uses adjusted history so an in-horizon
+        # split/reverse-split does not become a fictitious investment return.
+        price_mode="adjusted",
     )
     benchmark_symbol = instrument.benchmark_symbol
     benchmark = load_yahoo_benchmark(

@@ -338,13 +338,16 @@ void EquityAnalysisTab::on_kr_research_clicked() {
         return;
     }
     const QString company_name = cached_info_.company_name.trimmed().isEmpty() ? kr_ticker_() : cached_info_.company_name;
-    const QDate korea_today = QDateTime::currentDateTimeUtc().addSecs(9 * 60 * 60).date();
+    const QDateTime korea_now = QDateTime::currentDateTimeUtc().toOffsetFromUtc(9 * 60 * 60);
+    const QDate korea_today = korea_now.date();
     QJsonObject payload{
         {"instrument", QJsonObject{{"ticker", kr_ticker_()},
                                    {"name", company_name},
                                    {"market", market},
                                    {"currency", "KRW"}}},
         {"analysis_date", korea_today.toString(Qt::ISODate)},
+        {"analysis_cutoff_at", korea_now.toString(Qt::ISODateWithMs)},
+        {"analysis_cutoff_mode", "live_request"},
         {"score", 0.0},
         {"strategy_id", "personal-kr-ui"},
     };

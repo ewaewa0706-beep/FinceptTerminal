@@ -371,6 +371,9 @@ class ProviderContractTests(unittest.TestCase):
 
         self.assertEqual(snapshot.indicators["bok_base_rate"], 2.5)
         self.assertIsNone(snapshot.indicators["usdkrw"])
+        self.assertIn("usdkrw", snapshot.series_errors)
+        self.assertIn("RuntimeError", snapshot.series_errors["usdkrw"])
+        self.assertIn("one ECOS series unavailable", snapshot.series_errors["usdkrw"])
         self.assertLessEqual(snapshot.as_of, date(2026, 9, 16))
 
     def test_ecos_http_200_error_envelope_is_not_false_success(self):

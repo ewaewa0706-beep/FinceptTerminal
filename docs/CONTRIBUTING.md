@@ -55,7 +55,7 @@ Pinned toolchain versions — enforced by CMake. Mismatch produces a clear fail-
 
 | Tool          | Version                                                                                 |
 |---------------|-----------------------------------------------------------------------------------------|
-| C++ compiler  | MSVC 19.38 (VS 2022 17.8) / GCC 12.3 / Apple Clang 15.0 (Xcode 15.2)                    |
+| C++ compiler  | MSVC 19.40+ (VS 2022 17.10+) / GCC 12.3 / Apple Clang 15.0 (Xcode 15.2)                |
 | CMake         | **3.27.7** — [cmake.org](https://cmake.org/download/)                                   |
 | Ninja         | **1.11.1** — [releases](https://github.com/ninja-build/ninja/releases)                  |
 | Qt            | **6.8.3** — [Qt Online Installer](https://www.qt.io/download-qt-installer)              |
@@ -74,8 +74,14 @@ Optional (speeds up rebuilds): **ccache 4.13.4** on Windows is auto-detected.
 git clone https://github.com/Fincept-Corporation/FinceptTerminal.git
 cd FinceptTerminal
 ./setup.sh      # Linux / macOS — installs toolchain + Qt via aqtinstall, then builds
-setup.bat       # Windows — run from a VS 2022 Developer Command Prompt
 ```
+
+There is currently no checked-in Windows `setup.bat`/`setup.ps1`. On Windows,
+open a VS 2022 Developer PowerShell, install the prerequisites below, and use
+the CMake presets in the next section. `fincept-qt/scripts/windows_dev_doctor.ps1`
+is a read-only prerequisite check that reports missing MSVC/SDK/CMake/Ninja,
+Python 3.11, Qt 6.8 required modules, deployment tools, and OpenSSL without
+installing or modifying anything.
 
 ### Manual — CMake presets
 

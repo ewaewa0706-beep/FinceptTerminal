@@ -73,6 +73,12 @@ class ResearchEngine:
         def optional(name: str, fn):
             try:
                 return fn()
+            except (AssertionError, TypeError, AttributeError, NameError, KeyError, IndexError, ValueError):
+                # These are overwhelmingly implementation/schema bugs, not an
+                # expected provider outage. Freezing a research decision after
+                # silently downgrading them to "partial data" hides defects and
+                # makes the decision irreproducible, so fail the candidate.
+                raise
             except Exception as exc:
                 unavailable.append(name)
                 unavailable_reasons[name] = _safe_unavailable_reason(exc)
@@ -114,11 +120,17 @@ class ResearchEngine:
         if self.news is None:
             unavailable.append("news")
             unavailable_reasons["news"] = "not configured"
-        if self.macro is not None and candidate.analysis_cutoff_at is not None:
+        if (
+            self.macro is not None
+            and candidate.analysis_cutoff_at is not None
+            and candidate.analysis_cutoff_mode != "live_request"
+        ):
             # ECOS current-series responses are not vintage snapshots and expose
-            # no observation publication timestamp. Once a Quant ranking freezes
-            # an exact intraday cutoff, replaying ECOS later cannot prove what was
-            # visible at that instant, so this enrichment must fail closed.
+            # no observation publication timestamp. Once an external/Quant cutoff
+            # freezes an exact historical instant, replaying ECOS later cannot
+            # prove what was visible then, so that enrichment must fail closed.
+            # A live_request is different: the ECOS response is observed during
+            # this very run and then frozen in the decision evidence.
             macro = None
             unavailable.append("macro")
             unavailable_reasons["macro"] = "exact intraday PIT unavailable for non-vintage ECOS series"

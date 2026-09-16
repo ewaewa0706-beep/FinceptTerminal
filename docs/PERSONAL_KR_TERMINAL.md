@@ -152,9 +152,10 @@ are returned in `pending_horizons` rather than written as failures. Each frozen
 outcome stores the stock/benchmark source, price mode, evaluation version,
 `evaluated_at`, and canonical SHA-256 fingerprints of both price inputs. A later
 replay with different immutable provenance is surfaced as a provenance conflict.
-KIS stock bars are currently original-price bars, so outcomes are deterministic
-price-return measurements rather than split/dividend-adjusted total returns.
-Corporate-action-aware total-return accounting remains a separate enhancement.
+KIS outcome stock bars use adjusted-price history, and that exact price mode is
+frozen in outcome provenance. This prevents an in-horizon split/reverse-split
+from appearing as a fictitious investment gain or loss. Dividend-aware total
+return accounting remains a separate enhancement.
 
 ## Fincept UI and MCP
 
@@ -183,6 +184,10 @@ than a side effect of research.
 
 - the timezone-aware external `ranking_generated_at` is frozen as the exact
   analysis cutoff for production batch research;
+- manual/UI/MCP research for today's market also freezes a timezone-aware exact
+  request timestamp as `analysis_cutoff_at`. Immediate requests are tagged
+  `analysis_cutoff_mode=live_request`; explicit older/external timestamps are
+  treated as strict external PIT cutoffs;
 - market bars newer than the analysis cutoff are rejected. KIS daily price and
   investor-flow endpoints expose date-level data without a finality timestamp;
   before 16:00 KST the same calendar day's KIS rows are therefore excluded and
@@ -199,11 +204,11 @@ than a side effect of research.
   allowed, articles later than the exact batch cutoff are filtered and duplicates
   are removed. Historical analysis fails this enrichment closed instead of
   pretending the current search index is a historical snapshot;
-- ECOS responses are non-vintage for this workflow. Historical analysis fails
-  the macro enrichment closed. Exact intraday batch research also marks ECOS
-  unavailable because the current-series response cannot prove what was visible
-  at that exact timestamp; for an ordinary today's on-demand snapshot, one
-  missing series does not abort the other macro series;
+- ECOS responses are non-vintage for this workflow. Historical/external exact
+  PIT analysis fails the macro enrichment closed because the current-series
+  response cannot prove what was visible at that old instant. A `live_request`
+  may use the ECOS values actually observed during that run; those values and
+  any per-series errors are then frozen in decision evidence;
 - KIS HTTP 401 refreshes authentication once; 429/5xx/timeouts are bounded
   retries;
 - KIS daily history is split into bounded date windows to avoid silent provider
@@ -212,6 +217,10 @@ than a side effect of research.
   as unavailable enrichments rather than discarding an otherwise valid result.
   Sanitized failure reasons are frozen in `unavailable_reasons` without URLs or
   credential/token values;
+- ECOS partial-series failures are retained in `macro.series_errors`, so a
+  missing observation is distinguishable from a failed series request. Obvious
+  programming/schema exceptions in optional providers fail the candidate rather
+  than being silently frozen as ordinary partial-data availability;
 - the final nonblank Portfolio Manager line must be exactly `SIGNAL: BUY`,
   `SIGNAL: HOLD`, or `SIGNAL: SELL`. Missing markers or trailing prose fail closed;
 - ranking rows used by the production batch require an explicit Korean company

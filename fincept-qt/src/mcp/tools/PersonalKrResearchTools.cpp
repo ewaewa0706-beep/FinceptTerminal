@@ -93,6 +93,8 @@ QJsonObject candidate_payload(const QJsonObject& args) {
         {"rank", args.value("rank")},
         {"strategy_id", "personal-kr-single"},
     };
+    if (!args.value("analysis_cutoff_at").toString().isEmpty())
+        payload["analysis_cutoff_at"] = args.value("analysis_cutoff_at");
     if (args.value("factors").isObject())
         payload["factors"] = args.value("factors").toObject();
     const QJsonObject llm = fincept::services::equity::personal_kr_active_llm_config();
@@ -241,6 +243,10 @@ std::vector<ToolDef> get_personal_kr_research_tools() {
                 .string("analysis_date", "Point-in-time analysis date YYYY-MM-DD")
                 .required()
                 .pattern("^\\d{4}-\\d{2}-\\d{2}$")
+                .string("analysis_cutoff_at",
+                        "Optional timezone-aware ISO-8601 exact research cutoff; today's request time is frozen "
+                        "automatically when omitted")
+                .length(20, 64)
                 .number("score", "Quant ranking score carried into deep research")
                 .default_num(0.0)
                 .integer("rank", "Rank within the external Top-N shortlist")

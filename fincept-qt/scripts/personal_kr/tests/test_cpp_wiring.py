@@ -64,6 +64,10 @@ class CppWiringTests(unittest.TestCase):
         self.assertIn('payload["llm"]', tools)
         self.assertIn('payload["llm"]', ui)
         self.assertIn('run_kr_tool({"batch"}', tools)
+        self.assertIn('"analysis_cutoff_at"', tools)
+        self.assertIn('"analysis_cutoff_at"', ui)
+        self.assertIn('"analysis_cutoff_mode", "live_request"', ui)
+        self.assertIn("toOffsetFromUtc(9 * 60 * 60)", ui)
 
     def test_research_calls_have_explicit_long_but_finite_timeouts(self):
         tools = (QT_ROOT / "src/mcp/tools/PersonalKrResearchTools.cpp").read_text(encoding="utf-8")

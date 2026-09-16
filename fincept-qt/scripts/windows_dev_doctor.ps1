@@ -217,6 +217,28 @@ else {
     $version = Invoke-VersionCommand $qmake @("-query", "QT_VERSION")
     $ok = $version -match ("^" + [regex]::Escape($qtMinor) + "(\.|$)")
     Add-Check "Qt qmake" $true $(if ($ok) { "OK" } else { "FAIL" }) $version $qmake "Expected Qt $qtMinor.x"
+
+    # qmake alone is not sufficient: Fincept's REQUIRED CMake components must
+    # all be installed in the selected kit or configure will fail later. Check
+    # their package configs here so a fresh development server gets an actionable
+    # diagnosis before attempting a multi-thousand-file native configure/build.
+    $qtPrefix = Split-Path -Parent (Split-Path -Parent $qmake)
+    $requiredQtModules = @(
+        "Widgets", "Charts", "PrintSupport", "Network", "Sql", "Concurrent", "Multimedia", "LinguistTools"
+    )
+    $missingQtModules = @()
+    foreach ($module in $requiredQtModules) {
+        $config = Join-Path $qtPrefix "lib\cmake\Qt6${module}\Qt6${module}Config.cmake"
+        if (-not (Test-Path -LiteralPath $config -PathType Leaf)) {
+            $missingQtModules += $module
+        }
+    }
+    if ($missingQtModules.Count -eq 0) {
+        Add-Check "Qt modules" $true "OK" $version $qtPrefix "All REQUIRED CMake Qt modules are installed"
+    }
+    else {
+        Add-Check "Qt modules" $true "FAIL" $version $qtPrefix ("Missing REQUIRED modules: " + ($missingQtModules -join ", "))
+    }
 }
 
 $windeployqt = Get-QtToolPath "windeployqt"

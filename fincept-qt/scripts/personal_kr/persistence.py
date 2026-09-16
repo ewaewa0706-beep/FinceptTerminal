@@ -390,6 +390,7 @@ def _result_from_payload(data: dict) -> ResearchResult:
         datetime.fromisoformat(c["ranking_generated_at"]) if c.get("ranking_generated_at") else None,
         c.get("ranking_payload_hash") or "",
         datetime.fromisoformat(c["analysis_cutoff_at"]) if c.get("analysis_cutoff_at") else None,
+        c.get("analysis_cutoff_mode") or "",
     )
     return ResearchResult(
         candidate=candidate,
