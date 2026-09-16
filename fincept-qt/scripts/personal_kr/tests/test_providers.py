@@ -5,7 +5,7 @@ import json
 import tempfile
 import unittest
 import zipfile
-from datetime import date
+from datetime import date, timedelta
 from email.utils import format_datetime
 from datetime import datetime, timezone
 
@@ -192,6 +192,8 @@ class EcosErrorHttp:
 class ProviderContractTests(unittest.TestCase):
     def setUp(self):
         self.instrument = Instrument("005930", "삼성전자", "KOSPI")
+        self.kst = timezone(timedelta(hours=9))
+        self.now_kst = datetime(2026, 9, 16, 15, 0, tzinfo=self.kst)
 
     def test_kis_daily_contract_chunks_long_range_and_filters_future(self):
         http = KisHttp()
@@ -204,6 +206,7 @@ class ProviderContractTests(unittest.TestCase):
             params = kwargs["params"]
             self.assertEqual(params["FID_INPUT_ISCD"], "005930")
             self.assertEqual(params["FID_PERIOD_DIV_CODE"], "D")
+            self.assertEqual(params["FID_ORG_ADJ_PRC"], "1")
         self.assertTrue(all(bar.trade_date <= date(2026, 9, 16) for bar in snapshot.bars))
         self.assertEqual(http.token_calls, 1)
 
@@ -295,77 +298,31 @@ class ProviderContractTests(unittest.TestCase):
 
     def test_naver_queries_company_name_filters_future_and_dedupes(self):
         http = NaverHttp()
-        client = NaverNewsClient("id", "secret", http=http)
-        items = client.news(self.instrument, date(2026, 9, 15))
+        client = NaverNewsClient("id", "secret", http=http, now=lambda: self.now_kst)
+        items = client.news(self.instrument, date(2026, 9, 16))
 
         self.assertEqual(http.params["query"], "삼성전자")
         self.assertEqual(http.params["sort"], "date")
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0].title, "Samsung today")
 
-    def test_naver_historical_cutoff_outside_search_window_is_unavailable(self):
-        class OnlyNewer:
+    def test_naver_historical_news_fails_closed_without_vintage_snapshot(self):
+        class MustNotCall:
             def get_json(self, url, **kwargs):
-                return {
-                    "total": 1,
-                    "items": [
-                        {
-                            "pubDate": format_datetime(datetime(2026, 9, 15, 8, tzinfo=timezone.utc)),
-                            "title": "newer than requested history",
-                            "originallink": "https://news/newer",
-                        }
-                    ],
-                }
+                raise AssertionError("historical non-vintage request must fail before HTTP")
 
-        client = NaverNewsClient("id", "secret", http=OnlyNewer())
-        with self.assertRaisesRegex(RuntimeError, "outside searchable result coverage"):
+        client = NaverNewsClient("id", "secret", http=MustNotCall(), now=lambda: self.now_kst)
+        with self.assertRaisesRegex(RuntimeError, "non-vintage"):
             client.news(self.instrument, date(2026, 8, 1))
 
-    def test_naver_historical_paginates_past_first_cutoff_page_to_fill_count(self):
-        cutoff = date(2026, 8, 1)
-
-        class PagedHistory:
+    def test_naver_future_as_of_is_rejected_before_http(self):
+        class MustNotCall:
             def get_json(self, url, **kwargs):
-                start = int(kwargs["params"]["start"])
-                if start == 1:
-                    newer = [
-                        {
-                            "pubDate": format_datetime(datetime(2026, 8, 2, 0, i % 60, tzinfo=timezone.utc)),
-                            "title": f"newer-{i}",
-                            "originallink": f"https://news/newer/{i}",
-                        }
-                        for i in range(99)
-                    ]
-                    return {
-                        "total": 102,
-                        "items": newer
-                        + [
-                            {
-                                "pubDate": format_datetime(datetime(2026, 8, 1, 10, tzinfo=timezone.utc)),
-                                "title": "valid-1",
-                                "originallink": "https://news/valid/1",
-                            }
-                        ],
-                    }
-                return {
-                    "total": 102,
-                    "items": [
-                        {
-                            "pubDate": format_datetime(datetime(2026, 7, 31, 9, tzinfo=timezone.utc)),
-                            "title": "valid-2",
-                            "originallink": "https://news/valid/2",
-                        },
-                        {
-                            "pubDate": format_datetime(datetime(2026, 7, 30, 9, tzinfo=timezone.utc)),
-                            "title": "valid-3",
-                            "originallink": "https://news/valid/3",
-                        },
-                    ],
-                }
+                raise AssertionError("future request must fail before HTTP")
 
-        client = NaverNewsClient("id", "secret", http=PagedHistory())
-        items = client.news(self.instrument, cutoff, count=3)
-        self.assertEqual([item.title for item in items], ["valid-1", "valid-2", "valid-3"])
+        client = NaverNewsClient("id", "secret", http=MustNotCall(), now=lambda: self.now_kst)
+        with self.assertRaisesRegex(ValueError, "future"):
+            client.news(self.instrument, date(2026, 9, 17))
 
     def test_ecos_partial_series_failure_does_not_abort_snapshot(self):
         client = EcosClient("ecos", http=EcosHttp(), base_url="https://ecos.test")

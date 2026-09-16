@@ -23,6 +23,7 @@ class CppWiringTests(unittest.TestCase):
             "kr_analyze_stock",
             "kr_decision_log",
             "kr_evaluate_outcome",
+            "kr_outcome_log",
             "kr_provider_smoke",
             "kr_paper_summary",
             "kr_paper_trade",
@@ -63,6 +64,16 @@ class CppWiringTests(unittest.TestCase):
         self.assertIn('payload["llm"]', tools)
         self.assertIn('payload["llm"]', ui)
         self.assertIn('run_kr_tool({"batch"}', tools)
+
+    def test_research_calls_have_explicit_long_but_finite_timeouts(self):
+        tools = (QT_ROOT / "src/mcp/tools/PersonalKrResearchTools.cpp").read_text(encoding="utf-8")
+        ui = (QT_ROOT / "src/screens/equity_research/EquityAnalysisTab.cpp").read_text(encoding="utf-8")
+        self.assertIn("kSingleResearchTimeoutMs = 20 * 60 * 1000", tools)
+        self.assertIn("kBatchResearchTimeoutMs = 60 * 60 * 1000", tools)
+        self.assertIn("t.default_timeout_ms = kBatchResearchTimeoutMs", tools)
+        self.assertIn("t.default_timeout_ms = kSingleResearchTimeoutMs", tools)
+        self.assertIn("run_opts.timeout_ms = 20 * 60 * 1000", ui)
+        self.assertIn("run_with_options", ui)
 
 
 if __name__ == "__main__":

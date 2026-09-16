@@ -171,6 +171,7 @@ class ResearchPacket:
     news: tuple[NewsItem, ...] = ()
     macro: MacroSnapshot | None = None
     unavailable: tuple[str, ...] = ()
+    unavailable_reasons: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         cutoff = self.candidate.analysis_date
@@ -184,6 +185,11 @@ class ResearchPacket:
             raise ValueError("macro snapshot is newer than analysis_date")
         if any(item.published_at.date() > cutoff for item in self.news):
             raise ValueError("news contains future articles")
+        object.__setattr__(
+            self,
+            "unavailable_reasons",
+            {str(key): str(value) for key, value in self.unavailable_reasons.items()},
+        )
 
 
 @dataclass(frozen=True)
@@ -200,6 +206,7 @@ class ResearchResult:
     risk_manager: str
     portfolio_manager: str
     unavailable: tuple[str, ...] = ()
+    unavailable_reasons: dict[str, str] = field(default_factory=dict)
     decision_id: str | None = None
     strategy_id: str = "personal-kr"
     generated_at: datetime | None = None

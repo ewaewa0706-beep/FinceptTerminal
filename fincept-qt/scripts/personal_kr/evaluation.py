@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Sequence
 
 from .models import OHLCVBar
@@ -24,6 +26,9 @@ class Outcome:
     stock_source: str | None = None
     benchmark_symbol: str | None = None
     benchmark_source: str | None = None
+    evaluated_at: datetime | None = None
+    stock_input_hash: str | None = None
+    benchmark_input_hash: str | None = None
 
 
 def calculate_forward_return(
@@ -42,8 +47,6 @@ def calculate_forward_return(
         raise ValueError("horizon must be >= 1")
     stock = _dedupe(bars)
     bench_by_date = {bar.trade_date: bar for bar in _dedupe(benchmark_bars or ())}
-    if benchmark_bars is not None:
-        stock = [bar for bar in stock if bar.trade_date in bench_by_date]
     # A research decision can be created intraday. Reconstructing that day's
     # final close later would leak information that was not available when the
     # decision was frozen. Attribute performance from the NEXT common trading
@@ -63,10 +66,14 @@ def calculate_forward_return(
     drawdown = min((bar.low / start.open - 1 for bar in path), default=None)
     benchmark_return = None
     alpha = None
+    benchmark_input_hash = None
     if benchmark_bars is not None:
+        if start.trade_date not in bench_by_date or end.trade_date not in bench_by_date:
+            raise ValueError("benchmark is missing the stock horizon start or end trading session")
         b0, b1 = bench_by_date[start.trade_date], bench_by_date[end.trade_date]
         benchmark_return = (b1.close - b0.open) / b0.open
         alpha = raw - benchmark_return
+        benchmark_input_hash = _bars_hash((b0, b1))
     return Outcome(
         decision_id=decision_id,
         horizon=horizon,
@@ -81,9 +88,28 @@ def calculate_forward_return(
         stock_source=stock_source,
         benchmark_symbol=benchmark_symbol,
         benchmark_source=benchmark_source,
+        evaluated_at=datetime.now(timezone.utc),
+        stock_input_hash=_bars_hash(path),
+        benchmark_input_hash=benchmark_input_hash,
     )
 
 
 def _dedupe(bars: Sequence[OHLCVBar]) -> list[OHLCVBar]:
     keyed = {bar.trade_date: bar for bar in bars}
     return [keyed[day] for day in sorted(keyed)]
+
+
+def _bars_hash(bars: Sequence[OHLCVBar]) -> str:
+    canonical = [
+        {
+            "trade_date": bar.trade_date.isoformat(),
+            "open": bar.open,
+            "high": bar.high,
+            "low": bar.low,
+            "close": bar.close,
+            "volume": bar.volume,
+        }
+        for bar in bars
+    ]
+    raw = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()

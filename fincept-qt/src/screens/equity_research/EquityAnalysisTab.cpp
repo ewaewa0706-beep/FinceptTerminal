@@ -359,8 +359,11 @@ void EquityAnalysisTab::on_kr_research_clicked() {
     const QByteArray input = QJsonDocument(payload).toJson(QJsonDocument::Compact);
     QPointer<EquityAnalysisTab> self(this);
     const QString launch_symbol = current_symbol_;
-    python::PythonRunner::instance().run(
-        "personal_kr_terminal.py", {"analyze"},
+    python::PythonRunner::RunOptions run_opts;
+    run_opts.timeout_ms = 20 * 60 * 1000;
+    run_opts.stdin_data = input;
+    python::PythonRunner::instance().run_with_options(
+        "personal_kr_terminal.py", {"analyze"}, run_opts,
         [self, launch_symbol](python::PythonResult result) {
             if (!self)
                 return;
@@ -386,13 +389,19 @@ void EquityAnalysisTab::on_kr_research_clicked() {
                 return;
             }
             const QJsonObject data = doc.object().value("data").toObject();
-            const QString signal = data.value("signal").toString(QStringLiteral("Hold"));
+            const QString signal = data.value("signal").toString();
+            if (signal != QLatin1String("Buy") && signal != QLatin1String("Hold") && signal != QLatin1String("Sell")) {
+                if (self->kr_status_)
+                    self->kr_status_->setText(self->tr("KR AI research unavailable"));
+                if (self->kr_result_)
+                    self->kr_result_->setPlainText(self->tr("Invalid Portfolio Manager signal contract"));
+                return;
+            }
             if (self->kr_status_)
                 self->kr_status_->setText(self->tr("Completed · signal: %1 · research_only").arg(signal));
             if (self->kr_result_)
                 self->kr_result_->setPlainText(QString::fromUtf8(QJsonDocument(data).toJson(QJsonDocument::Indented)));
-        },
-        {}, input);
+        });
 }
 
 bool EquityAnalysisTab::is_korean_symbol_() const {

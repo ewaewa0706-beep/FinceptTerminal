@@ -145,7 +145,14 @@ class DecisionStore:
                     (strategy_id, ticker, analysis_date),
                 ).fetchone()
                 if row:
-                    return _result_from_payload(json.loads(row["payload"]))
+                    existing = _result_from_payload(json.loads(row["payload"]))
+                    incoming_provenance = _ranking_provenance_tuple(result)
+                    if any(incoming_provenance) and incoming_provenance != _ranking_provenance_tuple(existing):
+                        raise ValueError(
+                            "decision provenance conflict: an immutable decision already exists for a different "
+                            "quant ranking run"
+                        )
+                    return existing
                 decision_id = str(uuid.uuid4())
                 frozen = replace(result, decision_id=decision_id, strategy_id=strategy_id)
                 payload = json.dumps(to_jsonable(frozen), ensure_ascii=False, separators=(",", ":"))
@@ -182,6 +189,7 @@ class DecisionStore:
         payload = json.dumps(to_jsonable(outcome), ensure_ascii=False, separators=(",", ":"))
         with closing(self._connect()) as conn:
             with conn:
+                conn.execute("BEGIN IMMEDIATE")
                 decision = conn.execute(
                     "SELECT ticker FROM kr_decisions WHERE id=?", (outcome.decision_id,)
                 ).fetchone()
@@ -189,8 +197,21 @@ class DecisionStore:
                     raise ValueError("outcome decision not found")
                 if outcome.stock_ticker and outcome.stock_ticker != decision["ticker"]:
                     raise ValueError("outcome ticker does not match decision")
+                existing_row = conn.execute(
+                    "SELECT payload FROM kr_outcomes WHERE decision_id=? AND horizon=?",
+                    (outcome.decision_id, outcome.horizon),
+                ).fetchone()
+                if existing_row is not None:
+                    existing = _outcome_from_payload(json.loads(existing_row["payload"]))
+                    incoming_provenance = _outcome_provenance_tuple(outcome)
+                    existing_provenance = _outcome_provenance_tuple(existing)
+                    if any(incoming_provenance + existing_provenance) and incoming_provenance != existing_provenance:
+                        raise ValueError(
+                            "outcome provenance conflict: immutable outcome already exists for different price inputs"
+                        )
+                    return existing
                 conn.execute(
-                    "INSERT OR IGNORE INTO kr_outcomes(decision_id,horizon,payload,created_at) VALUES(?,?,?,?)",
+                    "INSERT INTO kr_outcomes(decision_id,horizon,payload,created_at) VALUES(?,?,?,?)",
                     (outcome.decision_id, outcome.horizon, payload, datetime.now(timezone.utc).isoformat()),
                 )
                 row = conn.execute(
@@ -198,22 +219,23 @@ class DecisionStore:
                     (outcome.decision_id, outcome.horizon),
                 ).fetchone()
         assert row is not None
-        data = json.loads(row["payload"])
-        return Outcome(
-            decision_id=data["decision_id"],
-            horizon=int(data["horizon"]),
-            start_date=date.fromisoformat(data["start_date"]),
-            end_date=date.fromisoformat(data["end_date"]),
-            raw_return=float(data["raw_return"]),
-            benchmark_return=data.get("benchmark_return"),
-            alpha_return=data.get("alpha_return"),
-            max_gain=data.get("max_gain"),
-            max_drawdown=data.get("max_drawdown"),
-            stock_ticker=data.get("stock_ticker"),
-            stock_source=data.get("stock_source"),
-            benchmark_symbol=data.get("benchmark_symbol"),
-            benchmark_source=data.get("benchmark_source"),
-        )
+        return _outcome_from_payload(json.loads(row["payload"]))
+
+    def list_outcomes(self, decision_id: str) -> list[Outcome]:
+        """Return frozen outcome/alpha observations for one decision by horizon."""
+
+        decision_id = str(decision_id).strip()
+        if not decision_id:
+            raise ValueError("decision_id is required")
+        with closing(self._connect()) as conn:
+            decision = conn.execute("SELECT 1 FROM kr_decisions WHERE id=?", (decision_id,)).fetchone()
+            if decision is None:
+                raise ValueError("decision not found")
+            rows = conn.execute(
+                "SELECT payload FROM kr_outcomes WHERE decision_id=? ORDER BY horizon",
+                (decision_id,),
+            ).fetchall()
+        return [_outcome_from_payload(json.loads(row["payload"])) for row in rows]
 
     def add_paper_trade(
         self,
@@ -346,6 +368,7 @@ def _result_from_payload(data: dict) -> ResearchResult:
         risk_manager=data["risk_manager"],
         portfolio_manager=data["portfolio_manager"],
         unavailable=tuple(data.get("unavailable") or ()),
+        unavailable_reasons={str(k): str(v) for k, v in (data.get("unavailable_reasons") or {}).items()},
         decision_id=data.get("decision_id"),
         strategy_id=data.get("strategy_id") or "personal-kr",
         generated_at=datetime.fromisoformat(data["generated_at"]) if data.get("generated_at") else None,
@@ -354,3 +377,34 @@ def _result_from_payload(data: dict) -> ResearchResult:
         llm_model_id=data.get("llm_model_id") or "",
         workflow_version=data.get("workflow_version") or "personal-kr-v1",
     )
+
+
+def _outcome_from_payload(data: dict) -> Outcome:
+    return Outcome(
+        decision_id=data["decision_id"],
+        horizon=int(data["horizon"]),
+        start_date=date.fromisoformat(data["start_date"]),
+        end_date=date.fromisoformat(data["end_date"]),
+        raw_return=float(data["raw_return"]),
+        benchmark_return=data.get("benchmark_return"),
+        alpha_return=data.get("alpha_return"),
+        max_gain=data.get("max_gain"),
+        max_drawdown=data.get("max_drawdown"),
+        stock_ticker=data.get("stock_ticker"),
+        stock_source=data.get("stock_source"),
+        benchmark_symbol=data.get("benchmark_symbol"),
+        benchmark_source=data.get("benchmark_source"),
+        evaluated_at=datetime.fromisoformat(data["evaluated_at"]) if data.get("evaluated_at") else None,
+        stock_input_hash=data.get("stock_input_hash"),
+        benchmark_input_hash=data.get("benchmark_input_hash"),
+    )
+
+
+def _ranking_provenance_tuple(result: ResearchResult) -> tuple[str, str, str]:
+    candidate = result.candidate
+    generated = candidate.ranking_generated_at.isoformat() if candidate.ranking_generated_at else ""
+    return candidate.ranking_source, generated, candidate.ranking_payload_hash
+
+
+def _outcome_provenance_tuple(outcome: Outcome) -> tuple[str, str]:
+    return outcome.stock_input_hash or "", outcome.benchmark_input_hash or ""

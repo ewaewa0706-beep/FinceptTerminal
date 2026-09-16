@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, Protocol
@@ -64,12 +65,14 @@ class ResearchEngine:
     def packet(self, candidate: QuantCandidate, *, lookback_days: int = 120) -> ResearchPacket:
         market = self.market.daily_bars(candidate.instrument, candidate.analysis_date, lookback_days)
         unavailable: list[str] = []
+        unavailable_reasons: dict[str, str] = {}
 
         def optional(name: str, fn):
             try:
                 return fn()
-            except Exception:
+            except Exception as exc:
                 unavailable.append(name)
+                unavailable_reasons[name] = _safe_unavailable_reason(exc)
                 return None
 
         flow = (
@@ -79,6 +82,7 @@ class ResearchEngine:
         )
         if self.flow is None:
             unavailable.append("investor_flow")
+            unavailable_reasons["investor_flow"] = "not configured"
         fundamentals = (
             optional("fundamentals", lambda: self.fundamentals.fundamentals(candidate.instrument, candidate.analysis_date))
             if self.fundamentals
@@ -86,6 +90,7 @@ class ResearchEngine:
         )
         if self.fundamentals is None:
             unavailable.append("fundamentals")
+            unavailable_reasons["fundamentals"] = "not configured"
         news_items = (
             optional("news", lambda: self.news.news(candidate.instrument, candidate.analysis_date, 20))
             if self.news
@@ -93,9 +98,11 @@ class ResearchEngine:
         )
         if self.news is None:
             unavailable.append("news")
+            unavailable_reasons["news"] = "not configured"
         macro = optional("macro", lambda: self.macro.macro(candidate.analysis_date)) if self.macro else None
         if self.macro is None:
             unavailable.append("macro")
+            unavailable_reasons["macro"] = "not configured"
         return ResearchPacket(
             candidate=candidate,
             market=market,
@@ -104,6 +111,7 @@ class ResearchEngine:
             news=tuple(news_items or ()),
             macro=macro,
             unavailable=tuple(dict.fromkeys(unavailable)),
+            unavailable_reasons=unavailable_reasons,
         )
 
     def analyze(self, candidate: QuantCandidate) -> ResearchResult:
@@ -181,6 +189,7 @@ class ResearchEngine:
             risk_manager=risk_manager,
             portfolio_manager=portfolio_manager,
             unavailable=packet.unavailable,
+            unavailable_reasons=packet.unavailable_reasons,
             generated_at=datetime.now(timezone.utc),
             evidence=to_jsonable(packet),
             llm_provider=llm_provider,
@@ -204,8 +213,6 @@ def with_decision_id(result: ResearchResult, decision_id: str) -> ResearchResult
 
 
 def _parse_signal(text: str) -> str:
-    import re
-
     # Portfolio Manager is required to put the final signal on the last line.
     # Use the last explicit marker rather than checking BUY first: a rationale
     # can legitimately mention rejected alternatives ("not SIGNAL: BUY") before
@@ -213,4 +220,21 @@ def _parse_signal(text: str) -> str:
     matches = re.findall(r"(?im)^\s*SIGNAL\s*:\s*(BUY|HOLD|SELL)\s*$", text)
     if matches:
         return matches[-1].title()
-    return "Hold"
+    raise ValueError("Portfolio Manager response is missing a valid explicit SIGNAL: BUY|HOLD|SELL line")
+
+
+def _safe_unavailable_reason(exc: Exception) -> str:
+    """Keep useful provider failure context without persisting URLs or credentials."""
+
+    message = " ".join(str(exc).split())
+    message = re.sub(r"https?://\S+", "<redacted-url>", message, flags=re.IGNORECASE)
+    message = re.sub(r"(?i)(bearer\s+)[^\s,;]+", r"\1<redacted>", message)
+    message = re.sub(
+        r"(?i)((?:api[_ -]?key|app[_ -]?secret|client[_ -]?secret|access[_ -]?token|token)\s*[=:]\s*)[^\s,;]+",
+        r"\1<redacted>",
+        message,
+    )
+    if len(message) > 240:
+        message = message[:237] + "..."
+    label = exc.__class__.__name__
+    return f"{label}: {message}" if message else label

@@ -26,7 +26,11 @@ namespace {
 static constexpr const char* TAG = "PersonalKrResearchTools";
 static constexpr int kStatusTimeoutMs = 15000;
 static constexpr int kProviderTimeoutMs = 5 * 60 * 1000;
-static constexpr int kResearchTimeoutMs = 5 * 60 * 1000;
+// One stock performs nine sequential LLM stages; Top-N batches can perform
+// dozens. Keep finite watchdogs, but budget them separately so healthy research
+// is not killed by the generic five-minute subprocess limit.
+static constexpr int kSingleResearchTimeoutMs = 20 * 60 * 1000;
+static constexpr int kBatchResearchTimeoutMs = 60 * 60 * 1000;
 
 ToolResult parse_kr_envelope(const python::PythonResult& result) {
     if (!result.success)
@@ -189,7 +193,7 @@ std::vector<ToolDef> get_personal_kr_research_tools() {
                 .default_int(5)
                 .between(1, 50)
                 .build();
-        t.default_timeout_ms = kResearchTimeoutMs;
+        t.default_timeout_ms = kBatchResearchTimeoutMs;
         t.supports_async = true;
         t.auth_required = AuthLevel::Authenticated;
         t.async_handler = [](const QJsonObject& args, ToolContext ctx,
@@ -244,7 +248,7 @@ std::vector<ToolDef> get_personal_kr_research_tools() {
                 .min(1)
                 .object("factors", "Optional numeric quant factor map")
                 .build();
-        t.default_timeout_ms = kResearchTimeoutMs;
+        t.default_timeout_ms = kSingleResearchTimeoutMs;
         t.supports_async = true;
         t.auth_required = AuthLevel::Authenticated;
         t.async_handler = [](const QJsonObject& args, ToolContext ctx,
@@ -303,6 +307,26 @@ std::vector<ToolDef> get_personal_kr_research_tools() {
                     script_args << QString::number(value.toInt());
             }
             run_kr_tool(script_args, {}, ctx, promise);
+        };
+        tools.push_back(std::move(t));
+    }
+
+    // ── kr_provider_smoke ───────────────────────────────────────────────
+    {
+        ToolDef t;
+        t.name = "kr_outcome_log";
+        t.description = "Read frozen forward outcomes and benchmark alpha for one stored Korean-stock research "
+                        "decision. Results are ordered by trading-session horizon and are read-only.";
+        t.category = "equity-research";
+        t.input_schema = ToolSchemaBuilder()
+                             .string("decision_id", "Stored personal-KR decision ID")
+                             .required()
+                             .length(1, 128)
+                             .build();
+        t.default_timeout_ms = kStatusTimeoutMs;
+        t.async_handler = [](const QJsonObject& args, ToolContext ctx,
+                             std::shared_ptr<QPromise<ToolResult>> promise) {
+            run_kr_tool({"outcomes", args.value("decision_id").toString()}, {}, ctx, promise);
         };
         tools.push_back(std::move(t));
     }

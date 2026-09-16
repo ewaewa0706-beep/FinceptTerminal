@@ -119,6 +119,13 @@ class CoreTests(unittest.TestCase):
         text = "Rejected alternative:\nSIGNAL: BUY\nFinal decision:\nSIGNAL: SELL"
         self.assertEqual(_parse_signal(text), "Sell")
 
+    def test_signal_parser_fails_closed_without_explicit_marker(self):
+        with self.assertRaisesRegex(ValueError, "explicit SIGNAL"):
+            _parse_signal("The portfolio should probably hold for now.")
+        with self.assertRaisesRegex(ValueError, "explicit SIGNAL"):
+            _parse_signal("SIGNAL: WAIT")
+        self.assertEqual(_parse_signal("rationale\nSIGNAL: HOLD"), "Hold")
+
     def test_partial_data_continues_when_news_fails(self):
         providers = FakeProviders(fail_news=True)
         engine = ResearchEngine(
@@ -132,6 +139,34 @@ class CoreTests(unittest.TestCase):
         packet = engine.packet(self.candidate)
         self.assertIn("news", packet.unavailable)
         self.assertEqual(packet.news, ())
+        self.assertEqual(packet.unavailable_reasons["news"], "RuntimeError: naver down")
+
+    def test_partial_data_reason_is_sanitized_and_persisted(self):
+        class LeakyNews(FakeProviders):
+            def news(self, instrument, as_of, count=20):
+                raise RuntimeError("GET https://example.invalid/path?api_key=secret token=abc123 failed")
+
+        providers = LeakyNews()
+        llm = ScriptedLlm(["ok"] * 8 + ["SIGNAL: HOLD"])
+        engine = ResearchEngine(
+            market=providers,
+            flow=providers,
+            fundamentals=providers,
+            news=providers,
+            macro=providers,
+            llm=llm,
+        )
+        result = engine.analyze(self.candidate)
+        reason = result.unavailable_reasons["news"]
+        self.assertIn("RuntimeError", reason)
+        self.assertIn("<redacted-url>", reason)
+        self.assertNotIn("secret", reason)
+        self.assertNotIn("abc123", reason)
+        with tempfile.TemporaryDirectory() as tmp:
+            stored = DecisionStore(Path(tmp) / "kr.db").record_decision(result)
+            loaded = DecisionStore(Path(tmp) / "kr.db").get_decision(stored.decision_id or "")
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded.unavailable_reasons, result.unavailable_reasons)
 
     def test_full_agent_chain_runs_and_returns_hold(self):
         providers = FakeProviders()
@@ -156,11 +191,42 @@ class CoreTests(unittest.TestCase):
                 return super().daily_bars(instrument, as_of, lookback_days)
 
         providers = SometimesBad()
-        engine = ResearchEngine(market=providers, llm=ScriptedLlm())
+        engine = ResearchEngine(market=providers, llm=ScriptedLlm(["ok"] * 8 + ["SIGNAL: HOLD"]))
         other = QuantCandidate(Instrument("000660", "SK하이닉스"), self.candidate.analysis_date, 80, 2)
         results, errors = engine.analyze_many([self.candidate, other])
         self.assertEqual([r.candidate.instrument.ticker for r in results], ["005930"])
         self.assertIn("000660", errors)
+
+    def test_batch_isolates_malformed_portfolio_manager_signal(self):
+        providers = FakeProviders()
+        bad = QuantCandidate(Instrument("000660", "SK하이닉스"), self.candidate.analysis_date, 80, 2)
+
+        class PerTickerLlm:
+            provider = "scripted"
+            model = "per-ticker"
+
+            def __init__(self):
+                self.calls = 0
+
+            def complete(self, system, user):
+                self.calls += 1
+                ticker = "000660" if "000660" in user else "005930"
+                stage = (self.calls - 1) % 9
+                if stage == 8:
+                    return "no explicit final marker" if ticker == "000660" else "SIGNAL: BUY"
+                return "ok"
+
+        engine = ResearchEngine(
+            market=providers,
+            flow=providers,
+            fundamentals=providers,
+            news=providers,
+            macro=providers,
+            llm=PerTickerLlm(),
+        )
+        results, errors = engine.analyze_many([self.candidate, bad])
+        self.assertEqual([r.candidate.instrument.ticker for r in results], ["005930"])
+        self.assertRegex(errors["000660"], "explicit SIGNAL")
 
     def test_http_retries_500_then_succeeds(self):
         calls = []
@@ -185,6 +251,24 @@ class CoreTests(unittest.TestCase):
         self.assertAlmostEqual(out.benchmark_return or 0, expected_bench)
         self.assertAlmostEqual(out.alpha_return or 0, expected_raw - expected_bench)
         self.assertEqual(out.start_date, date(2026, 8, 21))
+        self.assertIsNotNone(out.evaluated_at)
+        self.assertEqual(len(out.stock_input_hash or ""), 64)
+        self.assertEqual(len(out.benchmark_input_hash or ""), 64)
+
+    def test_evaluation_does_not_stretch_stock_horizon_for_benchmark_gaps(self):
+        stock = bars(1.0, days=6)
+        benchmark = tuple(bar for bar in bars(0.5, days=6) if bar.trade_date != date(2026, 8, 23))
+        with self.assertRaisesRegex(ValueError, "benchmark is missing"):
+            calculate_forward_return("d1", stock, date(2026, 8, 20), 3, benchmark)
+
+        # A missing interior benchmark session is acceptable when the stock
+        # horizon endpoints exist; it must not shift the stock end date.
+        benchmark_interior_gap = tuple(
+            bar for bar in bars(0.5, days=6) if bar.trade_date != date(2026, 8, 22)
+        )
+        out = calculate_forward_return("d1", stock, date(2026, 8, 20), 3, benchmark_interior_gap)
+        self.assertEqual(out.start_date, date(2026, 8, 21))
+        self.assertEqual(out.end_date, date(2026, 8, 23))
 
     def test_outcome_first_write_wins(self):
         from personal_kr.evaluation import Outcome
@@ -232,6 +316,55 @@ class CoreTests(unittest.TestCase):
             stored_second = store.record_outcome(second)
             self.assertEqual(stored_first.raw_return, 0.05)
             self.assertEqual(stored_second.raw_return, 0.05)
+            history = store.list_outcomes(decision.decision_id or "")
+            self.assertEqual(len(history), 1)
+            self.assertEqual(history[0].horizon, 5)
+            self.assertEqual(history[0].raw_return, 0.05)
+
+    def test_outcome_rejects_replay_with_different_price_input_fingerprint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DecisionStore(Path(tmp) / "kr.db")
+            decision = store.record_decision(
+                ResearchResult(
+                    candidate=self.candidate,
+                    signal="Hold",
+                    market_report="m",
+                    fundamentals_report="f",
+                    news_macro_report="n",
+                    bull_case="b+",
+                    bear_case="b-",
+                    research_manager="r",
+                    trader="t",
+                    risk_manager="risk",
+                    portfolio_manager="p",
+                )
+            )
+            first = calculate_forward_return(
+                decision.decision_id or "",
+                bars(1.0, days=10),
+                self.candidate.analysis_date,
+                5,
+                bars(0.5, days=10),
+                stock_ticker="005930",
+                stock_source="KIS",
+                benchmark_symbol="^KS11",
+                benchmark_source="Yahoo Finance",
+            )
+            changed = calculate_forward_return(
+                decision.decision_id or "",
+                bars(2.0, days=10),
+                self.candidate.analysis_date,
+                5,
+                bars(0.75, days=10),
+                stock_ticker="005930",
+                stock_source="KIS",
+                benchmark_symbol="^KS11",
+                benchmark_source="Yahoo Finance",
+            )
+            frozen = store.record_outcome(first)
+            self.assertEqual(frozen.stock_input_hash, first.stock_input_hash)
+            with self.assertRaisesRegex(ValueError, "outcome provenance conflict"):
+                store.record_outcome(changed)
 
     def test_outcome_requires_matching_decision_provenance(self):
         from personal_kr.evaluation import Outcome
@@ -395,6 +528,52 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(manual.strategy_id, "personal-kr-ui")
             self.assertEqual(quant.strategy_id, "personal-kr-quant")
             self.assertEqual(quant.signal, "Buy")
+
+    def test_decision_rejects_same_day_quant_rerun_with_different_ranking_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DecisionStore(Path(tmp) / "kr.db")
+            generated = datetime(2026, 8, 20, 9, tzinfo=timezone.utc)
+            first_candidate = QuantCandidate(
+                self.instrument,
+                self.candidate.analysis_date,
+                90,
+                1,
+                {},
+                "quant-v1",
+                generated,
+                "hash-a",
+            )
+            second_candidate = QuantCandidate(
+                self.instrument,
+                self.candidate.analysis_date,
+                95,
+                1,
+                {},
+                "quant-v2",
+                generated + timedelta(minutes=5),
+                "hash-b",
+            )
+
+            def result(candidate):
+                return ResearchResult(
+                    candidate=candidate,
+                    signal="Hold",
+                    market_report="m",
+                    fundamentals_report="f",
+                    news_macro_report="n",
+                    bull_case="b+",
+                    bear_case="b-",
+                    research_manager="r",
+                    trader="t",
+                    risk_manager="risk",
+                    portfolio_manager="p",
+                )
+
+            frozen = store.record_decision(result(first_candidate), strategy_id="personal-kr-quant")
+            replay = store.record_decision(result(first_candidate), strategy_id="personal-kr-quant")
+            self.assertEqual(replay.decision_id, frozen.decision_id)
+            with self.assertRaisesRegex(ValueError, "provenance conflict"):
+                store.record_decision(result(second_candidate), strategy_id="personal-kr-quant")
 
     def test_concurrent_decision_and_paper_writes_remain_first_write_wins(self):
         with tempfile.TemporaryDirectory() as tmp:

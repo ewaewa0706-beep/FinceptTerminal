@@ -9,7 +9,7 @@ import os
 import re
 import time
 import zipfile
-from datetime import date, datetime, time as dt_time, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
 from pathlib import Path
@@ -273,7 +273,10 @@ class KisClient:
                     "FID_INPUT_DATE_1": window_start.strftime("%Y%m%d"),
                     "FID_INPUT_DATE_2": window_end.strftime("%Y%m%d"),
                     "FID_PERIOD_DIV_CODE": "D",
-                    "FID_ORG_ADJ_PRC": "0",
+                    # Strict historical research uses original prices. KIS
+                    # adjusted history can be restated by later corporate
+                    # actions, which would leak information into old PIT runs.
+                    "FID_ORG_ADJ_PRC": "1",
                 },
             )
             rows = payload.get("output2") or []
@@ -519,12 +522,20 @@ def _map_dart_accounts(rows: list[dict[str, Any]]) -> dict[str, float | None]:
 class NaverNewsClient:
     URL = "https://openapi.naver.com/v1/search/news.json"
 
-    def __init__(self, client_id: str, client_secret: str, *, http: RetryHttpClient | None = None) -> None:
+    def __init__(
+        self,
+        client_id: str,
+        client_secret: str,
+        *,
+        http: RetryHttpClient | None = None,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
         if not client_id or not client_secret:
             raise ValueError("NAVER_CLIENT_ID and NAVER_CLIENT_SECRET are required")
         self.client_id = client_id
         self.client_secret = client_secret
         self.http = http or RetryHttpClient()
+        self._now = now or (lambda: datetime.now(timezone(timedelta(hours=9))))
 
     @classmethod
     def from_env(cls, **kwargs: Any) -> "NaverNewsClient":
@@ -532,19 +543,16 @@ class NaverNewsClient:
 
     def news(self, instrument: Instrument, as_of: date, count: int = 20) -> tuple[NewsItem, ...]:
         kst = timezone(timedelta(hours=9))
-        now_kst = datetime.now(kst)
-        cutoff = (
-            now_kst
-            if as_of == now_kst.date()
-            else datetime.combine(as_of, dt_time.max, tzinfo=kst)
-        )
-        display = 100 if as_of < now_kst.date() else min(max(count, 1), 100)
+        now_kst = self._now().astimezone(kst)
+        if as_of < now_kst.date():
+            raise RuntimeError("Naver historical news is non-vintage; point-in-time history unavailable")
+        if as_of > now_kst.date():
+            raise ValueError("Naver news as_of cannot be in the future")
+        cutoff = now_kst
+        display = min(max(count, 1), 100)
         result: list[NewsItem] = []
         seen: set[str] = set()
         start = 1
-        newer_rows_seen = False
-        reached_cutoff = False
-        total = 0
         while start <= 1000 and len(result) < count:
             payload = self.http.get_json(
                 self.URL,
@@ -559,7 +567,6 @@ class NaverNewsClient:
                     "sort": "date",
                 },
             )
-            total = int(payload.get("total") or total or 0)
             rows = payload.get("items") or []
             if not rows:
                 break
@@ -573,9 +580,7 @@ class NaverNewsClient:
                     published = published.replace(tzinfo=timezone.utc)
                 published = published.astimezone(kst)
                 if published > cutoff:
-                    newer_rows_seen = True
                     continue
-                reached_cutoff = True
                 link = str(row.get("originallink") or row.get("link") or "")
                 key = link or _clean_html(str(row.get("title", "")))
                 if not key or key in seen:
@@ -593,11 +598,6 @@ class NaverNewsClient:
             if len(result) >= count or len(rows) < display:
                 break
             start += display
-
-        if as_of < now_kst.date() and newer_rows_seen and not reached_cutoff and total > 0:
-            raise RuntimeError(
-                f"Naver historical news cutoff {as_of.isoformat()} is outside searchable result coverage"
-            )
         return tuple(result[:count])
 
 

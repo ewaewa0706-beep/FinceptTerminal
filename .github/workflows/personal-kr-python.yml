@@ -1,0 +1,59 @@
+name: Personal KR Python Regression
+
+on:
+  pull_request:
+    paths:
+      - 'fincept-qt/scripts/personal_kr/**'
+      - 'fincept-qt/scripts/personal_kr_terminal.py'
+      - 'fincept-qt/scripts/validate_personal_kr.ps1'
+      - 'fincept-qt/src/config/PersonalKrCredentials.inc'
+      - 'fincept-qt/src/mcp/McpInit.cpp'
+      - 'fincept-qt/src/mcp/tools/PersonalKrResearchTools.cpp'
+      - 'fincept-qt/src/mcp/tools/PersonalKrResearchTools.h'
+      - 'fincept-qt/src/python/PythonRunner.cpp'
+      - 'fincept-qt/src/screens/equity_research/EquityAnalysisTab.cpp'
+      - 'fincept-qt/src/screens/settings/CredentialsSection.cpp'
+      - 'fincept-qt/src/services/equity/PersonalKrLlmConfig.h'
+      - 'fincept-qt/CMakeLists.txt'
+      - '.github/workflows/personal-kr-python.yml'
+  push:
+    branches:
+      - main
+      - personal-kr-terminal
+    paths:
+      - 'fincept-qt/scripts/personal_kr/**'
+      - 'fincept-qt/scripts/personal_kr_terminal.py'
+      - 'fincept-qt/scripts/validate_personal_kr.ps1'
+      - 'fincept-qt/src/config/PersonalKrCredentials.inc'
+      - 'fincept-qt/src/mcp/McpInit.cpp'
+      - 'fincept-qt/src/mcp/tools/PersonalKrResearchTools.cpp'
+      - 'fincept-qt/src/mcp/tools/PersonalKrResearchTools.h'
+      - 'fincept-qt/src/python/PythonRunner.cpp'
+      - 'fincept-qt/src/screens/equity_research/EquityAnalysisTab.cpp'
+      - 'fincept-qt/src/screens/settings/CredentialsSection.cpp'
+      - 'fincept-qt/src/services/equity/PersonalKrLlmConfig.h'
+      - 'fincept-qt/CMakeLists.txt'
+      - '.github/workflows/personal-kr-python.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    name: Python 3.11 regression
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Validate Personal KR module
+        shell: pwsh
+        run: ./fincept-qt/scripts/validate_personal_kr.ps1 -Python python

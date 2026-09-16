@@ -201,7 +201,14 @@ def cmd_batch() -> Any:
     results, errors = engine.analyze_many(candidates)
     store = _store()
     strategy_id = str(payload.get("strategy_id") or "personal-kr-quant")
-    stored = [store.record_decision(result, strategy_id=strategy_id) for result in results]
+    stored = []
+    for result in results:
+        try:
+            stored.append(store.record_decision(result, strategy_id=strategy_id))
+        except Exception as exc:
+            # Persistence/provenance conflict for one Top-N name must not erase
+            # successfully frozen decisions for the rest of the batch.
+            errors[result.candidate.instrument.ticker] = f"decision persistence failed: {exc}"
     return {
         "selected": candidates,
         "results": stored,
@@ -280,6 +287,10 @@ def cmd_evaluate(args: argparse.Namespace) -> Any:
     return outcomes
 
 
+def cmd_outcomes(args: argparse.Namespace) -> Any:
+    return _store().list_outcomes(args.decision_id)
+
+
 def cmd_paper_summary() -> Any:
     cash, positions = _store().paper_summary()
     return {"cash_krw": cash, "positions": positions, "execution_mode": "paper_only"}
@@ -336,6 +347,8 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate = sub.add_parser("evaluate")
     evaluate.add_argument("decision_id")
     evaluate.add_argument("--horizons", nargs="+", type=int, default=[1, 5, 20, 60])
+    outcomes = sub.add_parser("outcomes")
+    outcomes.add_argument("decision_id")
     sub.add_parser("paper-summary")
     sub.add_parser("paper-trade")
     sub.add_parser("llm-smoke")
@@ -369,6 +382,8 @@ def main(argv: list[str] | None = None) -> int:
             _print(cmd_decisions(args))
         elif args.command == "evaluate":
             _print(cmd_evaluate(args))
+        elif args.command == "outcomes":
+            _print(cmd_outcomes(args))
         elif args.command == "paper-summary":
             _print(cmd_paper_summary())
         elif args.command == "paper-trade":

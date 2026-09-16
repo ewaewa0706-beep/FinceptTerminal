@@ -11,6 +11,7 @@ from pathlib import Path
 
 from personal_kr.models import Instrument, QuantCandidate, ResearchResult
 from personal_kr.persistence import DecisionStore
+from personal_kr.evaluation import Outcome
 
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[2]
@@ -146,6 +147,48 @@ class CliIntegrationTests(unittest.TestCase):
             self.assertEqual(second["data"]["cash_krw"], 99_930_000)
             self.assertEqual(summary["data"]["positions"], {"005930": 1})
             self.assertEqual(summary["data"]["execution_mode"], "paper_only")
+
+    def test_outcomes_wrapper_reads_frozen_alpha_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DecisionStore(Path(tmp) / "personal_kr" / "research.db")
+            decision = store.record_decision(
+                ResearchResult(
+                    candidate=QuantCandidate(Instrument("005930", "삼성전자"), date(2026, 9, 1), 90, 1),
+                    signal="Hold",
+                    market_report="m",
+                    fundamentals_report="f",
+                    news_macro_report="n",
+                    bull_case="b+",
+                    bear_case="b-",
+                    research_manager="r",
+                    trader="t",
+                    risk_manager="risk",
+                    portfolio_manager="p",
+                )
+            )
+            store.record_outcome(
+                Outcome(
+                    decision.decision_id or "",
+                    5,
+                    date(2026, 9, 2),
+                    date(2026, 9, 8),
+                    0.04,
+                    0.01,
+                    0.03,
+                    0.05,
+                    -0.02,
+                    stock_ticker="005930",
+                    stock_source="KIS",
+                    benchmark_symbol="^KS11",
+                    benchmark_source="Yahoo Finance",
+                )
+            )
+            proc, body = run_cli("outcomes", decision.decision_id or "", data_dir=tmp)
+            self.assertEqual(proc.returncode, 0)
+            self.assertTrue(body["success"])
+            self.assertEqual(body["data"][0]["horizon"], 5)
+            self.assertEqual(body["data"][0]["alpha_return"], 0.03)
+            self.assertEqual(body["data"][0]["benchmark_symbol"], "^KS11")
 
     def test_provider_smoke_missing_kis_returns_structured_error(self):
         env_backup = {key: os.environ.pop(key, None) for key in ("KIS_APP_KEY", "KIS_APP_SECRET")}

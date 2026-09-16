@@ -139,10 +139,18 @@ cmake -B build/win-release -DCMAKE_BUILD_TYPE=Release \
 
 **Windows** (run from **Developer Command Prompt for VS 2022** or **Developer PowerShell**):
 ```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows_dev_doctor.ps1
 cmake --preset win-release
 cmake --build --preset win-release
 .\build\win-release\FinceptTerminal.exe
 ```
+
+`windows_dev_doctor.ps1` is read-only. It reports the CMake, Ninja, MSVC,
+Windows SDK, OpenSSL, MSBuild, Python, Qt/qmake, `windeployqt`, and vcpkg tools
+visible to the current shell, plus the current Git branch and any existing
+build-cache directories. Missing optional MSBuild/vcpkg installations are
+reported but do not fail the doctor; missing tools/libraries required by the
+checked-in Ninja presets and `find_package(OpenSSL REQUIRED)` do.
 
 **Linux:**
 ```bash
