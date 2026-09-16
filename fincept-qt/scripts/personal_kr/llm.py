@@ -84,7 +84,15 @@ _DEFAULT_ENDPOINTS = {
     "kimi": "https://api.moonshot.ai/v1/chat/completions",
     "ollama": "http://localhost:11434/v1/chat/completions",
     "xai": "https://api.x.ai/v1/chat/completions",
+    "astraflow": "https://api-us-ca.umodelverse.ai/v1/chat/completions",
+    "astraflow_cn": "https://api.modelverse.cn/v1/chat/completions",
+    "aihubmix": "https://aihubmix.com/v1/chat/completions",
 }
+
+
+def _is_openai_family_model(model: str) -> bool:
+    model_lower = model.lower()
+    return model_lower.startswith(("gpt-", "chatgpt", "o1", "o3", "o4"))
 
 
 class FinceptConfiguredLlm:
@@ -149,6 +157,9 @@ class FinceptConfiguredLlm:
                 headers["User-Agent"] = "FinceptTerminal/4.0"
             elif self.config.api_key:
                 headers["Authorization"] = f"Bearer {self.config.api_key}"
+                if provider == "openrouter":
+                    headers["HTTP-Referer"] = "https://fincept.in"
+                    headers["X-Title"] = "Fincept Terminal"
             body = {
                 "messages": [
                     {"role": "system", "content": system},
@@ -158,7 +169,12 @@ class FinceptConfiguredLlm:
             if provider != "fincept" or (self.model and self.model != "fincept-llm"):
                 body["model"] = self.model
             if provider != "fincept":
-                token_key = "max_completion_tokens" if provider in {"openai", "xai"} else "max_tokens"
+                token_key = (
+                    "max_completion_tokens"
+                    if provider in {"openai", "xai"}
+                    or (provider == "aihubmix" and _is_openai_family_model(self.model))
+                    else "max_tokens"
+                )
                 body[token_key] = self.config.max_tokens
 
         payload = self.http.post_json(endpoint, headers=headers, json_body=body)
@@ -170,27 +186,49 @@ class FinceptConfiguredLlm:
 
         text = ""
         if provider == "anthropic":
+            thinking_fallback = ""
             for block in payload.get("content") or []:
-                if isinstance(block, dict) and block.get("type") == "text":
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "text":
                     text += str(block.get("text") or "")
+                elif block.get("type") == "thinking" and not thinking_fallback:
+                    thinking_fallback = str(block.get("thinking") or "")
+            if not text:
+                text = thinking_fallback
         elif provider in {"gemini", "google"}:
+            thought_fallback = ""
             candidates = payload.get("candidates") or []
             if candidates:
                 for part in ((candidates[0].get("content") or {}).get("parts") or []):
-                    if isinstance(part, dict) and not part.get("thought"):
-                        text += str(part.get("text") or "")
+                    if not isinstance(part, dict) or part.get("functionCall"):
+                        continue
+                    part_text = str(part.get("text") or "")
+                    if part.get("thought"):
+                        if not thought_fallback:
+                            thought_fallback = part_text
+                    else:
+                        text += part_text
+            if not text:
+                text = thought_fallback
         else:
-            choices = payload.get("choices") or []
+            response_payload = payload
+            if provider == "fincept" and isinstance(payload.get("data"), dict):
+                response_payload = payload["data"]
+            choices = response_payload.get("choices") or []
             if choices:
-                content = (choices[0].get("message") or {}).get("content")
+                message = choices[0].get("message") or {}
+                content = message.get("content")
                 if isinstance(content, str):
                     text = content
                 elif isinstance(content, list):
                     text = "".join(
                         str(part.get("text") or "") for part in content if isinstance(part, dict)
                     )
+                if not text:
+                    text = str(message.get("reasoning_content") or message.get("refusal") or "")
             if not text:
-                text = str(payload.get("content") or payload.get("response") or "")
+                text = str(response_payload.get("content") or response_payload.get("response") or "")
         text = text.strip()
         if not text:
             raise RuntimeError(f"{provider} returned an empty response")

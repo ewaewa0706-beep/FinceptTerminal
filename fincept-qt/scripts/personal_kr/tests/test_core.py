@@ -1046,6 +1046,97 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(info["client_trade_id"][3], 1)
             self.assertEqual(info["decision_id"][3], 1)
 
+    def test_legacy_outcomes_without_provenance_are_quarantined_and_can_be_reevaluated(self):
+        from personal_kr.evaluation import Outcome
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "legacy-outcome.db"
+            seed = DecisionStore(path)
+            decision = seed.record_decision(
+                ResearchResult(
+                    candidate=self.candidate,
+                    signal="Hold",
+                    market_report="m",
+                    fundamentals_report="f",
+                    news_macro_report="n",
+                    bull_case="b+",
+                    bear_case="b-",
+                    research_manager="r",
+                    trader="t",
+                    risk_manager="risk",
+                    portfolio_manager="SIGNAL: HOLD",
+                )
+            )
+            decision_id = decision.decision_id or ""
+            legacy_payload = {
+                "decision_id": decision_id,
+                "horizon": 5,
+                "start_date": (self.candidate.analysis_date + timedelta(days=1)).isoformat(),
+                "end_date": (self.candidate.analysis_date + timedelta(days=5)).isoformat(),
+                "raw_return": 0.05,
+                "benchmark_return": 0.02,
+                "alpha_return": 0.03,
+                "max_gain": 0.08,
+                "max_drawdown": -0.02,
+            }
+            conn = sqlite3.connect(path)
+            conn.execute("DROP TABLE kr_outcome_quarantine")
+            conn.execute(
+                "INSERT INTO kr_outcomes(decision_id,horizon,payload,created_at) VALUES(?,?,?,?)",
+                (
+                    decision_id,
+                    5,
+                    json.dumps(legacy_payload, separators=(",", ":")),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            conn.commit()
+            conn.close()
+
+            upgraded = DecisionStore(path)
+            self.assertEqual(upgraded.list_outcomes(decision_id), [])
+            check = sqlite3.connect(path)
+            quarantined = check.execute(
+                "SELECT payload,reason FROM kr_outcome_quarantine WHERE decision_id=? AND horizon=5",
+                (decision_id,),
+            ).fetchone()
+            active = check.execute(
+                "SELECT COUNT(*) FROM kr_outcomes WHERE decision_id=? AND horizon=5", (decision_id,)
+            ).fetchone()[0]
+            check.close()
+            self.assertIsNotNone(quarantined)
+            self.assertIn("provenance", quarantined[1])
+            self.assertEqual(json.loads(quarantined[0])["raw_return"], 0.05)
+            self.assertEqual(active, 0)
+
+            audited = Outcome(
+                decision_id=decision_id,
+                horizon=5,
+                start_date=self.candidate.analysis_date + timedelta(days=1),
+                end_date=self.candidate.analysis_date + timedelta(days=5),
+                raw_return=0.04,
+                benchmark_return=0.01,
+                alpha_return=0.03,
+                max_gain=0.07,
+                max_drawdown=-0.015,
+                stock_ticker="005930",
+                stock_source="KIS",
+                stock_price_mode="adjusted",
+                benchmark_symbol="^KS11",
+                benchmark_source="Yahoo Finance",
+                benchmark_price_mode="raw_close",
+                evaluated_at=datetime.now(timezone.utc),
+                stock_input_hash="a" * 64,
+                benchmark_input_hash="b" * 64,
+                evaluation_version="personal-kr-outcome-v1",
+            )
+            recorded = upgraded.record_outcome(audited)
+            self.assertEqual(recorded.stock_input_hash, "a" * 64)
+            self.assertEqual(len(upgraded.list_outcomes(decision_id)), 1)
+            reopened = DecisionStore(path)
+            self.assertEqual(len(reopened.list_outcomes(decision_id)), 1)
+            self.assertEqual(reopened.list_outcomes(decision_id)[0].stock_input_hash, "a" * 64)
+
     def test_json_contract_is_valid(self):
         payload = {"success": True, "data": {"ticker": self.instrument.ticker}, "error": None}
         self.assertEqual(json.loads(json.dumps(payload))["data"]["ticker"], "005930")

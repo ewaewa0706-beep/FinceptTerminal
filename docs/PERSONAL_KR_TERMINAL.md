@@ -230,6 +230,10 @@ than a side effect of research.
 - repeated decision/outcome writes are first-write-wins only when immutable
   provenance matches; conflicting ranking, exact cutoff/mode, LLM/workflow, or
   frozen evidence fingerprint / outcome input provenance is rejected;
+- legacy outcome rows that predate source/price-mode/timestamp/input-hash
+  provenance are moved to `kr_outcome_quarantine` during schema upgrade, freeing
+  their decision/horizon key for a newly audited evaluation while preserving the
+  old payload for inspection;
 - legacy paper rows without required decision/client provenance are quarantined
   to `kr_paper_trade_quarantine` during schema upgrade rather than being counted
   in the active ledger.

@@ -55,6 +55,14 @@ class DecisionStore:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(decision_id,horizon)
                 );
+                CREATE TABLE IF NOT EXISTS kr_outcome_quarantine(
+                    quarantine_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    decision_id TEXT,
+                    horizon INTEGER,
+                    payload TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    quarantined_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS kr_paper_trades(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     client_trade_id TEXT NOT NULL UNIQUE,
@@ -79,7 +87,100 @@ class DecisionStore:
                 columns = {row[1] for row in conn.execute("PRAGMA table_info(kr_paper_trades)")}
                 if "client_trade_id" not in columns:
                     conn.execute("ALTER TABLE kr_paper_trades ADD COLUMN client_trade_id TEXT")
+                self._migrate_outcome_provenance(conn)
                 self._migrate_paper_provenance(conn)
+
+    def _migrate_outcome_provenance(self, conn: sqlite3.Connection) -> None:
+        """Quarantine legacy outcomes that cannot satisfy the immutable provenance contract.
+
+        Older Personal-KR builds stored forward returns before source, price-mode,
+        timestamp and input-hash provenance existed. Leaving those rows active
+        permanently occupies the ``(decision_id, horizon)`` first-write-wins key,
+        so a modern audited re-evaluation can only conflict. Preserve the legacy
+        payload for inspection and free the active key for a fully provenanced
+        outcome.
+        """
+
+        rows = conn.execute(
+            "SELECT decision_id,horizon,payload FROM kr_outcomes ORDER BY decision_id,horizon"
+        ).fetchall()
+        for row in rows:
+            reason = self._outcome_quarantine_reason(conn, row)
+            if reason is None:
+                continue
+            conn.execute(
+                "INSERT INTO kr_outcome_quarantine(decision_id,horizon,payload,reason,quarantined_at) "
+                "VALUES(?,?,?,?,?)",
+                (
+                    row["decision_id"],
+                    row["horizon"],
+                    row["payload"],
+                    reason,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            conn.execute(
+                "DELETE FROM kr_outcomes WHERE decision_id=? AND horizon=?",
+                (row["decision_id"], row["horizon"]),
+            )
+
+    def _outcome_quarantine_reason(self, conn: sqlite3.Connection, row: sqlite3.Row) -> str | None:
+        decision = conn.execute(
+            "SELECT ticker,analysis_date,payload FROM kr_decisions WHERE id=?", (row["decision_id"],)
+        ).fetchone()
+        if decision is None:
+            return "missing decision provenance"
+        try:
+            raw = json.loads(row["payload"])
+            if not isinstance(raw, dict):
+                return "invalid outcome payload"
+            outcome = _outcome_from_payload(raw)
+            decision_result = _result_from_payload(json.loads(decision["payload"]))
+            analysis_date = date.fromisoformat(decision["analysis_date"])
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+            return "invalid outcome payload"
+
+        if outcome.decision_id != row["decision_id"] or outcome.horizon != int(row["horizon"]):
+            return "outcome key does not match stored payload"
+        if outcome.start_date <= analysis_date or outcome.end_date < outcome.start_date:
+            return "invalid outcome date provenance"
+        if not outcome.stock_ticker or outcome.stock_ticker != decision["ticker"]:
+            return "missing or mismatched stock ticker provenance"
+        if outcome.benchmark_symbol != decision_result.candidate.instrument.benchmark_symbol:
+            return "missing or mismatched benchmark provenance"
+        for label in (
+            "stock_source",
+            "stock_price_mode",
+            "benchmark_source",
+            "benchmark_price_mode",
+            "evaluation_version",
+        ):
+            # Check the raw payload as well as the dataclass value. In particular,
+            # _outcome_from_payload supplies a default evaluation version for old
+            # rows so they remain readable, but that must not make legacy evidence
+            # look as though it had been frozen with the modern contract.
+            if not str(raw.get(label) or "").strip() or not str(getattr(outcome, label) or "").strip():
+                return f"missing {label} provenance"
+        if outcome.evaluated_at is None or outcome.evaluated_at.tzinfo is None:
+            return "missing timezone-aware evaluated_at provenance"
+        if not _is_sha256(outcome.stock_input_hash) or not _is_sha256(outcome.benchmark_input_hash):
+            return "missing or invalid outcome input fingerprints"
+        if outcome.benchmark_return is None or outcome.alpha_return is None:
+            return "missing benchmark return or alpha provenance"
+        numeric = (
+            outcome.raw_return,
+            outcome.benchmark_return,
+            outcome.alpha_return,
+            outcome.max_gain,
+            outcome.max_drawdown,
+        )
+        try:
+            invalid_numeric = any(value is not None and not math.isfinite(float(value)) for value in numeric)
+        except (TypeError, ValueError, OverflowError):
+            return "invalid outcome metric"
+        if invalid_numeric:
+            return "non-finite outcome metric"
+        return None
 
     def _migrate_paper_provenance(self, conn: sqlite3.Connection) -> None:
         invalid = conn.execute(
