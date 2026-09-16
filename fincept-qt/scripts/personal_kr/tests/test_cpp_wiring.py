@@ -86,6 +86,22 @@ class CppWiringTests(unittest.TestCase):
         batch = tools.split('t.name = "kr_research_batch"', 1)[1].split('t.name = "kr_analyze_stock"', 1)[0]
         self.assertIn(".between(1, 10)", batch)
 
+    def test_personal_kr_branch_runs_python_and_native_ci(self):
+        repo_root = QT_ROOT.parent
+        python_ci = (repo_root / ".github/workflows/personal-kr-python.yml").read_text(encoding="utf-8")
+        native_ci = (repo_root / ".github/workflows/build-pr.yml").read_text(encoding="utf-8")
+
+        # The long-lived development branch must get both the cheap Python
+        # contract matrix and the release-style native build. Without the latter,
+        # Personal-KR C++/MCP/UI changes can remain uncompiled until merge/release.
+        self.assertIn("personal-kr-terminal", python_ci)
+        self.assertIn("branches: [main, personal-kr-terminal]", native_ci)
+        for platform in ("windows-2022", "ubuntu-22.04", "macos-15"):
+            self.assertIn(platform, native_ci)
+        self.assertIn("Run all-screens smoke test (Linux)", native_ci)
+        self.assertIn("ci_app_checks.sh smoke", native_ci)
+        self.assertIn("if: runner.os == 'Linux'", native_ci)
+
 
 if __name__ == "__main__":
     unittest.main()

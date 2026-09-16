@@ -307,6 +307,13 @@ runs the Personal KR regression/syntax/status gate on Ubuntu 24.04 and Windows
 Server 2022 with Python 3.11 and 3.12, independently from the much heavier native
 Qt workflows. It requires no provider secrets and makes no live API calls.
 
+Pushes to the `personal-kr-terminal` branch that touch `fincept-qt/**` also run
+`.github/workflows/build-pr.yml`: a release-style native Qt matrix on Windows,
+Linux and macOS followed by the application's headless self-tests, plus the
+all-screens smoke walk on Linux. This is the preferred native verification path
+when the development machine itself does not have the Qt/CMake/MSVC toolchain
+installed.
+
 ## Tests
 
 From `fincept-qt/scripts`:

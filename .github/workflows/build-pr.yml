@@ -23,7 +23,12 @@ on:
       - '.github/scripts/ci_app_checks.sh'
       - '.github/scripts/check_version_drift.sh'
   push:
-    branches: [main]
+    # Personal-KR development is carried on this long-lived branch before it is
+    # merged upstream. Running the native matrix here closes the biggest local
+    # validation gap for contributors who do not have Qt/MSVC installed: every
+    # pushed C++/CMake integration change gets the same release-style build and
+    # headless self-tests as main.
+    branches: [main, personal-kr-terminal]
     paths:
       - 'fincept-qt/**'
       - '.github/workflows/build-pr.yml'
@@ -31,7 +36,7 @@ on:
       - '.github/scripts/check_version_drift.sh'
   workflow_dispatch:
 
-# One build per PR (or per main push). A new push cancels the in-flight run —
+# One build per PR (or per watched branch push). A new push cancels the in-flight run —
 # these are 30–60 minute jobs and superseded runs are wasted runner time.
 concurrency:
   group: build-pr-${{ github.event.pull_request.number || github.ref }}
@@ -280,3 +285,17 @@ jobs:
           fi
           export LD_LIBRARY_PATH="${QT_ROOT_DIR}/lib:${LD_LIBRARY_PATH:-}"
           bash ../.github/scripts/ci_app_checks.sh selftests "$BINARY" ci
+
+      # Self-tests exercise subsystems and the MCP catalog, but they do not walk
+      # every Qt screen constructor. Run the existing all-screens smoke path on
+      # one native leg so Personal-KR UI wiring (notably EquityAnalysisTab) is
+      # exercised on every relevant branch push without tripling CI cost.
+      - name: Run all-screens smoke test (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        working-directory: fincept-qt
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          export LD_LIBRARY_PATH="${QT_ROOT_DIR}/lib:${LD_LIBRARY_PATH:-}"
+          bash ../.github/scripts/ci_app_checks.sh smoke "build/${{ env.APP_NAME }}" ci-smoke 600
