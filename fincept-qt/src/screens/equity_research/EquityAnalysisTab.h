@@ -45,6 +45,7 @@ class EquityAnalysisTab : public QWidget {
     void on_info_loaded(services::equity::StockInfo info);
     void on_kr_discover_clicked();
     void on_kr_quant_rank_clicked();
+    void on_kr_quant_research_clicked();
     void on_kr_discovery_research_clicked();
     void on_kr_discovery_batch_clicked();
     void on_kr_history_refresh_clicked();
@@ -139,6 +140,7 @@ class EquityAnalysisTab : public QWidget {
     QFrame* kr_discovery_panel_ = nullptr;
     QPushButton* kr_discover_btn_ = nullptr;
     QPushButton* kr_quant_rank_btn_ = nullptr;
+    QPushButton* kr_quant_research_btn_ = nullptr;
     QPushButton* kr_discovery_research_btn_ = nullptr;
     QPushButton* kr_discovery_batch_btn_ = nullptr;
     QComboBox* kr_discovery_profile_ = nullptr;

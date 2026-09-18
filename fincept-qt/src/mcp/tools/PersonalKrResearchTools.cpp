@@ -244,6 +244,79 @@ std::vector<ToolDef> get_personal_kr_research_tools() {
         tools.push_back(std::move(t));
     }
 
+    // ── kr_quant_research ───────────────────────────────────────────────
+    {
+        ToolDef t;
+        t.name = "kr_quant_research";
+        t.description = "Run the one-click Personal-KR research-only pipeline for today: bounded whole-market "
+                        "discovery -> KIS Quant Ranking -> Top-N -> KIS/DART/Naver/ECOS deep research -> frozen "
+                        "decisions. Ranking provenance is generated and consumed in one Python process; completed "
+                        "candidates are checkpointed individually and one candidate failure does not erase others. "
+                        "No paper or live order is submitted.";
+        t.category = "equity-research";
+        t.input_schema =
+            ToolSchemaBuilder()
+                .string("analysis_date", "Optional Korean analysis date YYYY-MM-DD; this pipeline currently requires today")
+                .pattern("^\\d{4}-\\d{2}-\\d{2}$")
+                .integer("limit", "Maximum deep-research candidates")
+                .default_int(5)
+                .between(1, 10)
+                .integer("prefilter_limit", "Maximum discovery names receiving per-symbol KIS feature calls")
+                .default_int(30)
+                .between(1, 50)
+                .integer("lookback_days", "KIS daily-price calendar lookback")
+                .default_int(120)
+                .between(90, 365)
+                .integer("cache_ttl_seconds", "Short Quant Ranking API-call cache TTL; 0 disables cache")
+                .default_int(300)
+                .between(0, 3600)
+                .integer("min_trading_value_krw", "Minimum discovery-stage trading value in KRW")
+                .default_int(0)
+                .between(0, 2000000000000000LL)
+                .string("profile", "Quant feature scoring profile")
+                .default_str("balanced")
+                .enums({"balanced", "momentum", "flow", "defensive"})
+                .string("discovery_profile", "Upstream whole-market prefilter profile")
+                .default_str("balanced")
+                .enums({"balanced", "liquidity", "large_cap", "active"})
+                .string("market", "Market scope")
+                .default_str("ALL")
+                .enums({"ALL", "KOSPI", "KOSDAQ"})
+                .build();
+        t.default_timeout_ms = kBatchResearchTimeoutMs;
+        t.supports_async = true;
+        t.auth_required = AuthLevel::Authenticated;
+        t.async_handler = [](const QJsonObject& args, ToolContext ctx,
+                             std::shared_ptr<QPromise<ToolResult>> promise) {
+            const QJsonObject llm = fincept::services::equity::personal_kr_active_llm_config();
+            if (llm.isEmpty()) {
+                promise->addResult(ToolResult::fail("No active Fincept LLM profile is configured"));
+                promise->finish();
+                return;
+            }
+            QStringList script_args{
+                "quant-research",
+                "--limit", QString::number(args.value("limit").toInt(5)),
+                "--prefilter-limit", QString::number(args.value("prefilter_limit").toInt(30)),
+                "--lookback-days", QString::number(args.value("lookback_days").toInt(120)),
+                "--cache-ttl-seconds", QString::number(args.value("cache_ttl_seconds").toInt(300)),
+                "--min-trading-value-krw", QString::number(args.value("min_trading_value_krw").toInteger(0)),
+                "--profile", args.value("profile").toString("balanced"),
+                "--discovery-profile", args.value("discovery_profile").toString("balanced"),
+            };
+            const QString market = args.value("market").toString("ALL");
+            if (market != QLatin1String("ALL"))
+                script_args << "--market" << market;
+            const QString analysis_date = args.value("analysis_date").toString();
+            if (!analysis_date.isEmpty())
+                script_args << "--analysis-date" << analysis_date;
+            run_kr_tool(script_args,
+                        QJsonObject{{"llm", llm}, {"strategy_id", "personal-kr-quant-research-mcp"}},
+                        ctx, promise);
+        };
+        tools.push_back(std::move(t));
+    }
+
     // ── kr_llm_smoke ───────────────────────────────────────────────────
     {
         ToolDef t;

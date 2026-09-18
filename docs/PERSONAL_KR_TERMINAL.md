@@ -94,6 +94,7 @@ python personal_kr_terminal.py llm-smoke
 python personal_kr_terminal.py discover --limit 20 --min-trading-value-krw 1000000000
 python personal_kr_terminal.py quant-rank --prefilter-limit 30 --limit 10 --profile balanced
 python personal_kr_terminal.py quant-rank --prefilter-limit 30 --limit 10 --refresh
+python personal_kr_terminal.py quant-research --prefilter-limit 30 --limit 5 --profile balanced
 ```
 
 Without stdin, `llm-smoke` uses the headless `GOOGLE_API_KEY` fallback. The
@@ -173,6 +174,18 @@ flow quote used here does not accept an arbitrary historical date, so an old
 analysis date is rejected rather than treating today's response as historical
 PIT evidence. Historical whole-market work remains on exact snapshot replay or
 the explicitly labeled KRX reconstruction path described above.
+
+`quant-research` is the single-process production convenience path for the same
+current-date flow: `discover -> quant-rank -> Top-N -> deep research -> frozen
+decisions`. It does not introduce a second ranking or research implementation.
+The command calls the same Quant Ranking function and feeds its exact ranking
+envelope into the same bounded `batch` function, so ranking hash/timestamp,
+cutoff semantics, candidate isolation and first-write-wins decision persistence
+match the manual two-step workflow. The desktop exposes this as **RUN QUANT + AI
+TOP-N**, and MCP exposes `kr_quant_research`. Completed candidates are persisted
+one by one; a later candidate failure is returned in `errors` without erasing
+earlier decisions. The pipeline remains `research_only` and never submits an
+order.
 
 External Quant Ranking → Top N selection uses JSON over stdin:
 

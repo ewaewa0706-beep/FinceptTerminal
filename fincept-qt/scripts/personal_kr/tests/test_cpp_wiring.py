@@ -20,6 +20,7 @@ class CppWiringTests(unittest.TestCase):
             "kr_research_status",
             "kr_discover_market",
             "kr_quant_rank",
+            "kr_quant_research",
             "kr_llm_smoke",
             "kr_select_top_candidates",
             "kr_research_batch",
@@ -58,6 +59,7 @@ class CppWiringTests(unittest.TestCase):
         self.assertIn("RUN KR AI DEEP RESEARCH", cpp)
         self.assertIn("DISCOVER KR TOP-N", cpp)
         self.assertIn("RUN KIS QUANT RANK", cpp)
+        self.assertIn("RUN QUANT + AI TOP-N", cpp)
         self.assertIn("RESEARCH SELECTED", cpp)
         self.assertIn("RESEARCH TOP-N (MAX 10)", cpp)
         self.assertIn('addItem(tr("Balanced"), "balanced")', cpp)
@@ -99,6 +101,7 @@ class CppWiringTests(unittest.TestCase):
         self.assertIn('tr("Turnover")', cpp)
         self.assertIn('"discover", "--limit"', cpp)
         self.assertIn('"quant-rank"', cpp)
+        self.assertIn('"quant-research"', cpp)
         self.assertIn('"--prefilter-limit"', cpp)
         self.assertIn('"--discovery-profile"', cpp)
         self.assertIn("kr_discovery_table_", cpp)
@@ -141,7 +144,7 @@ class CppWiringTests(unittest.TestCase):
 
     def test_market_discovery_preserves_snapshot_pit_and_exposes_krx_reconstruction(self):
         tools = (QT_ROOT / "src/mcp/tools/PersonalKrResearchTools.cpp").read_text(encoding="utf-8")
-        section = tools.split('t.name = "kr_discover_market"', 1)[1].split('t.name = "kr_llm_smoke"', 1)[0]
+        section = tools.split('t.name = "kr_discover_market"', 1)[1].split('t.name = "kr_quant_rank"', 1)[0]
         self.assertIn('"discover"', section)
         self.assertIn("exact snapshot", section)
         self.assertIn("KRX OpenAPI", section)
@@ -154,7 +157,7 @@ class CppWiringTests(unittest.TestCase):
 
     def test_quant_rank_is_bounded_current_only_and_llm_free(self):
         tools = (QT_ROOT / "src/mcp/tools/PersonalKrResearchTools.cpp").read_text(encoding="utf-8")
-        section = tools.split('t.name = "kr_quant_rank"', 1)[1].split('t.name = "kr_llm_smoke"', 1)[0]
+        section = tools.split('t.name = "kr_quant_rank"', 1)[1].split('t.name = "kr_quant_research"', 1)[0]
         self.assertIn('"quant-rank"', section)
         self.assertIn("current-date", section)
         self.assertIn("investor-flow", section)
@@ -165,6 +168,31 @@ class CppWiringTests(unittest.TestCase):
         self.assertIn(".between(1, 50)", section)
         self.assertNotIn('payload["llm"]', section)
         self.assertNotIn("paper", section.lower())
+
+    def test_quant_research_is_one_process_research_only_and_uses_active_llm(self):
+        tools = (QT_ROOT / "src/mcp/tools/PersonalKrResearchTools.cpp").read_text(encoding="utf-8")
+        section = tools.split('t.name = "kr_quant_research"', 1)[1].split('t.name = "kr_llm_smoke"', 1)[0]
+        self.assertIn('"quant-research"', section)
+        self.assertIn("kBatchResearchTimeoutMs", section)
+        self.assertIn("personal_kr_active_llm_config()", section)
+        self.assertIn('QJsonObject{{"llm", llm}', section)
+        self.assertIn('"personal-kr-quant-research-mcp"', section)
+        self.assertIn("completed", section)
+        self.assertIn("No paper or live order", section)
+
+    def test_desktop_quant_research_button_has_single_one_click_slot(self):
+        ui = (QT_ROOT / "src/screens/equity_research/EquityAnalysisTab.cpp").read_text(encoding="utf-8")
+        header = (QT_ROOT / "src/screens/equity_research/EquityAnalysisTab.h").read_text(encoding="utf-8")
+        self.assertEqual(ui.count("void EquityAnalysisTab::on_kr_quant_research_clicked()"), 1)
+        self.assertIn("void on_kr_quant_research_clicked();", header)
+        section = ui.split("void EquityAnalysisTab::on_kr_quant_research_clicked()", 1)[1].split(
+            "void EquityAnalysisTab::on_kr_discovery_research_clicked()", 1
+        )[0]
+        self.assertIn('"quant-research"', section)
+        self.assertIn("personal_kr_active_llm_config()", section)
+        self.assertIn("60 * 60 * 1000", section)
+        self.assertIn("checkpointed individually", section)
+        self.assertIn("research_only", section)
 
     def test_production_batch_is_bounded_to_ten_deep_research_names(self):
         tools = (QT_ROOT / "src/mcp/tools/PersonalKrResearchTools.cpp").read_text(encoding="utf-8")

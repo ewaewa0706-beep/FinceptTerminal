@@ -416,6 +416,73 @@ class QuantCliTests(unittest.TestCase):
                 conn.close()
             self.assertEqual(remaining, 0)
 
+    def test_quant_research_reuses_exact_ranking_envelope_and_batch_contract(self):
+        quant = {
+            "analysis_date": TODAY,
+            "ranking_source": "fincept-kis-feature-quant-v1/balanced;features_sha256=" + "f" * 64,
+            "ranking_generated_at": NOW,
+            "ranking_payload_hash": "d" * 64,
+            "ranking_mode": "observed",
+            "ranking_data_as_of": TODAY,
+            "scoring_profile": "balanced",
+            "prefilter_count": 30,
+            "feature_record_count": 30,
+            "dart_enrichment_count": 10,
+            "cache_hit": True,
+            "cache_key": "e" * 64,
+            "ranking": {
+                "analysis_date": TODAY.isoformat(),
+                "ranking_source": "fincept-kis-feature-quant-v1/balanced;features_sha256=" + "f" * 64,
+                "ranking_generated_at": NOW.isoformat(),
+                "ranking_mode": "observed",
+                "ranking_data_as_of": TODAY.isoformat(),
+                "limit": 1,
+                "rows": [
+                    {
+                        "ticker": "005930",
+                        "name": "삼성전자",
+                        "market": "KOSPI",
+                        "score": 91.2,
+                        "rank": 1,
+                    }
+                ],
+            },
+        }
+        captured = {}
+
+        def fake_batch(payload):
+            captured.update(payload)
+            return {
+                "selected": ["selected"],
+                "results": ["stored"],
+                "input_errors": {},
+                "errors": {"000660": "isolated failure"},
+                "execution_mode": "research_only",
+            }
+
+        llm = {"provider": "openai", "model_id": "gpt-test", "api_key": "secret"}
+        with (
+            patch.object(cli, "_optional_input_json", return_value={"llm": llm, "strategy_id": "quant-e2e"}),
+            patch.object(cli, "cmd_quant_rank", return_value=quant),
+            patch.object(cli, "_run_batch_payload", side_effect=fake_batch) as batch,
+        ):
+            result = cli.cmd_quant_research(self.args(limit=1))
+
+        batch.assert_called_once()
+        self.assertEqual(captured["ranking_source"], quant["ranking"]["ranking_source"])
+        self.assertEqual(captured["ranking_generated_at"], quant["ranking"]["ranking_generated_at"])
+        self.assertEqual(captured["ranking_data_as_of"], quant["ranking"]["ranking_data_as_of"])
+        self.assertEqual(captured["rows"], quant["ranking"]["rows"])
+        self.assertEqual(captured["strategy_id"], "quant-e2e")
+        self.assertEqual(captured["llm"], llm)
+        self.assertEqual(result["ranking_payload_hash"], "d" * 64)
+        self.assertEqual(result["ranking"], quant["ranking"])
+        self.assertEqual(result["errors"], {"000660": "isolated failure"})
+        self.assertEqual(result["completed_count"], 1)
+        self.assertEqual(result["failed_count"], 1)
+        self.assertEqual(result["failed_tickers"], ["000660"])
+        self.assertEqual(result["execution_mode"], "research_only")
+
 
 if __name__ == "__main__":
     unittest.main()

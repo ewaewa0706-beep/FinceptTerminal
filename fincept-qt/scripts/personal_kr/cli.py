@@ -930,7 +930,12 @@ def cmd_batch() -> Any:
     a fresh KIS token for every name.
     """
 
-    payload = _input_json()
+    return _run_batch_payload(_input_json())
+
+
+def _run_batch_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Run the immutable ranking -> bounded deep-research batch contract."""
+
     analysis_date = date.fromisoformat(payload["analysis_date"])
     if analysis_date > _korea_today():
         raise ValueError("analysis_date cannot be in the future")
@@ -990,6 +995,58 @@ def cmd_batch() -> Any:
         "results": stored,
         "input_errors": input_errors,
         "errors": errors,
+        "execution_mode": "research_only",
+    }
+
+
+def cmd_quant_research(args: argparse.Namespace) -> dict[str, Any]:
+    """Current Quant Ranking -> Top-N deep research -> frozen decisions.
+
+    The ranking is generated and consumed in one Python process. The existing
+    batch implementation remains the sole deep-research/decision boundary, so
+    ranking hashes, cutoff semantics, candidate isolation and first-write-wins
+    persistence cannot diverge between manual two-step and one-click workflows.
+    """
+
+    request = _optional_input_json()
+    llm_config = request.get("llm")
+    strategy_id = str(request.get("strategy_id") or "personal-kr-quant-research")
+    if not strategy_id.strip():
+        raise ValueError("strategy_id cannot be blank")
+
+    quant = cmd_quant_rank(args)
+    ranking_payload = dict(quant["ranking"])
+    ranking_payload["strategy_id"] = strategy_id
+    if llm_config is not None:
+        ranking_payload["llm"] = llm_config
+    batch = _run_batch_payload(ranking_payload)
+    return {
+        "analysis_date": quant["analysis_date"],
+        "strategy_id": strategy_id,
+        "ranking_source": quant["ranking_source"],
+        "ranking_generated_at": quant["ranking_generated_at"],
+        "ranking_payload_hash": quant["ranking_payload_hash"],
+        "ranking_mode": quant["ranking_mode"],
+        "ranking_data_as_of": quant["ranking_data_as_of"],
+        "scoring_profile": quant["scoring_profile"],
+        "prefilter_count": quant["prefilter_count"],
+        "feature_record_count": quant["feature_record_count"],
+        "dart_enrichment_count": quant["dart_enrichment_count"],
+        "cache_hit": quant["cache_hit"],
+        "cache_key": quant["cache_key"],
+        "ranking": quant["ranking"],
+        "selected": batch["selected"],
+        "results": batch["results"],
+        "input_errors": batch["input_errors"],
+        "errors": batch["errors"],
+        "quant_warnings": {
+            "market": quant.get("market_errors") or {},
+            "flow": quant.get("flow_errors") or {},
+            "fundamentals": quant.get("fundamental_errors") or {},
+        },
+        "completed_count": len(batch["results"]),
+        "failed_count": len(batch["errors"]) + len(batch["input_errors"]),
+        "failed_tickers": sorted(batch["errors"]),
         "execution_mode": "research_only",
     }
 
@@ -1199,6 +1256,17 @@ def build_parser() -> argparse.ArgumentParser:
     quant_rank.add_argument("--discovery-profile", choices=DISCOVERY_PROFILE_NAMES, default="balanced")
     quant_rank.add_argument("--cache-ttl-seconds", type=int, default=300)
     quant_rank.add_argument("--refresh", action="store_true")
+    quant_research = sub.add_parser("quant-research")
+    quant_research.add_argument("--analysis-date")
+    quant_research.add_argument("--market", action="append", choices=("KOSPI", "KOSDAQ"))
+    quant_research.add_argument("--limit", type=int, default=5)
+    quant_research.add_argument("--prefilter-limit", type=int, default=30)
+    quant_research.add_argument("--lookback-days", type=int, default=120)
+    quant_research.add_argument("--min-trading-value-krw", type=int, default=0)
+    quant_research.add_argument("--profile", choices=QUANT_PROFILE_NAMES, default="balanced")
+    quant_research.add_argument("--discovery-profile", choices=DISCOVERY_PROFILE_NAMES, default="balanced")
+    quant_research.add_argument("--cache-ttl-seconds", type=int, default=300)
+    quant_research.add_argument("--refresh", action="store_true")
     for name in ("providers-only", "full"):
         p = sub.add_parser(name)
         p.add_argument("--ticker", default="005930")
@@ -1243,6 +1311,8 @@ def main(argv: list[str] | None = None) -> int:
             _print(cmd_discover(args))
         elif args.command == "quant-rank":
             _print(cmd_quant_rank(args))
+        elif args.command == "quant-research":
+            _print(cmd_quant_research(args))
         elif args.command == "providers-only":
             _print(cmd_providers_only(args))
         elif args.command == "full":
