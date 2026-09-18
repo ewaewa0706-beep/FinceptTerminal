@@ -296,6 +296,9 @@ void EquityAnalysisTab::build_ui() {
     kr_discovery_panel_ = build_kr_discovery_panel_();
     root->addWidget(kr_discovery_panel_);
 
+    kr_history_panel_ = build_kr_history_panel_();
+    root->addWidget(kr_history_panel_);
+
     // Korean-market AI research is an explicit, on-demand action. Keeping it
     // inside the existing Analysis tab avoids adding a parallel screen while
     // still giving users a visible path to the new KIS/DART/Naver/ECOS engine.
@@ -411,6 +414,260 @@ QFrame* EquityAnalysisTab::build_kr_discovery_panel_() {
     kr_discovery_result_->setMinimumHeight(180);
     vl->addWidget(kr_discovery_result_);
     return panel;
+}
+
+QFrame* EquityAnalysisTab::build_kr_history_panel_() {
+    auto* panel = make_panel_(QT_TR_NOOP("KR RESEARCH HISTORY"), ui::colors::INFO());
+    auto* vl = static_cast<QVBoxLayout*>(panel->layout());
+
+    auto* description = new QLabel(
+        tr("Frozen Personal-KR decisions, forward outcome/benchmark-alpha evaluation, and paper portfolio summary. "
+           "Evaluation is explicit and paper data never routes to live brokerage."));
+    description->setWordWrap(true);
+    vl->addWidget(description);
+
+    auto* controls = new QWidget(nullptr);
+    auto* hl = new QHBoxLayout(controls);
+    hl->setContentsMargins(0, 0, 0, 0);
+    hl->setSpacing(10);
+
+    kr_history_refresh_btn_ = new QPushButton(tr("REFRESH DECISIONS"));
+    connect(kr_history_refresh_btn_, &QPushButton::clicked, this, &EquityAnalysisTab::on_kr_history_refresh_clicked);
+    hl->addWidget(kr_history_refresh_btn_);
+
+    kr_history_evaluate_btn_ = new QPushButton(tr("EVALUATE 1/5/20/60D"));
+    kr_history_evaluate_btn_->setEnabled(false);
+    connect(kr_history_evaluate_btn_, &QPushButton::clicked, this, &EquityAnalysisTab::on_kr_history_evaluate_clicked);
+    hl->addWidget(kr_history_evaluate_btn_);
+
+    kr_history_outcomes_btn_ = new QPushButton(tr("SHOW OUTCOMES"));
+    kr_history_outcomes_btn_->setEnabled(false);
+    connect(kr_history_outcomes_btn_, &QPushButton::clicked, this, &EquityAnalysisTab::on_kr_history_outcomes_clicked);
+    hl->addWidget(kr_history_outcomes_btn_);
+
+    kr_history_paper_btn_ = new QPushButton(tr("PAPER SUMMARY"));
+    connect(kr_history_paper_btn_, &QPushButton::clicked, this,
+            &EquityAnalysisTab::on_kr_history_paper_summary_clicked);
+    hl->addWidget(kr_history_paper_btn_);
+
+    kr_history_status_ = new QLabel(tr("Frozen decisions · benchmark alpha · paper_only summary"));
+    hl->addWidget(kr_history_status_, 1);
+    vl->addWidget(controls);
+
+    kr_history_table_ = new QTableWidget(0, 7);
+    kr_history_table_->setHorizontalHeaderLabels(
+        {tr("Date"), tr("Ticker"), tr("Company"), tr("Signal"), tr("Score"), tr("Strategy"), tr("Decision ID")});
+    kr_history_table_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+    kr_history_table_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
+    kr_history_table_->horizontalHeader()->setSectionResizeMode(6, QHeaderView::Stretch);
+    kr_history_table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    kr_history_table_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    kr_history_table_->setSelectionMode(QAbstractItemView::SingleSelection);
+    kr_history_table_->setMinimumHeight(220);
+    connect(kr_history_table_, &QTableWidget::itemSelectionChanged, this, [this]() {
+        const bool selected = !selected_kr_decision_id_().isEmpty();
+        if (kr_history_evaluate_btn_)
+            kr_history_evaluate_btn_->setEnabled(selected && !kr_history_busy_);
+        if (kr_history_outcomes_btn_)
+            kr_history_outcomes_btn_->setEnabled(selected && !kr_history_busy_);
+    });
+    vl->addWidget(kr_history_table_);
+
+    kr_history_result_ = new QPlainTextEdit;
+    kr_history_result_->setReadOnly(true);
+    kr_history_result_->setPlaceholderText(
+        tr("Refresh decisions, select a row, then evaluate or inspect frozen outcomes. Paper summary is read-only here."));
+    kr_history_result_->setMinimumHeight(180);
+    vl->addWidget(kr_history_result_);
+    return panel;
+}
+
+QString EquityAnalysisTab::selected_kr_decision_id_() const {
+    if (!kr_history_table_)
+        return {};
+    const int row = kr_history_table_->currentRow();
+    if (row < 0 || row >= kr_history_decisions_.size())
+        return {};
+    return kr_history_decisions_.at(row).toObject().value("decision_id").toString();
+}
+
+void EquityAnalysisTab::set_kr_history_busy_(bool busy) {
+    kr_history_busy_ = busy;
+    if (kr_history_refresh_btn_)
+        kr_history_refresh_btn_->setEnabled(!busy);
+    if (kr_history_paper_btn_)
+        kr_history_paper_btn_->setEnabled(!busy);
+    const bool selected = !selected_kr_decision_id_().isEmpty();
+    if (kr_history_evaluate_btn_)
+        kr_history_evaluate_btn_->setEnabled(!busy && selected);
+    if (kr_history_outcomes_btn_)
+        kr_history_outcomes_btn_->setEnabled(!busy && selected);
+}
+
+void EquityAnalysisTab::on_kr_history_refresh_clicked() {
+    if (!kr_history_table_ || !kr_history_result_ || !kr_history_status_)
+        return;
+    set_kr_history_busy_(true);
+    kr_history_status_->setText(tr("Loading frozen KR decisions…"));
+
+    python::PythonRunner::RunOptions opts;
+    opts.timeout_ms = 60 * 1000;
+    QPointer<EquityAnalysisTab> self(this);
+    python::PythonRunner::instance().run_with_options(
+        "personal_kr_terminal.py", {"decisions", "--limit", "50"}, opts,
+        [self](python::PythonResult result) {
+            if (!self)
+                return;
+            if (!result.success) {
+                self->set_kr_history_busy_(false);
+                self->kr_history_status_->setText(self->tr("KR decision history unavailable"));
+                self->kr_history_result_->setPlainText(result.error);
+                return;
+            }
+            const QJsonDocument doc = QJsonDocument::fromJson(python::extract_json(result.output).toUtf8());
+            if (!doc.isObject() || !doc.object().value("success").toBool(false)) {
+                const QString error = doc.isObject() ? doc.object().value("error").toString() : result.output;
+                self->set_kr_history_busy_(false);
+                self->kr_history_status_->setText(self->tr("KR decision history unavailable"));
+                self->kr_history_result_->setPlainText(error);
+                return;
+            }
+            const QJsonArray rows = doc.object().value("data").toArray();
+            self->kr_history_decisions_ = rows;
+            self->kr_history_table_->setRowCount(rows.size());
+            for (int row = 0; row < rows.size(); ++row) {
+                const QJsonObject item = rows.at(row).toObject();
+                const QJsonObject candidate = item.value("candidate").toObject();
+                const QJsonObject instrument = candidate.value("instrument").toObject();
+                const QStringList values{
+                    candidate.value("analysis_date").toString(),
+                    instrument.value("ticker").toString(),
+                    instrument.value("name").toString(),
+                    item.value("signal").toString(),
+                    QString::number(candidate.value("score").toDouble(), 'f', 2),
+                    item.value("strategy_id").toString(),
+                    item.value("decision_id").toString(),
+                };
+                for (int col = 0; col < values.size(); ++col)
+                    self->kr_history_table_->setItem(row, col, new QTableWidgetItem(values.at(col)));
+            }
+            if (!rows.isEmpty())
+                self->kr_history_table_->selectRow(0);
+            self->set_kr_history_busy_(false);
+            self->kr_history_status_->setText(self->tr("Loaded %1 frozen decision(s)").arg(rows.size()));
+            self->kr_history_result_->clear();
+        });
+}
+
+void EquityAnalysisTab::on_kr_history_evaluate_clicked() {
+    const QString decision_id = selected_kr_decision_id_();
+    if (decision_id.isEmpty() || !kr_history_result_ || !kr_history_status_)
+        return;
+    set_kr_history_busy_(true);
+    kr_history_status_->setText(tr("Evaluating 1/5/20/60-session outcomes…"));
+
+    python::PythonRunner::RunOptions opts;
+    opts.timeout_ms = 10 * 60 * 1000;
+    QPointer<EquityAnalysisTab> self(this);
+    python::PythonRunner::instance().run_with_options(
+        "personal_kr_terminal.py", {"evaluate", decision_id, "--horizons", "1", "5", "20", "60"}, opts,
+        [self](python::PythonResult result) {
+            if (!self)
+                return;
+            self->set_kr_history_busy_(false);
+            if (!result.success) {
+                self->kr_history_status_->setText(self->tr("KR outcome evaluation unavailable"));
+                self->kr_history_result_->setPlainText(result.error);
+                return;
+            }
+            const QJsonDocument doc = QJsonDocument::fromJson(python::extract_json(result.output).toUtf8());
+            if (!doc.isObject() || !doc.object().value("success").toBool(false)) {
+                const QString error = doc.isObject() ? doc.object().value("error").toString() : result.output;
+                self->kr_history_status_->setText(self->tr("KR outcome evaluation unavailable"));
+                self->kr_history_result_->setPlainText(error);
+                return;
+            }
+            const QJsonObject data = doc.object().value("data").toObject();
+            const int completed = data.value("outcomes").toArray().size();
+            const int pending = data.value("pending_horizons").toArray().size();
+            self->kr_history_status_->setText(
+                self->tr("Outcome evaluation · %1 frozen · %2 pending").arg(completed).arg(pending));
+            self->kr_history_result_->setPlainText(
+                QString::fromUtf8(QJsonDocument(data).toJson(QJsonDocument::Indented)));
+        });
+}
+
+void EquityAnalysisTab::on_kr_history_outcomes_clicked() {
+    const QString decision_id = selected_kr_decision_id_();
+    if (decision_id.isEmpty() || !kr_history_result_ || !kr_history_status_)
+        return;
+    set_kr_history_busy_(true);
+    kr_history_status_->setText(tr("Loading frozen outcomes…"));
+
+    python::PythonRunner::RunOptions opts;
+    opts.timeout_ms = 60 * 1000;
+    QPointer<EquityAnalysisTab> self(this);
+    python::PythonRunner::instance().run_with_options(
+        "personal_kr_terminal.py", {"outcomes", decision_id}, opts,
+        [self](python::PythonResult result) {
+            if (!self)
+                return;
+            self->set_kr_history_busy_(false);
+            if (!result.success) {
+                self->kr_history_status_->setText(self->tr("KR outcomes unavailable"));
+                self->kr_history_result_->setPlainText(result.error);
+                return;
+            }
+            const QJsonDocument doc = QJsonDocument::fromJson(python::extract_json(result.output).toUtf8());
+            if (!doc.isObject() || !doc.object().value("success").toBool(false)) {
+                const QString error = doc.isObject() ? doc.object().value("error").toString() : result.output;
+                self->kr_history_status_->setText(self->tr("KR outcomes unavailable"));
+                self->kr_history_result_->setPlainText(error);
+                return;
+            }
+            const QJsonArray data = doc.object().value("data").toArray();
+            self->kr_history_status_->setText(self->tr("Loaded %1 frozen outcome(s)").arg(data.size()));
+            self->kr_history_result_->setPlainText(
+                QString::fromUtf8(QJsonDocument(data).toJson(QJsonDocument::Indented)));
+        });
+}
+
+void EquityAnalysisTab::on_kr_history_paper_summary_clicked() {
+    if (!kr_history_result_ || !kr_history_status_)
+        return;
+    set_kr_history_busy_(true);
+    kr_history_status_->setText(tr("Loading Personal-KR paper portfolio summary…"));
+
+    python::PythonRunner::RunOptions opts;
+    opts.timeout_ms = 60 * 1000;
+    QPointer<EquityAnalysisTab> self(this);
+    python::PythonRunner::instance().run_with_options(
+        "personal_kr_terminal.py", {"paper-summary"}, opts,
+        [self](python::PythonResult result) {
+            if (!self)
+                return;
+            self->set_kr_history_busy_(false);
+            if (!result.success) {
+                self->kr_history_status_->setText(self->tr("Paper summary unavailable"));
+                self->kr_history_result_->setPlainText(result.error);
+                return;
+            }
+            const QJsonDocument doc = QJsonDocument::fromJson(python::extract_json(result.output).toUtf8());
+            if (!doc.isObject() || !doc.object().value("success").toBool(false)) {
+                const QString error = doc.isObject() ? doc.object().value("error").toString() : result.output;
+                self->kr_history_status_->setText(self->tr("Paper summary unavailable"));
+                self->kr_history_result_->setPlainText(error);
+                return;
+            }
+            const QJsonObject data = doc.object().value("data").toObject();
+            if (data.value("execution_mode").toString() != QLatin1String("paper_only")) {
+                self->kr_history_status_->setText(self->tr("Unexpected paper summary execution mode"));
+                return;
+            }
+            self->kr_history_status_->setText(self->tr("Personal-KR paper portfolio · paper_only"));
+            self->kr_history_result_->setPlainText(
+                QString::fromUtf8(QJsonDocument(data).toJson(QJsonDocument::Indented)));
+        });
 }
 
 void EquityAnalysisTab::on_kr_discover_clicked() {

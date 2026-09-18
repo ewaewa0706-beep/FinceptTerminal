@@ -235,6 +235,14 @@ token/client reuse, per-candidate failure isolation and immediate decision
 checkpointing. The UI uses a finite 60-minute outer watchdog and reports partial
 successes/errors; the batch remains `research_only` and never submits an order.
 
+The Analysis tab also exposes **KR RESEARCH HISTORY**. **REFRESH DECISIONS**
+loads the latest frozen Personal-KR decision rows, **EVALUATE 1/5/20/60D** runs
+the existing point-in-time forward-return and benchmark-alpha evaluator for the
+selected decision, and **SHOW OUTCOMES** reads only already frozen outcome rows.
+**PAPER SUMMARY** is read-only and requires the Python response to declare
+`execution_mode=paper_only`. This history panel never routes to live brokerage
+and does not create paper trades implicitly.
+
 Internal MCP/agent tools:
 
 - `kr_research_status`

@@ -46,6 +46,10 @@ class EquityAnalysisTab : public QWidget {
     void on_kr_discover_clicked();
     void on_kr_discovery_research_clicked();
     void on_kr_discovery_batch_clicked();
+    void on_kr_history_refresh_clicked();
+    void on_kr_history_evaluate_clicked();
+    void on_kr_history_outcomes_clicked();
+    void on_kr_history_paper_summary_clicked();
     void on_kr_research_clicked();
 
   protected:
@@ -78,6 +82,7 @@ class EquityAnalysisTab : public QWidget {
     void build_ui();
     QFrame* build_hero_();
     QFrame* build_kr_discovery_panel_();
+    QFrame* build_kr_history_panel_();
     QFrame* build_kr_research_panel_();
     VerdictCard build_verdict_card_(QWidget* parent_grid_cell, const char* title_key, const QString& accent);
     void retranslateUi();
@@ -106,6 +111,8 @@ class EquityAnalysisTab : public QWidget {
     bool is_korean_symbol_() const;
     QString kr_ticker_() const;
     QString kr_market_() const;
+    QString selected_kr_decision_id_() const;
+    void set_kr_history_busy_(bool busy);
 
     // ── State ──────────────────────────────────────────────────────────────────
     QHash<QLabel*, const char*> i18n_labels_; ///< static label → English source key
@@ -140,6 +147,17 @@ class EquityAnalysisTab : public QWidget {
     QPlainTextEdit* kr_discovery_result_ = nullptr;
     QJsonArray kr_discovery_candidates_;
     QJsonObject kr_discovery_ranking_;
+
+    QFrame* kr_history_panel_ = nullptr;
+    QPushButton* kr_history_refresh_btn_ = nullptr;
+    QPushButton* kr_history_evaluate_btn_ = nullptr;
+    QPushButton* kr_history_outcomes_btn_ = nullptr;
+    QPushButton* kr_history_paper_btn_ = nullptr;
+    QLabel* kr_history_status_ = nullptr;
+    QTableWidget* kr_history_table_ = nullptr;
+    QPlainTextEdit* kr_history_result_ = nullptr;
+    QJsonArray kr_history_decisions_;
+    bool kr_history_busy_ = false;
 
     QFrame* kr_panel_ = nullptr;
     QPushButton* kr_research_btn_ = nullptr;
