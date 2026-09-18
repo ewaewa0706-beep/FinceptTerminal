@@ -782,7 +782,8 @@ void EquityAnalysisTab::on_kr_history_paper_trades_clicked() {
                     self->kr_history_pending_paper_trade_ = {};
                     status += self->tr(" · pending request confirmed in ledger");
                 } else {
-                    status += self->tr(" · pending request not found; retry the exact same trade values");
+                    self->kr_history_pending_paper_trade_ = {};
+                    status += self->tr(" · pending request confirmed absent; safe to enter a new paper trade");
                 }
             }
             self->kr_history_status_->setText(status);
