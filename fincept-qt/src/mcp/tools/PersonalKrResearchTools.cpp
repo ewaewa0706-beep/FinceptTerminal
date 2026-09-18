@@ -113,8 +113,8 @@ std::vector<ToolDef> get_personal_kr_research_tools() {
         ToolDef t;
         t.name = "kr_research_status";
         t.description = "Check readiness of the personal Korean-market research engine. Returns research_only "
-                        "execution mode and boolean readiness for KIS, DART, Naver, ECOS, and the active Fincept "
-                        "LLM profile. Never returns secret values.";
+                        "execution mode and boolean readiness for KIS, KRX, DART, Naver, ECOS, and the active "
+                        "Fincept LLM profile. Never returns secret values.";
         t.category = "equity-research";
         t.default_timeout_ms = kStatusTimeoutMs;
         t.async_handler = [](const QJsonObject&, ToolContext ctx,
@@ -133,10 +133,12 @@ std::vector<ToolDef> get_personal_kr_research_tools() {
     {
         ToolDef t;
         t.name = "kr_discover_market";
-        t.description = "Discover a PIT-safe KOSPI/KOSDAQ Top-N shortlist from the keyless KIS public master. "
-                        "Today's full canonical universe is frozen first-write-wins; historical requests only replay "
-                        "an exact snapshot captured on that date. Ranking is deterministic cross-sectional v2 over "
-                        "liquidity, market-cap size, turnover and volume; it is not an LLM market scan.";
+        t.description = "Discover a PIT-safe KOSPI/KOSDAQ Top-N shortlist. Today's keyless KIS public-master "
+                        "universe is frozen first-write-wins. Historical requests prefer an exact snapshot captured "
+                        "on that date and can reconstruct dated KRX OpenAPI rows when KRX_AUTH_KEY is configured. "
+                        "KRX reconstruction reports data_as_of and the later retrieval time separately. Ranking is "
+                        "deterministic cross-sectional v2 over liquidity, market-cap size, turnover and volume; it is "
+                        "not an LLM market scan.";
         t.category = "equity-research";
         t.input_schema =
             ToolSchemaBuilder()

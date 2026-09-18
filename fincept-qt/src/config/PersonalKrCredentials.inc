@@ -6,6 +6,7 @@
 // credentials.
 FINCEPT_KR_CRED("KIS_APP_KEY", "Korea Investment & Securities App Key")
 FINCEPT_KR_CRED("KIS_APP_SECRET", "Korea Investment & Securities App Secret")
+FINCEPT_KR_CRED("KRX_AUTH_KEY", "Korea Exchange OpenAPI Auth Key")
 FINCEPT_KR_CRED("DART_API_KEY", "Open DART")
 FINCEPT_KR_CRED("NAVER_CLIENT_ID", "Naver Search Client ID")
 FINCEPT_KR_CRED("NAVER_CLIENT_SECRET", "Naver Search Client Secret")

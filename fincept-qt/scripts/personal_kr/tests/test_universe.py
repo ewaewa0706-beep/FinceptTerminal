@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from personal_kr.models import Instrument
 from personal_kr.persistence import DecisionStore
@@ -12,8 +13,12 @@ from personal_kr.universe import (
     KST,
     CurrentUniverseOnlyError,
     KisPublicMasterUniverseProvider,
+    KrxApiError,
+    KrxClient,
+    KrxUniverseProvider,
     SnapshotAwareUniverseProvider,
     UniverseEntry,
+    load_krx_auth_key,
     liquidity_candidates,
 )
 
@@ -54,6 +59,112 @@ def row(
 
 
 class UniverseTests(unittest.TestCase):
+    def test_krx_key_loader_prefers_env_and_supports_one_line_local_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "KRX_KEY.local.txt"
+            path.write_text("local-key\n", encoding="utf-8")
+            with patch.dict("os.environ", {"KRX_AUTH_KEY": "env-key"}, clear=False):
+                self.assertEqual(load_krx_auth_key(path), "env-key")
+            with patch.dict("os.environ", {"KRX_AUTH_KEY": ""}, clear=False):
+                self.assertEqual(load_krx_auth_key(path), "local-key")
+
+    def test_krx_key_loader_rejects_ambiguous_multiline_local_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "KRX_KEY.local.txt"
+            path.write_text("first\nsecond\n", encoding="utf-8")
+            with patch.dict("os.environ", {"KRX_AUTH_KEY": ""}, clear=False):
+                with self.assertRaisesRegex(KrxApiError, "exactly one key line"):
+                    load_krx_auth_key(path)
+
+    def test_krx_client_401_reports_approval_without_echoing_secret(self):
+        class UnauthorizedHttp:
+            def get_json(self, *_args, **_kwargs):
+                from personal_kr.http import HttpStatusError
+
+                raise HttpStatusError(401, '{"respMsg":"Unauthorized API Call"}')
+
+        secret = "do-not-echo-this-secret"
+        with self.assertRaises(KrxApiError) as caught:
+            KrxClient(secret, http=UnauthorizedHttp()).get_daily_trading("KOSPI", date(2026, 9, 18))
+        message = str(caught.exception)
+        self.assertIn("HTTP 401", message)
+        self.assertIn("approved", message)
+        self.assertNotIn(secret, message)
+
+    def test_krx_historical_provider_resolves_session_filters_and_preserves_data_date(self):
+        requested = date(2026, 9, 20)
+        resolved = date(2026, 9, 18)
+
+        class FakeKrxClient:
+            def __init__(self):
+                self.daily_calls = []
+                self.base_calls = []
+
+            def get_daily_trading(self, market, as_of):
+                self.daily_calls.append((market, as_of))
+                if as_of != resolved:
+                    return []
+                return [
+                    {"ISU_CD": "005930", "ACC_TRDVOL": "100", "ACC_TRDVAL": "100", "MKTCAP": "1000"},
+                    {"ISU_CD": "000660", "ACC_TRDVOL": "200", "ACC_TRDVAL": "200", "MKTCAP": "900"},
+                    {"ISU_CD": "005931", "ACC_TRDVOL": "500", "ACC_TRDVAL": "500", "MKTCAP": "800"},
+                    {"ISU_CD": "123456", "ACC_TRDVOL": "600", "ACC_TRDVAL": "600", "MKTCAP": "700"},
+                ]
+
+            def get_base_info(self, market, as_of):
+                self.base_calls.append((market, as_of))
+                self.asserted = (market, as_of)
+                return [
+                    {
+                        "ISU_SRT_CD": "005930",
+                        "ISU_ABBRV": "삼성전자",
+                        "SECUGRP_NM": "주권",
+                        "KIND_STKCERT_TP_NM": "보통주",
+                    },
+                    {
+                        "ISU_SRT_CD": "000660",
+                        "ISU_ABBRV": "SK하이닉스",
+                        "SECUGRP_NM": "주권",
+                        "KIND_STKCERT_TP_NM": "보통주",
+                    },
+                    {
+                        "ISU_SRT_CD": "005931",
+                        "ISU_ABBRV": "삼성전자우",
+                        "SECUGRP_NM": "주권",
+                        "KIND_STKCERT_TP_NM": "우선주",
+                    },
+                    {
+                        "ISU_SRT_CD": "123456",
+                        "ISU_ABBRV": "테스트스팩1호",
+                        "SECUGRP_NM": "주권",
+                        "KIND_STKCERT_TP_NM": "보통주",
+                    },
+                ]
+
+        client = FakeKrxClient()
+        provider = KrxUniverseProvider(client)
+        entries = provider.get_universe(requested, markets=("KOSPI",))
+
+        self.assertEqual([item.instrument.ticker for item in entries], ["000660", "005930"])
+        self.assertTrue(all(item.as_of == resolved for item in entries))
+        self.assertTrue(all("requested_as_of=2026-09-20" in item.source for item in entries))
+        self.assertTrue(all("resolved_trading_date=2026-09-18" in item.source for item in entries))
+        self.assertEqual(client.base_calls, [("KOSPI", resolved)])
+
+    def test_krx_historical_provider_rejects_before_2010_without_network(self):
+        class FailClient:
+            def get_daily_trading(self, *_args, **_kwargs):
+                raise AssertionError("network should not be called")
+
+            def get_base_info(self, *_args, **_kwargs):
+                raise AssertionError("network should not be called")
+
+        with self.assertRaisesRegex(KrxApiError, "2010-01-04"):
+            KrxUniverseProvider(FailClient()).get_universe(
+                date(2009, 12, 31),
+                markets=("KOSPI",),
+            )
+
     def test_current_public_master_filters_and_sorts_by_liquidity_proxy(self):
         today = date(2026, 9, 18)
         client = FakeMasterClient(
@@ -158,6 +269,59 @@ class UniverseTests(unittest.TestCase):
                     store,
                     today_fn=lambda: snapshot_date + timedelta(days=2),
                 ).get_universe(snapshot_date + timedelta(days=1))
+
+    def test_historical_exact_snapshot_precedes_later_krx_reconstruction(self):
+        snapshot_date = date(2026, 9, 15)
+        captured = datetime(2026, 9, 15, 14, 30, tzinfo=KST)
+        snapshot_entry = UniverseEntry(
+            Instrument("005930", "삼성전자", "KOSPI"),
+            snapshot_date,
+            trading_value_krw=300,
+            source="observed-current-source",
+        )
+
+        class Historical:
+            def __init__(self):
+                self.calls = 0
+
+            def get_universe(self, as_of, **_kwargs):
+                self.calls += 1
+                return [
+                    UniverseEntry(
+                        Instrument("000660", "SK하이닉스", "KOSPI"),
+                        as_of,
+                        trading_value_krw=999,
+                        source="later-reconstruction",
+                    )
+                ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DecisionStore(Path(tmp) / "research.db")
+            store.record_universe_snapshot(
+                snapshot_date=snapshot_date,
+                markets=["KOSPI"],
+                entries=[snapshot_entry],
+                captured_at=captured,
+            )
+            historical = Historical()
+            provider = SnapshotAwareUniverseProvider(
+                object(),
+                store,
+                historical_provider=historical,
+                today_fn=lambda: date(2026, 9, 18),
+            )
+
+            replay = provider.get_universe(snapshot_date, markets=("KOSPI",))
+            self.assertEqual([entry.instrument.ticker for entry in replay], ["005930"])
+            self.assertIn("PIT universe snapshot replay", replay[0].source)
+            self.assertEqual(historical.calls, 0)
+
+            reconstructed = provider.get_universe(
+                date(2026, 9, 16),
+                markets=("KOSPI",),
+            )
+            self.assertEqual([entry.instrument.ticker for entry in reconstructed], ["000660"])
+            self.assertEqual(historical.calls, 1)
 
     def test_market_scope_order_cannot_bypass_first_write_snapshot(self):
         snapshot_date = date(2026, 9, 18)

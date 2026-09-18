@@ -25,10 +25,17 @@ from .persistence import DecisionStore
 from .providers import DartClient, EcosClient, KisClient, NaverNewsClient
 from .ranking import candidate_from_mapping, select_top_candidates, select_top_candidates_isolated
 from .discovery_scoring import DISCOVERY_PROFILE_NAMES, score_universe_entries, weights_for_profile
-from .universe import KisPublicMasterUniverseProvider, SnapshotAwareUniverseProvider
+from .universe import (
+    KisPublicMasterUniverseProvider,
+    KrxClient,
+    KrxUniverseProvider,
+    SnapshotAwareUniverseProvider,
+    krx_auth_key_configured,
+)
 
 
 _KST = timezone(timedelta(hours=9))
+_KRX_RECONSTRUCTION_RANKING_PREFIX = "fincept-krx-openapi-historical-cross-sectional-v2"
 
 
 def _input_json() -> dict[str, Any]:
@@ -51,6 +58,7 @@ def _print(data: Any, *, success: bool = True, error: str | None = None) -> None
 def credential_status(llm_provider: str | None = None) -> dict[str, Any]:
     keys = {
         "kis": bool(os.getenv("KIS_APP_KEY") and os.getenv("KIS_APP_SECRET")),
+        "krx": krx_auth_key_configured(),
         "dart": bool(os.getenv("DART_API_KEY")),
         "naver": bool(os.getenv("NAVER_CLIENT_ID") and os.getenv("NAVER_CLIENT_SECRET")),
         "ecos": bool(os.getenv("ECOS_API_KEY")),
@@ -68,7 +76,12 @@ def credential_status(llm_provider: str | None = None) -> dict[str, Any]:
         "universe": {
             "current_ready": True,
             "source": "KIS public master (keyless current snapshot)",
-            "historical_mode": "exact_snapshot_replay_only",
+            "historical_mode": (
+                "exact_snapshot_replay_or_krx_reconstruction"
+                if keys["krx"]
+                else "exact_snapshot_replay_only"
+            ),
+            "historical_krx_ready": keys["krx"],
         },
         "llm": {
             "ready": llm_ready,
@@ -151,7 +164,13 @@ def _candidate_from_payload(payload: dict[str, Any]) -> QuantCandidate:
         # flow row or news item when the same decision is reconstructed.
         analysis_cutoff_at = now_kst
         analysis_cutoff_mode = "live_request"
-    ranking_source, ranking_generated_at, ranking_payload_hash = _candidate_ranking_provenance(
+    (
+        ranking_source,
+        ranking_generated_at,
+        ranking_payload_hash,
+        ranking_mode,
+        ranking_data_as_of,
+    ) = _candidate_ranking_provenance(
         payload,
         analysis_date=analysis_date,
         analysis_cutoff_at=analysis_cutoff_at,
@@ -170,6 +189,8 @@ def _candidate_from_payload(payload: dict[str, Any]) -> QuantCandidate:
             ranking_payload_hash=ranking_payload_hash,
             analysis_cutoff_at=analysis_cutoff_at,
             analysis_cutoff_mode=analysis_cutoff_mode,
+            ranking_mode=ranking_mode,
+            ranking_data_as_of=ranking_data_as_of,
         )
     candidate = candidate_from_mapping(payload, payload["analysis_date"])
     return replace(
@@ -179,6 +200,8 @@ def _candidate_from_payload(payload: dict[str, Any]) -> QuantCandidate:
         ranking_payload_hash=ranking_payload_hash,
         analysis_cutoff_at=analysis_cutoff_at,
         analysis_cutoff_mode=analysis_cutoff_mode,
+        ranking_mode=ranking_mode,
+        ranking_data_as_of=ranking_data_as_of,
     )
 
 
@@ -188,15 +211,17 @@ def _candidate_ranking_provenance(
     analysis_date: date,
     analysis_cutoff_at: datetime | None,
     now_kst: datetime,
-) -> tuple[str, datetime | None, str]:
+) -> tuple[str, datetime | None, str, str, date | None]:
     """Validate optional ranking provenance on direct/single-candidate research."""
 
     source = str(payload.get("ranking_source") or "").strip()
     raw_generated = str(payload.get("ranking_generated_at") or "").strip()
     payload_hash = str(payload.get("ranking_payload_hash") or "").strip().lower()
-    present = bool(source or raw_generated or payload_hash)
+    raw_mode = str(payload.get("ranking_mode") or "").strip().lower()
+    raw_data_as_of = str(payload.get("ranking_data_as_of") or "").strip()
+    present = bool(source or raw_generated or payload_hash or raw_mode or raw_data_as_of)
     if not present:
-        return "", None, ""
+        return "", None, "", "", None
     if not source or not raw_generated or not payload_hash:
         raise ValueError(
             "ranking_source, ranking_generated_at and ranking_payload_hash must be supplied together"
@@ -209,14 +234,39 @@ def _candidate_ranking_provenance(
         raise ValueError("ranking_generated_at must be ISO-8601") from exc
     if generated_at.tzinfo is None:
         raise ValueError("ranking_generated_at must include a timezone")
+    ranking_mode = raw_mode or "observed"
+    if ranking_mode not in {"observed", "historical_reconstruction"}:
+        raise ValueError("ranking_mode must be observed or historical_reconstruction")
+    if raw_data_as_of:
+        try:
+            ranking_data_as_of = date.fromisoformat(raw_data_as_of)
+        except ValueError as exc:
+            raise ValueError("ranking_data_as_of must be ISO date") from exc
+    else:
+        ranking_data_as_of = analysis_date if ranking_mode == "observed" else None
+    if ranking_mode == "historical_reconstruction" and ranking_data_as_of is None:
+        raise ValueError("historical_reconstruction requires ranking_data_as_of")
+    if ranking_data_as_of is not None and ranking_data_as_of > analysis_date:
+        raise ValueError("ranking_data_as_of cannot be later than analysis_date")
     generated_kst = generated_at.astimezone(_KST)
+    is_reconstruction = ranking_mode == "historical_reconstruction"
     if generated_kst > now_kst:
         raise ValueError("ranking_generated_at cannot be in the future")
-    if generated_kst.date() > analysis_date:
+    if is_reconstruction:
+        if analysis_cutoff_at is None:
+            raise ValueError("historical_reconstruction requires analysis_cutoff_at")
+        cutoff_kst = analysis_cutoff_at.astimezone(_KST)
+        if ranking_data_as_of is not None and ranking_data_as_of > cutoff_kst.date():
+            raise ValueError("ranking_data_as_of cannot be later than analysis_cutoff_at")
+    if generated_kst.date() > analysis_date and not is_reconstruction:
         raise ValueError("ranking_generated_at cannot be later than analysis_date")
-    if analysis_cutoff_at is not None and generated_at > analysis_cutoff_at:
+    if (
+        analysis_cutoff_at is not None
+        and generated_at > analysis_cutoff_at
+        and not is_reconstruction
+    ):
         raise ValueError("ranking_generated_at cannot be later than analysis_cutoff_at")
-    return source, generated_at, payload_hash
+    return source, generated_at, payload_hash, ranking_mode, ranking_data_as_of
 
 
 def _engine(llm_config: dict[str, Any] | None = None) -> ResearchEngine:
@@ -245,7 +295,10 @@ def _store() -> DecisionStore:
     return DecisionStore(data_dir / "personal_kr" / "research.db")
 
 
-def _ranking_provenance(payload: dict[str, Any], analysis_date: date) -> tuple[str, datetime, str]:
+def _ranking_provenance(
+    payload: dict[str, Any],
+    analysis_date: date,
+) -> tuple[str, datetime, str, str, date]:
     source = str(payload.get("ranking_source") or "").strip()
     raw_generated = str(payload.get("ranking_generated_at") or "").strip()
     if not source:
@@ -258,22 +311,52 @@ def _ranking_provenance(payload: dict[str, Any], analysis_date: date) -> tuple[s
         raise ValueError("ranking_generated_at must be ISO-8601") from exc
     if generated_at.tzinfo is None:
         raise ValueError("ranking_generated_at must include a timezone")
+    ranking_mode = str(payload.get("ranking_mode") or "observed").strip().lower()
+    if ranking_mode not in {"observed", "historical_reconstruction"}:
+        raise ValueError("ranking_mode must be observed or historical_reconstruction")
+    raw_data_as_of = str(payload.get("ranking_data_as_of") or "").strip()
+    if raw_data_as_of:
+        try:
+            ranking_data_as_of = date.fromisoformat(raw_data_as_of)
+        except ValueError as exc:
+            raise ValueError("ranking_data_as_of must be ISO date") from exc
+    elif ranking_mode == "observed":
+        ranking_data_as_of = analysis_date
+    else:
+        raise ValueError("historical_reconstruction requires ranking_data_as_of")
+    if ranking_data_as_of > analysis_date:
+        raise ValueError("ranking_data_as_of cannot be later than analysis_date")
     kst = timezone(timedelta(hours=9))
-    now_kst = datetime.now(kst)
+    now_kst = _korea_now()
     cutoff = (
         now_kst
         if analysis_date == now_kst.date()
         else datetime.combine(analysis_date, datetime.max.time(), tzinfo=kst)
     )
-    if generated_at.astimezone(kst) > cutoff:
+    if generated_at.astimezone(kst) > now_kst:
+        raise ValueError("ranking_generated_at cannot be in the future")
+    if (
+        ranking_mode != "historical_reconstruction"
+        and generated_at.astimezone(kst) > cutoff
+    ):
         raise ValueError("ranking_generated_at is later than the analysis cutoff")
+    return (
+        source,
+        generated_at,
+        _ranking_payload_hash(payload, analysis_date),
+        ranking_mode,
+        ranking_data_as_of,
+    )
+
+
+def _ranking_payload_hash(payload: dict[str, Any], analysis_date: date) -> str:
     canonical = json.dumps(
         {"analysis_date": analysis_date.isoformat(), "rows": payload.get("rows") or []},
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    return source, generated_at, hashlib.sha256(canonical).hexdigest()
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def cmd_select() -> Any:
@@ -285,7 +368,7 @@ def cmd_select() -> Any:
 
 
 def cmd_discover(args: argparse.Namespace) -> Any:
-    """Keyless whole-market discovery with immutable exact-date snapshot replay."""
+    """Whole-market discovery with observed snapshots and explicit KRX reconstruction."""
 
     as_of = date.fromisoformat(args.analysis_date or _korea_today().isoformat())
     if as_of > _korea_today():
@@ -300,24 +383,55 @@ def cmd_discover(args: argparse.Namespace) -> Any:
 
     store = _store()
     rank_client = KisClient.from_env() if os.getenv("KIS_APP_KEY") and os.getenv("KIS_APP_SECRET") else None
+    historical_provider = KrxUniverseProvider(KrxClient.from_env()) if krx_auth_key_configured() else None
     provider = SnapshotAwareUniverseProvider(
         KisPublicMasterUniverseProvider(rank_client=rank_client, today_fn=_korea_today),
         store,
+        historical_provider=historical_provider,
         today_fn=_korea_today,
         now_fn=_korea_now,
     )
-    entries = provider.get_universe(
+    all_entries = provider.get_universe(
         as_of,
         markets=markets,
-        min_trading_value_krw=min_trading_value_krw,
+        min_trading_value_krw=0,
     )
+    entries = [
+        entry
+        for entry in all_entries
+        if (entry.trading_value_krw or 0) >= min_trading_value_krw
+    ]
     discovery_profile = str(args.profile or "balanced")
     discovery_weights = weights_for_profile(discovery_profile)
     candidates = score_universe_entries(entries, as_of, limit=limit, weights=discovery_weights)
     snapshot = store.get_universe_snapshot(as_of, markets=list(dict.fromkeys(markets)))
-    if snapshot is None:
-        raise RuntimeError("universe snapshot missing after discovery")
-    ranking_source = f"fincept-kis-public-master-cross-sectional-v2/{discovery_profile}"
+    reconstructed_at: datetime | None = None
+    resolved_data_date: date | None = None
+    analysis_cutoff_at: datetime
+    if snapshot is not None:
+        ranking_source = f"fincept-kis-public-master-cross-sectional-v2/{discovery_profile}"
+        frozen_generated_at = snapshot.captured_at
+        analysis_cutoff_at = snapshot.captured_at
+        ranking_mode = "observed"
+        ranking_data_as_of = as_of
+        output_source = "KIS public master current snapshot / exact PIT replay"
+    else:
+        if historical_provider is None or as_of >= _korea_today():
+            raise RuntimeError("universe snapshot missing after discovery")
+        resolved_dates = {entry.as_of for entry in all_entries}
+        if len(resolved_dates) != 1:
+            raise RuntimeError("KRX historical reconstruction must resolve to one exchange session")
+        resolved_data_date = next(iter(resolved_dates))
+        reconstructed_at = _korea_now()
+        ranking_source = (
+            f"{_KRX_RECONSTRUCTION_RANKING_PREFIX}/{discovery_profile}"
+            f";data_as_of={resolved_data_date.isoformat()}"
+        )
+        frozen_generated_at = reconstructed_at
+        analysis_cutoff_at = datetime.combine(as_of, KR_DAILY_FINALITY_TIME, tzinfo=_KST)
+        ranking_mode = "historical_reconstruction"
+        ranking_data_as_of = resolved_data_date
+        output_source = "KRX OpenAPI historical reconstruction"
     entries_by_ticker = {entry.instrument.ticker: entry for entry in entries}
     flat_rows = [
         {
@@ -335,29 +449,47 @@ def cmd_discover(args: argparse.Namespace) -> Any:
     ranking_payload = {
         "analysis_date": as_of.isoformat(),
         "ranking_source": ranking_source,
-        "ranking_generated_at": snapshot.captured_at.isoformat(),
-        "limit": min(limit, 10),
+        "ranking_generated_at": frozen_generated_at.isoformat(),
+        "ranking_mode": ranking_mode,
+        "ranking_data_as_of": ranking_data_as_of.isoformat(),
+        "limit": limit,
         "rows": flat_rows,
     }
-    frozen_source, frozen_generated_at, ranking_hash = _ranking_provenance(ranking_payload, as_of)
+    if snapshot is not None:
+        (
+            frozen_source,
+            frozen_generated_at,
+            ranking_hash,
+            frozen_mode,
+            frozen_data_as_of,
+        ) = _ranking_provenance(ranking_payload, as_of)
+    else:
+        frozen_source = ranking_source
+        ranking_hash = _ranking_payload_hash(ranking_payload, as_of)
+        frozen_mode = ranking_mode
+        frozen_data_as_of = ranking_data_as_of
     candidates = [
         replace(
             candidate,
             ranking_source=frozen_source,
             ranking_generated_at=frozen_generated_at,
             ranking_payload_hash=ranking_hash,
-            analysis_cutoff_at=frozen_generated_at,
+            analysis_cutoff_at=analysis_cutoff_at,
             analysis_cutoff_mode="external",
+            ranking_mode=frozen_mode,
+            ranking_data_as_of=frozen_data_as_of,
         )
         for candidate in candidates
     ]
     return {
         "analysis_date": as_of,
-        "snapshot_entry_count": len(snapshot.entries),
+        "snapshot_entry_count": len(snapshot.entries) if snapshot is not None else None,
         "eligible_count": len(entries),
-        "snapshot_hash": snapshot.payload_sha256,
-        "captured_at": snapshot.captured_at,
-        "source": "KIS public master current snapshot / exact PIT replay",
+        "snapshot_hash": snapshot.payload_sha256 if snapshot is not None else None,
+        "captured_at": snapshot.captured_at if snapshot is not None else None,
+        "reconstructed_at": reconstructed_at,
+        "resolved_data_date": resolved_data_date,
+        "source": output_source,
         "rank_overlay_count": rank_overlay_count,
         "scoring_model": "cross-sectional-v2",
         "scoring_profile": discovery_profile,
@@ -365,6 +497,8 @@ def cmd_discover(args: argparse.Namespace) -> Any:
         "ranking_source": frozen_source,
         "ranking_generated_at": frozen_generated_at,
         "ranking_payload_hash": ranking_hash,
+        "ranking_mode": frozen_mode,
+        "ranking_data_as_of": frozen_data_as_of,
         "candidates": candidates,
         "ranking": ranking_payload,
         "execution_mode": "research_only",
@@ -391,19 +525,32 @@ def cmd_batch() -> Any:
     analysis_date = date.fromisoformat(payload["analysis_date"])
     if analysis_date > _korea_today():
         raise ValueError("analysis_date cannot be in the future")
-    ranking_source, ranking_generated_at, ranking_hash = _ranking_provenance(payload, analysis_date)
+    (
+        ranking_source,
+        ranking_generated_at,
+        ranking_hash,
+        ranking_mode,
+        ranking_data_as_of,
+    ) = _ranking_provenance(payload, analysis_date)
     limit = int(payload.get("limit", 5))
     if limit < 1 or limit > 10:
         raise ValueError("production batch limit must be between 1 and 10")
     candidates, input_errors = select_top_candidates_isolated(payload["rows"], analysis_date, limit)
+    batch_cutoff_at = (
+        ranking_generated_at
+        if ranking_mode == "observed"
+        else datetime.combine(analysis_date, KR_DAILY_FINALITY_TIME, tzinfo=_KST)
+    )
     candidates = [
         replace(
             candidate,
             ranking_source=ranking_source,
             ranking_generated_at=ranking_generated_at,
             ranking_payload_hash=ranking_hash,
-            analysis_cutoff_at=ranking_generated_at,
+            analysis_cutoff_at=batch_cutoff_at,
             analysis_cutoff_mode="external",
+            ranking_mode=ranking_mode,
+            ranking_data_as_of=ranking_data_as_of,
         )
         for candidate in candidates
     ]

@@ -50,19 +50,29 @@ def load_yahoo_benchmark(
     if not quote_rows:
         raise RuntimeError(f"no benchmark OHLC rows for {symbol}")
     quotes = quote_rows[0]
+    if not isinstance(quotes, dict):
+        raise RuntimeError(f"malformed benchmark OHLC rows for {symbol}")
+    required_series = {name: quotes.get(name) or [] for name in ("open", "high", "low", "close")}
+    if any(not isinstance(values, list) for values in required_series.values()):
+        raise RuntimeError(f"malformed benchmark OHLC arrays for {symbol}")
+    if any(len(values) != len(timestamps) for values in required_series.values()):
+        raise RuntimeError(f"misaligned benchmark OHLC arrays for {symbol}")
+    volumes = quotes.get("volume") or []
+    if not isinstance(volumes, list):
+        raise RuntimeError(f"malformed benchmark volume array for {symbol}")
     bars: list[OHLCVBar] = []
     for index, timestamp in enumerate(timestamps):
-        try:
-            open_ = quotes.get("open", [])[index]
-            high = quotes.get("high", [])[index]
-            low = quotes.get("low", [])[index]
-            close = quotes.get("close", [])[index]
-            volume = quotes.get("volume", [])[index]
-        except IndexError:
-            continue
+        open_ = required_series["open"][index]
+        high = required_series["high"][index]
+        low = required_series["low"][index]
+        close = required_series["close"][index]
+        volume = volumes[index] if index < len(volumes) else 0
         if None in (open_, high, low, close):
             continue
-        trade_date = datetime.fromtimestamp(int(timestamp), timezone.utc).date()
+        try:
+            trade_date = datetime.fromtimestamp(int(timestamp), timezone.utc).date()
+        except (TypeError, ValueError, OverflowError, OSError) as exc:
+            raise RuntimeError(f"invalid benchmark timestamp for {symbol}") from exc
         if trade_date < start or trade_date > end:
             continue
         bars.append(

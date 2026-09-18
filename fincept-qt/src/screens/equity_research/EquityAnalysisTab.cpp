@@ -929,7 +929,7 @@ void EquityAnalysisTab::on_kr_discover_clicked() {
         kr_discovery_research_btn_->setEnabled(false);
     if (kr_discovery_batch_btn_)
         kr_discovery_batch_btn_->setEnabled(false);
-    kr_discovery_status_->setText(tr("Discovering current KOSPI/KOSDAQ universe…"));
+    kr_discovery_status_->setText(tr("Discovering KOSPI/KOSDAQ universe…"));
     kr_discovery_table_->setRowCount(0);
     kr_discovery_candidates_ = {};
     kr_discovery_ranking_ = {};
@@ -999,19 +999,31 @@ void EquityAnalysisTab::on_kr_discover_clicked() {
             }
 
             if (self->kr_discovery_status_) {
-                const int universe_count = data.value("snapshot_entry_count").toInt();
-                const QString hash = data.value("snapshot_hash").toString().left(12);
                 const QString profile = data.value("scoring_profile").toString("balanced");
                 const int overlay_count = data.value("rank_overlay_count").toInt();
                 const QString analysis_date = data.value("analysis_date").toString();
-                self->kr_discovery_status_->setText(
-                    self->tr("Completed · %1 · %2 · %3 eligible · Top %4 · KIS overlay %5 · snapshot %6 · research_only")
-                        .arg(analysis_date)
-                        .arg(profile)
-                        .arg(universe_count)
-                        .arg(candidates.size())
-                        .arg(overlay_count)
-                        .arg(hash));
+                const QString source = data.value("source").toString();
+                if (source.startsWith(QLatin1String("KRX OpenAPI"))) {
+                    const QString resolved = data.value("resolved_data_date").toString();
+                    self->kr_discovery_status_->setText(
+                        self->tr("Completed · %1 · %2 · %3 eligible · Top %4 · KRX data %5 · historical reconstruction · research_only")
+                            .arg(analysis_date)
+                            .arg(profile)
+                            .arg(data.value("eligible_count").toInt())
+                            .arg(candidates.size())
+                            .arg(resolved));
+                } else {
+                    const int universe_count = data.value("snapshot_entry_count").toInt();
+                    const QString hash = data.value("snapshot_hash").toString().left(12);
+                    self->kr_discovery_status_->setText(
+                        self->tr("Completed · %1 · %2 · %3 eligible · Top %4 · KIS overlay %5 · snapshot %6 · research_only")
+                            .arg(analysis_date)
+                            .arg(profile)
+                            .arg(universe_count)
+                            .arg(candidates.size())
+                            .arg(overlay_count)
+                            .arg(hash));
+                }
             }
         });
 }

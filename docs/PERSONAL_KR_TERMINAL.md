@@ -41,6 +41,7 @@ Open **Settings → API Credentials** and configure the providers you use:
 
 - `KIS_APP_KEY`
 - `KIS_APP_SECRET`
+- `KRX_AUTH_KEY`
 - `DART_API_KEY`
 - `NAVER_CLIENT_ID`
 - `NAVER_CLIENT_SECRET`
@@ -52,6 +53,14 @@ managed credential allow-list into child processes; secrets are not passed on
 the command line. KIS and the LLM are required for a full deep-research run.
 DART, Naver and ECOS are enrichment providers and degrade independently when
 unavailable.
+
+For local/headless development only, KRX also supports the git-ignored file
+`fincept-qt/scripts/KRX_KEY.local.txt`. Put exactly one authentication-key line
+in that file with no `KRX_AUTH_KEY=` prefix. `KRX_AUTH_KEY` from SecureStorage or
+the process environment takes precedence. `KRX_AUTH_KEY_FILE` can point to an
+alternate local file. The status command reports only whether a key is present;
+it never returns the key value. KRX can still return HTTP 401 when the key exists
+but the requested API service has not been approved for that key.
 
 Whole-market discovery itself does not require a KIS API credential. The
 current KOSPI/KOSDAQ membership is loaded from KIS public master archives.
@@ -115,10 +124,15 @@ KRW. These filters are applied only after the canonical daily snapshot is frozen
 so changing a screen does not rewrite PIT membership or provenance.
 
 The desktop date picker defaults to the current Korean civil date and never
-allows a future date. Selecting an older date invokes the same exact-date replay
-contract as CLI/MCP: only a universe snapshot genuinely captured on that date is
-accepted. Missing historical snapshots fail closed rather than substituting the
-current market membership.
+allows a future date. Selecting an older date first replays an exact universe
+snapshot genuinely captured on that date. If no exact snapshot exists and
+`KRX_AUTH_KEY` is configured, discovery can reconstruct the historical universe
+from dated KRX OpenAPI base-info and daily-trading rows. Reconstruction is never
+stored as a backdated snapshot: `ranking_mode=historical_reconstruction`,
+`ranking_data_as_of` preserves the resolved exchange session, and
+`ranking_generated_at` / `reconstructed_at` preserve the actual later retrieval
+time. Without either an exact snapshot or KRX access, historical discovery fails
+closed rather than substituting current market membership.
 
 External Quant Ranking → Top N selection uses JSON over stdin:
 
@@ -292,16 +306,21 @@ than a side effect of research.
 
 ## Point-in-time and failure behavior
 
-- the timezone-aware external `ranking_generated_at` is frozen as the exact
-  analysis cutoff for production batch research;
+- ordinary observed rankings freeze timezone-aware `ranking_generated_at` as
+  the exact analysis cutoff for production batch research. KRX historical
+  reconstruction instead records the later retrieval time honestly and uses
+  `ranking_data_as_of` plus the requested date's conservative finality boundary
+  as the research cutoff;
 - manual/UI/MCP research for today's market also freezes a timezone-aware exact
   request timestamp as `analysis_cutoff_at`. Immediate requests are tagged
   `analysis_cutoff_mode=live_request`; explicit older/external timestamps are
   treated as strict external PIT cutoffs;
 - keyless whole-market membership is current-only. The full current KIS public
   master universe is captured first-write-wins before liquidity thresholds or
-  Top-N slicing; historical requests require an exact same-date snapshot and
-  fail closed when none exists;
+  Top-N slicing. Historical requests prefer that exact same-date snapshot; when
+  it is absent, an authenticated KRX OpenAPI reconstruction is allowed without
+  pretending the data was captured historically. If neither source is
+  available, discovery fails closed;
 - market bars newer than the analysis cutoff are rejected. KIS daily price and
   investor-flow endpoints expose date-level data without a finality timestamp;
   before the conservative 17:00 KST daily-finality boundary the same calendar
@@ -378,7 +397,7 @@ process-level watchdog; use the Fincept UI/MCP path for managed orchestration.
 The repository includes two safe PowerShell helpers under `fincept-qt/scripts`:
 
 ```powershell
-cd C:\webgpt\fincept\fincept-qt
+cd "C:\Users\User\web gpt\fincept-terminal-personal\fincept-qt"
 powershell -ExecutionPolicy Bypass -File .\scripts\windows_dev_doctor.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\validate_personal_kr.ps1
 ```
@@ -400,7 +419,7 @@ $env:QT_DIR='C:\Qt\6.8.3\msvc2022_64'
 $env:VCPKG_ROOT='C:\vcpkg'
 $env:OPENSSL_ROOT_DIR="$env:VCPKG_ROOT\installed\x64-windows"
 
-cd C:\webgpt\fincept\fincept-qt
+cd "C:\Users\User\web gpt\fincept-terminal-personal\fincept-qt"
 cmake --preset win-dev `
   -DFINCEPT_BUILD_TESTS=ON `
   -DCMAKE_PREFIX_PATH="$env:QT_DIR" `

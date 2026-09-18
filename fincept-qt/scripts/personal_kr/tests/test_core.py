@@ -264,6 +264,217 @@ class CoreTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "analysis_cutoff_at"):
                 cli._candidate_from_payload(after_cutoff)
 
+    def test_krx_historical_reconstruction_keeps_actual_generation_time_and_data_cutoff(self):
+        kst = timezone(timedelta(hours=9))
+        now = datetime(2026, 9, 18, 15, 30, tzinfo=kst)
+        cutoff = datetime(2026, 9, 15, 17, 0, tzinfo=kst)
+        payload = {
+            "analysis_date": "2026-09-15",
+            "instrument": {"ticker": "005930", "name": "삼성전자", "market": "KOSPI"},
+            "score": 91.5,
+            "rank": 1,
+            "factors": {"liquidity_score": 99.0},
+            "ranking_source": (
+                "fincept-krx-openapi-historical-cross-sectional-v2/balanced"
+                ";data_as_of=2026-09-15"
+            ),
+            "ranking_generated_at": now.isoformat(),
+            "ranking_payload_hash": "b" * 64,
+            "ranking_mode": "historical_reconstruction",
+            "ranking_data_as_of": "2026-09-15",
+            "analysis_cutoff_at": cutoff.isoformat(),
+            "analysis_cutoff_mode": "external",
+        }
+        with patch.object(cli, "_korea_now", return_value=now):
+            candidate = cli._candidate_from_payload(payload)
+
+        self.assertEqual(candidate.ranking_generated_at, now)
+        self.assertEqual(candidate.analysis_cutoff_at, cutoff)
+        self.assertEqual(candidate.ranking_mode, "historical_reconstruction")
+        self.assertEqual(candidate.ranking_data_as_of, date(2026, 9, 15))
+        self.assertIn("data_as_of=2026-09-15", candidate.ranking_source)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DecisionStore(Path(tmp) / "research.db")
+            result = ResearchResult(
+                candidate=candidate,
+                signal="Hold",
+                market_report="m",
+                fundamentals_report="f",
+                news_macro_report="n",
+                bull_case="b+",
+                bear_case="b-",
+                research_manager="r",
+                trader="t",
+                risk_manager="risk",
+                portfolio_manager="SIGNAL: HOLD",
+            )
+            stored = store.record_decision(result, strategy_id="krx-reconstruction-roundtrip")
+            loaded = store.get_decision(stored.decision_id or "")
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded.candidate.ranking_mode, "historical_reconstruction")
+        self.assertEqual(loaded.candidate.ranking_data_as_of, date(2026, 9, 15))
+        self.assertEqual(loaded.candidate.ranking_generated_at, now)
+
+        generic = dict(payload)
+        generic["ranking_source"] = "external-ranking-v1"
+        generic["ranking_mode"] = "observed"
+        with patch.object(cli, "_korea_now", return_value=now):
+            with self.assertRaisesRegex(ValueError, "later than analysis_date"):
+                cli._candidate_from_payload(generic)
+
+        future_data = dict(payload)
+        future_data["ranking_data_as_of"] = "2026-09-16"
+        with patch.object(cli, "_korea_now", return_value=now):
+            with self.assertRaisesRegex(ValueError, "ranking_data_as_of"):
+                cli._candidate_from_payload(future_data)
+
+    def test_discover_uses_krx_for_missing_historical_snapshot_without_backdating_capture(self):
+        kst = timezone(timedelta(hours=9))
+        today = date(2026, 9, 18)
+        as_of = date(2026, 9, 15)
+        now = datetime(2026, 9, 18, 15, 30, tzinfo=kst)
+
+        class FakeKrxClient:
+            def get_daily_trading(self, market, requested):
+                self.asserted = requested
+                ticker = "005930" if market == "KOSPI" else "247540"
+                value = "300" if market == "KOSPI" else "200"
+                return [
+                    {
+                        "ISU_CD": ticker,
+                        "ACC_TRDVOL": "100",
+                        "ACC_TRDVAL": value,
+                        "MKTCAP": "1000",
+                    }
+                ]
+
+            def get_base_info(self, market, requested):
+                ticker = "005930" if market == "KOSPI" else "247540"
+                name = "삼성전자" if market == "KOSPI" else "에코프로비엠"
+                return [
+                    {
+                        "ISU_SRT_CD": ticker,
+                        "ISU_ABBRV": name,
+                        "SECUGRP_NM": "주권",
+                        "KIND_STKCERT_TP_NM": "보통주",
+                    }
+                ]
+
+        args = SimpleNamespace(
+            analysis_date=as_of.isoformat(),
+            limit=2,
+            min_trading_value_krw=0,
+            market=None,
+            profile="balanced",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DecisionStore(Path(tmp) / "research.db")
+            with (
+                patch.dict(
+                    cli.os.environ,
+                    {"KRX_AUTH_KEY": "test", "KIS_APP_KEY": "", "KIS_APP_SECRET": ""},
+                    clear=False,
+                ),
+                patch.object(cli, "_store", return_value=store),
+                patch.object(cli, "_korea_today", return_value=today),
+                patch.object(cli, "_korea_now", return_value=now),
+                patch.object(cli.KrxClient, "from_env", return_value=FakeKrxClient()),
+            ):
+                data = cli.cmd_discover(args)
+
+                self.assertIsNone(
+                    store.get_universe_snapshot(as_of, markets=["KOSPI", "KOSDAQ"])
+                )
+                self.assertEqual(data["source"], "KRX OpenAPI historical reconstruction")
+                self.assertIsNone(data["snapshot_hash"])
+                self.assertIsNone(data["captured_at"])
+                self.assertEqual(data["reconstructed_at"], now)
+                self.assertEqual(data["resolved_data_date"], as_of)
+                self.assertIn("data_as_of=2026-09-15", data["ranking_source"])
+                self.assertEqual(data["ranking_generated_at"], now)
+                self.assertEqual(data["ranking_mode"], "historical_reconstruction")
+                self.assertEqual(data["ranking_data_as_of"], as_of)
+                self.assertEqual(
+                    data["candidates"][0].analysis_cutoff_at,
+                    datetime(2026, 9, 15, 17, 0, tzinfo=kst),
+                )
+
+                round_trip = cli._candidate_from_payload(
+                    to_jsonable(data["candidates"][0])
+                )
+                self.assertEqual(round_trip.ranking_generated_at, now)
+                self.assertEqual(round_trip.ranking_mode, "historical_reconstruction")
+                self.assertEqual(round_trip.ranking_data_as_of, as_of)
+                self.assertIn("data_as_of=2026-09-15", round_trip.ranking_source)
+
+    def test_historical_reconstruction_ranking_can_flow_into_batch_without_fake_cutoff(self):
+        kst = timezone(timedelta(hours=9))
+        analysis_date = date(2026, 9, 15)
+        generated_at = datetime(2026, 9, 18, 15, 30, tzinfo=kst)
+        payload = {
+            "analysis_date": analysis_date.isoformat(),
+            "ranking_source": (
+                "fincept-krx-openapi-historical-cross-sectional-v2/balanced"
+                ";data_as_of=2026-09-15"
+            ),
+            "ranking_generated_at": generated_at.isoformat(),
+            "ranking_mode": "historical_reconstruction",
+            "ranking_data_as_of": analysis_date.isoformat(),
+            "limit": 1,
+            "rows": [
+                {
+                    "ticker": "005930",
+                    "name": "삼성전자",
+                    "market": "KOSPI",
+                    "score": 90,
+                }
+            ],
+        }
+
+        class RecordingStore:
+            def __init__(self):
+                self.candidate = None
+
+            def record_decision(self, result, *, strategy_id):
+                self.candidate = result.candidate
+                return result
+
+        class Engine:
+            def analyze(self, candidate):
+                return ResearchResult(
+                    candidate=candidate,
+                    signal="Hold",
+                    market_report="m",
+                    fundamentals_report="f",
+                    news_macro_report="n",
+                    bull_case="b+",
+                    bear_case="b-",
+                    research_manager="r",
+                    trader="t",
+                    risk_manager="risk",
+                    portfolio_manager="SIGNAL: HOLD",
+                )
+
+        store = RecordingStore()
+        with (
+            patch.object(cli, "_input_json", return_value=payload),
+            patch.object(cli, "_korea_now", return_value=generated_at),
+            patch.object(cli, "_engine", return_value=Engine()),
+            patch.object(cli, "_store", return_value=store),
+        ):
+            result = cli.cmd_batch()
+
+        self.assertEqual(len(result["results"]), 1)
+        self.assertIsNotNone(store.candidate)
+        self.assertEqual(store.candidate.ranking_mode, "historical_reconstruction")
+        self.assertEqual(store.candidate.ranking_data_as_of, analysis_date)
+        self.assertEqual(store.candidate.ranking_generated_at, generated_at)
+        self.assertEqual(
+            store.candidate.analysis_cutoff_at,
+            datetime(2026, 9, 15, 17, 0, tzinfo=kst),
+        )
+
     def test_live_request_cutoff_keeps_observed_current_macro(self):
         kst = timezone(timedelta(hours=9))
         cutoff = datetime(2026, 9, 16, 10, 15, tzinfo=kst)

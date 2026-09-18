@@ -43,6 +43,7 @@ class CppWiringTests(unittest.TestCase):
         for key in (
             "KIS_APP_KEY",
             "KIS_APP_SECRET",
+            "KRX_AUTH_KEY",
             "DART_API_KEY",
             "NAVER_CLIENT_ID",
             "NAVER_CLIENT_SECRET",
@@ -130,11 +131,13 @@ class CppWiringTests(unittest.TestCase):
         self.assertIn("run_opts.timeout_ms = 20 * 60 * 1000", ui)
         self.assertIn("run_with_options", ui)
 
-    def test_market_discovery_is_keyless_pit_snapshot_tool(self):
+    def test_market_discovery_preserves_snapshot_pit_and_exposes_krx_reconstruction(self):
         tools = (QT_ROOT / "src/mcp/tools/PersonalKrResearchTools.cpp").read_text(encoding="utf-8")
         section = tools.split('t.name = "kr_discover_market"', 1)[1].split('t.name = "kr_llm_smoke"', 1)[0]
         self.assertIn('"discover"', section)
         self.assertIn("exact snapshot", section)
+        self.assertIn("KRX OpenAPI", section)
+        self.assertIn("data_as_of", section)
         self.assertIn("cross-sectional v2", section)
         self.assertIn('enums({"balanced", "liquidity", "large_cap", "active"})', section)
         self.assertIn('enums({"ALL", "KOSPI", "KOSDAQ"})', section)

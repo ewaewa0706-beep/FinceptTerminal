@@ -174,6 +174,8 @@ class QuantCandidate:
     ranking_payload_hash: str = ""
     analysis_cutoff_at: datetime | None = None
     analysis_cutoff_mode: str = ""
+    ranking_mode: str = ""
+    ranking_data_as_of: date | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "analysis_date", _date(self.analysis_date))
@@ -186,6 +188,21 @@ class QuantCandidate:
         object.__setattr__(self, "factors", cleaned)
         if self.ranking_generated_at is not None and self.ranking_generated_at.tzinfo is None:
             raise ValueError("ranking_generated_at must include a timezone")
+        ranking_mode = str(self.ranking_mode or "").strip().lower()
+        if ranking_mode not in {"", "observed", "historical_reconstruction"}:
+            raise ValueError("ranking_mode must be observed or historical_reconstruction")
+        object.__setattr__(self, "ranking_mode", ranking_mode)
+        ranking_data_as_of = (
+            _date(self.ranking_data_as_of) if self.ranking_data_as_of is not None else None
+        )
+        object.__setattr__(self, "ranking_data_as_of", ranking_data_as_of)
+        if ranking_mode == "historical_reconstruction":
+            if self.ranking_generated_at is None:
+                raise ValueError("historical_reconstruction requires ranking_generated_at")
+            if ranking_data_as_of is None:
+                raise ValueError("historical_reconstruction requires ranking_data_as_of")
+        if ranking_data_as_of is not None and ranking_data_as_of > self.analysis_date:
+            raise ValueError("ranking_data_as_of cannot be later than analysis_date")
         if self.analysis_cutoff_at is not None and self.analysis_cutoff_at.tzinfo is None:
             raise ValueError("analysis_cutoff_at must include a timezone")
         cutoff_mode = str(self.analysis_cutoff_mode or "").strip().lower()
@@ -204,6 +221,11 @@ class QuantCandidate:
             kst = timezone(timedelta(hours=9))
             if self.analysis_cutoff_at.astimezone(kst).date() > self.analysis_date:
                 raise ValueError("analysis_cutoff_at cannot be later than analysis_date")
+            if (
+                ranking_data_as_of is not None
+                and ranking_data_as_of > self.analysis_cutoff_at.astimezone(kst).date()
+            ):
+                raise ValueError("ranking_data_as_of cannot be later than analysis_cutoff_at")
 
 
 @dataclass(frozen=True)

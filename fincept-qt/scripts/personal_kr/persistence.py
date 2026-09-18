@@ -800,16 +800,30 @@ def _result_from_payload(data: dict) -> ResearchResult:
     c = data["candidate"]
     i = c["instrument"]
     candidate = QuantCandidate(
-        Instrument(i["ticker"], i["name"], i["market"], i.get("currency", "KRW")),
-        date.fromisoformat(c["analysis_date"]),
-        c["score"],
-        c.get("rank"),
-        c.get("factors") or {},
-        c.get("ranking_source") or "",
-        datetime.fromisoformat(c["ranking_generated_at"]) if c.get("ranking_generated_at") else None,
-        c.get("ranking_payload_hash") or "",
-        datetime.fromisoformat(c["analysis_cutoff_at"]) if c.get("analysis_cutoff_at") else None,
-        c.get("analysis_cutoff_mode") or "",
+        instrument=Instrument(i["ticker"], i["name"], i["market"], i.get("currency", "KRW")),
+        analysis_date=date.fromisoformat(c["analysis_date"]),
+        score=c["score"],
+        rank=c.get("rank"),
+        factors=c.get("factors") or {},
+        ranking_source=c.get("ranking_source") or "",
+        ranking_generated_at=(
+            datetime.fromisoformat(c["ranking_generated_at"])
+            if c.get("ranking_generated_at")
+            else None
+        ),
+        ranking_payload_hash=c.get("ranking_payload_hash") or "",
+        analysis_cutoff_at=(
+            datetime.fromisoformat(c["analysis_cutoff_at"])
+            if c.get("analysis_cutoff_at")
+            else None
+        ),
+        analysis_cutoff_mode=c.get("analysis_cutoff_mode") or "",
+        ranking_mode=c.get("ranking_mode") or "",
+        ranking_data_as_of=(
+            date.fromisoformat(c["ranking_data_as_of"])
+            if c.get("ranking_data_as_of")
+            else None
+        ),
     )
     return ResearchResult(
         candidate=candidate,

@@ -84,14 +84,26 @@ class DiscoveryScoringTests(unittest.TestCase):
         self.assertEqual(volume_first[0].instrument.ticker, "000660")
         self.assertTrue(all(0 <= item.score <= 100 for item in liquidity_first + volume_first))
 
-    def test_mismatched_entry_date_is_rejected(self):
-        bad = UniverseEntry(
+    def test_previous_resolved_session_is_allowed_but_future_or_mixed_dates_are_rejected(self):
+        prior = UniverseEntry(
             Instrument("005930", "삼성전자", "KOSPI"),
             date(2026, 9, 17),
             trading_value_krw=100,
         )
-        with self.assertRaisesRegex(ValueError, "must match"):
-            score_universe_entries([bad], self.as_of)
+        ranked = score_universe_entries([prior], self.as_of)
+        self.assertEqual(ranked[0].instrument.ticker, "005930")
+
+        future = UniverseEntry(
+            Instrument("000660", "SK하이닉스", "KOSPI"),
+            date(2026, 9, 19),
+            trading_value_krw=90,
+        )
+        with self.assertRaisesRegex(ValueError, "cannot be later"):
+            score_universe_entries([future], self.as_of)
+
+        same_day = self.entry("035420", value=80, cap=100, volume=10)
+        with self.assertRaisesRegex(ValueError, "share one resolved market date"):
+            score_universe_entries([prior, same_day], self.as_of)
 
     def test_named_profiles_are_normalized_and_materially_different(self):
         balanced = weights_for_profile("balanced").normalized()

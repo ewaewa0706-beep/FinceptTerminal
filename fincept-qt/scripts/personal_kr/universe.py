@@ -9,13 +9,15 @@ later replay.  It never substitutes today's membership for a historical date.
 from __future__ import annotations
 
 import math
+import os
 import zipfile
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from .http import RetryHttpClient
+from .http import HttpStatusError, RetryHttpClient
 from .models import Instrument, QuantCandidate
 
 
@@ -24,6 +26,18 @@ KST = timezone(timedelta(hours=9))
 KIS_PUBLIC_MASTER_URLS = {
     "KOSPI": "https://new.real.download.dws.co.kr/common/master/kospi_code.mst.zip",
     "KOSDAQ": "https://new.real.download.dws.co.kr/common/master/kosdaq_code.mst.zip",
+}
+
+KRX_OPENAPI_BASE_URL = "https://data-dbg.krx.co.kr/svc/apis/sto"
+KRX_STOCK_HISTORY_START = date(2010, 1, 4)
+KRX_LOCAL_KEY_FILE = Path(__file__).resolve().parents[1] / "KRX_KEY.local.txt"
+_KRX_BASE_INFO_ENDPOINTS = {
+    "KOSPI": "stk_isu_base_info",
+    "KOSDAQ": "ksq_isu_base_info",
+}
+_KRX_DAILY_TRADING_ENDPOINTS = {
+    "KOSPI": "stk_bydd_trd",
+    "KOSDAQ": "ksq_bydd_trd",
 }
 
 # Fixed-width tail layouts published by Korea Investment & Securities.  The
@@ -71,6 +85,51 @@ class KisPublicMasterError(RuntimeError):
     """Raised when the keyless KIS public master cannot be parsed safely."""
 
 
+class KrxApiError(RuntimeError):
+    """Raised when KRX OpenAPI cannot provide a trustworthy historical universe."""
+
+
+def load_krx_auth_key(path: Path | str | None = None) -> str:
+    """Load the KRX auth key without ever echoing secret contents.
+
+    SecureStorage/PythonRunner normally supplies ``KRX_AUTH_KEY``.  For local
+    development a git-ignored ``scripts/KRX_KEY.local.txt`` file is also
+    supported.  ``KRX_AUTH_KEY_FILE`` can point at an alternate local file;
+    when that environment variable is present its path is authoritative, which
+    lets tests/validation deliberately disable the default local secret file.
+    """
+
+    env_key = os.getenv("KRX_AUTH_KEY", "").strip()
+    if env_key:
+        return env_key
+
+    if path is None:
+        configured_path = os.getenv("KRX_AUTH_KEY_FILE")
+        key_path = Path(configured_path) if configured_path is not None else KRX_LOCAL_KEY_FILE
+    else:
+        key_path = Path(path)
+    if not key_path.is_file():
+        return ""
+
+    try:
+        raw = key_path.read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        raise KrxApiError("KRX local auth-key file could not be read") from exc
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    lines = [line for line in lines if line != "PASTE_KRX_AUTH_KEY_HERE"]
+    if not lines:
+        return ""
+    if len(lines) != 1:
+        raise KrxApiError("KRX local auth-key file must contain exactly one key line")
+    return lines[0]
+
+
+def krx_auth_key_configured() -> bool:
+    """Return configuration presence only; never validates or exposes the key."""
+
+    return bool(load_krx_auth_key())
+
+
 @dataclass(frozen=True)
 class UniverseEntry:
     instrument: Instrument
@@ -115,6 +174,205 @@ class UniverseSnapshot:
             f"sha256={self.payload_sha256[:12]}); original="
         )
         return [replace(entry, source=f"{replay}{entry.source}") for entry in self.entries]
+
+
+class KrxClient:
+    """Minimal KRX OpenAPI client for historical listing/trading snapshots."""
+
+    def __init__(
+        self,
+        auth_key: str,
+        *,
+        http: RetryHttpClient | None = None,
+        base_url: str | None = None,
+    ) -> None:
+        self.auth_key = str(auth_key or "").strip()
+        if not self.auth_key:
+            raise ValueError("KRX_AUTH_KEY is required for KRX historical discovery")
+        self.http = http or RetryHttpClient(timeout=20.0)
+        self.base_url = (base_url or os.getenv("KRX_BASE_URL") or KRX_OPENAPI_BASE_URL).rstrip("/")
+
+    @classmethod
+    def from_env(cls, **kwargs: Any) -> "KrxClient":
+        return cls(load_krx_auth_key(), **kwargs)
+
+    def get_base_info(self, market: str, as_of: date) -> list[dict[str, Any]]:
+        market = str(market).upper().strip()
+        if market not in _KRX_BASE_INFO_ENDPOINTS:
+            raise ValueError(f"unsupported KRX market: {market}")
+        return self._get_rows(_KRX_BASE_INFO_ENDPOINTS[market], as_of)
+
+    def get_daily_trading(self, market: str, as_of: date) -> list[dict[str, Any]]:
+        market = str(market).upper().strip()
+        if market not in _KRX_DAILY_TRADING_ENDPOINTS:
+            raise ValueError(f"unsupported KRX market: {market}")
+        return self._get_rows(_KRX_DAILY_TRADING_ENDPOINTS[market], as_of)
+
+    def _get_rows(self, endpoint: str, as_of: date) -> list[dict[str, Any]]:
+        try:
+            payload = self.http.get_json(
+                f"{self.base_url}/{endpoint}",
+                headers={"AUTH_KEY": self.auth_key},
+                params={"basDd": as_of.strftime("%Y%m%d")},
+            )
+        except HttpStatusError as exc:
+            if exc.status == 401:
+                raise KrxApiError(
+                    "KRX OpenAPI authentication was rejected (HTTP 401); verify the auth key and that this API service is approved for the key"
+                ) from exc
+            raise KrxApiError(f"KRX OpenAPI request failed for {endpoint} (HTTP {exc.status})") from exc
+        except Exception as exc:
+            raise KrxApiError(f"KRX OpenAPI request failed for {endpoint}") from exc
+        if not isinstance(payload, dict):
+            raise KrxApiError("KRX OpenAPI response is not a JSON object")
+        rows = payload.get("OutBlock_1") or []
+        if not isinstance(rows, list):
+            raise KrxApiError("KRX OpenAPI OutBlock_1 is not a list")
+        return rows
+
+
+class KrxUniverseProvider:
+    """Historical KOSPI/KOSDAQ universe reconstructed from dated KRX rows."""
+
+    def __init__(self, client: KrxClient | Any) -> None:
+        self.client = client
+        self._daily_cache: dict[tuple[str, date], list[dict[str, Any]]] = {}
+
+    def get_universe(
+        self,
+        as_of: date,
+        *,
+        markets: Iterable[str] = ("KOSPI", "KOSDAQ"),
+        common_only: bool = True,
+        exclude_spac: bool = True,
+        min_trading_value_krw: int = 0,
+        limit: int | None = None,
+        max_calendar_lookback: int = 10,
+    ) -> list[UniverseEntry]:
+        if as_of < KRX_STOCK_HISTORY_START:
+            raise KrxApiError(
+                "KRX stock OpenAPI historical discovery is available from "
+                f"{KRX_STOCK_HISTORY_START.isoformat()}"
+            )
+        market_list = _normalize_markets(markets)
+        if not market_list:
+            return []
+        if min_trading_value_krw < 0:
+            raise ValueError("min_trading_value_krw must be >= 0")
+        if limit is not None and limit < 1:
+            raise ValueError("limit must be >= 1")
+        if max_calendar_lookback < 0:
+            raise ValueError("max_calendar_lookback must be >= 0")
+
+        trading_date = self._resolve_trading_date(
+            as_of,
+            market_list,
+            max_calendar_lookback=max_calendar_lookback,
+        )
+        entries: list[UniverseEntry] = []
+        for market in market_list:
+            base_rows = self.client.get_base_info(market, trading_date)
+            daily_rows = self._daily_rows(market, trading_date)
+            if not base_rows:
+                raise KrxApiError(
+                    f"KRX returned no {market} base-info rows for resolved trading date {trading_date}"
+                )
+            if not daily_rows:
+                raise KrxApiError(
+                    f"KRX returned no {market} daily rows for resolved trading date {trading_date}"
+                )
+            daily_by_code = {
+                code: row
+                for row in daily_rows
+                if (code := _krx_short_code(row)) is not None
+            }
+            if not daily_by_code:
+                raise KrxApiError(
+                    f"KRX {market} daily rows had no parseable stock codes on {trading_date}"
+                )
+            if not any(
+                (code := _krx_short_code(row)) is not None and code in daily_by_code
+                for row in base_rows
+            ):
+                raise KrxApiError(
+                    f"KRX {market} base-info/daily rows had no matching stock codes on {trading_date}"
+                )
+
+            for base in base_rows:
+                ticker = _krx_short_code(base)
+                if ticker is None:
+                    continue
+                name = str(base.get("ISU_ABBRV") or base.get("ISU_NM") or "").strip()
+                if not name:
+                    continue
+                if common_only and not _is_krx_common_stock(base):
+                    continue
+                if exclude_spac and _is_spac(name):
+                    continue
+                daily = daily_by_code.get(ticker) or {}
+                trading_value = _int_or_none(daily.get("ACC_TRDVAL"))
+                if (trading_value or 0) < min_trading_value_krw:
+                    continue
+                entries.append(
+                    UniverseEntry(
+                        instrument=Instrument(ticker, name, market),
+                        # The entry date is the exchange session that actually
+                        # produced these rows.  Callers keep the requested
+                        # analysis date separately, so weekend/holiday lookback
+                        # never pretends that Friday's tape was Sunday's tape.
+                        as_of=trading_date,
+                        listed_on=_date_or_none(base.get("LIST_DD")),
+                        listed_shares=_int_or_none(base.get("LIST_SHRS") or daily.get("LIST_SHRS")),
+                        volume=_int_or_none(daily.get("ACC_TRDVOL")),
+                        trading_value_krw=trading_value,
+                        market_cap_krw=_int_or_none(daily.get("MKTCAP")),
+                        source=(
+                            "KRX OpenAPI historical "
+                            f"(requested_as_of={as_of.isoformat()}, resolved_trading_date={trading_date.isoformat()})"
+                        ),
+                    )
+                )
+
+        entries.sort(
+            key=lambda item: (
+                -(item.trading_value_krw or 0),
+                -(item.market_cap_krw or 0),
+                item.instrument.ticker,
+            )
+        )
+        return entries[:limit] if limit is not None else entries
+
+    def _resolve_trading_date(
+        self,
+        as_of: date,
+        markets: tuple[str, ...],
+        *,
+        max_calendar_lookback: int,
+    ) -> date:
+        for offset in range(max_calendar_lookback + 1):
+            candidate = as_of - timedelta(days=offset)
+            availability = {
+                market: bool(self._daily_rows(market, candidate)) for market in markets
+            }
+            if all(availability.values()):
+                return candidate
+            if any(availability.values()):
+                missing = ", ".join(market for market, available in availability.items() if not available)
+                present = ", ".join(market for market, available in availability.items() if available)
+                raise KrxApiError(
+                    f"KRX returned inconsistent market coverage on {candidate}: "
+                    f"rows present for {present}, missing for {missing}"
+                )
+        raise KrxApiError(
+            "KRX returned no daily rows for requested markets "
+            f"{', '.join(markets)} on or before {as_of} within {max_calendar_lookback} calendar days"
+        )
+
+    def _daily_rows(self, market: str, as_of: date) -> list[dict[str, Any]]:
+        key = (market, as_of)
+        if key not in self._daily_cache:
+            self._daily_cache[key] = self.client.get_daily_trading(market, as_of)
+        return self._daily_cache[key]
 
 
 class KisPublicMasterClient:
@@ -275,11 +533,13 @@ class SnapshotAwareUniverseProvider:
         current_provider: Any,
         snapshot_store: Any,
         *,
+        historical_provider: Any | None = None,
         today_fn: Callable[[], date] | None = None,
         now_fn: Callable[[], datetime] | None = None,
     ) -> None:
         self.current_provider = current_provider
         self.snapshot_store = snapshot_store
+        self.historical_provider = historical_provider
         self.today_fn = today_fn or (lambda: datetime.now(KST).date())
         self.now_fn = now_fn or (lambda: datetime.now(KST))
 
@@ -309,13 +569,27 @@ class SnapshotAwareUniverseProvider:
                 common_only=common_only,
                 exclude_spac=exclude_spac,
             )
-            if snapshot is None:
-                raise CurrentUniverseOnlyError(
-                    "historical whole-market discovery requires an exact PIT universe snapshot captured on "
-                    f"{as_of.isoformat()}"
+            if snapshot is not None:
+                # A snapshot captured on the requested date is stronger PIT
+                # evidence than a later historical reconstruction. Preserve the
+                # first-write artifact even when KRX credentials are available.
+                return _apply_threshold_and_limit(
+                    snapshot.replay_entries(),
+                    min_trading_value_krw=min_trading_value_krw,
+                    limit=limit,
                 )
-            return _apply_threshold_and_limit(
-                snapshot.replay_entries(), min_trading_value_krw=min_trading_value_krw, limit=limit
+            if self.historical_provider is not None:
+                return self.historical_provider.get_universe(
+                    as_of,
+                    markets=market_list,
+                    common_only=common_only,
+                    exclude_spac=exclude_spac,
+                    min_trading_value_krw=min_trading_value_krw,
+                    limit=limit,
+                )
+            raise CurrentUniverseOnlyError(
+                "historical whole-market discovery requires KRX_AUTH_KEY or an exact PIT universe snapshot "
+                f"captured on {as_of.isoformat()}"
             )
 
         existing = self.snapshot_store.get_universe_snapshot(
@@ -456,6 +730,24 @@ def _kis_rank_trading_value(row: dict[str, Any]) -> int | None:
     if price is None or volume is None or price <= 0 or volume <= 0:
         return None
     return price * volume
+
+
+def _krx_short_code(row: dict[str, Any]) -> str | None:
+    for key in ("ISU_SRT_CD", "ISU_CD"):
+        raw = str(row.get(key) or "").strip()
+        if len(raw) == 6 and raw.isdigit() and raw != "000000":
+            return raw
+        if len(raw) > 6 and raw[-6:].isdigit() and raw[-6:] != "000000":
+            return raw[-6:]
+    return None
+
+
+def _is_krx_common_stock(row: dict[str, Any]) -> bool:
+    security_group = str(row.get("SECUGRP_NM") or "").strip()
+    stock_type = str(row.get("KIND_STKCERT_TP_NM") or "").strip()
+    if security_group and "주권" not in security_group:
+        return False
+    return not stock_type or "보통주" in stock_type
 
 
 def _int_or_none(value: Any) -> int | None:

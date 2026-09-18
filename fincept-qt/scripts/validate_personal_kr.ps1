@@ -9,12 +9,14 @@ $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $credentialNames = @(
     "KIS_APP_KEY",
     "KIS_APP_SECRET",
+    "KRX_AUTH_KEY",
     "DART_API_KEY",
     "NAVER_CLIENT_ID",
     "NAVER_CLIENT_SECRET",
     "ECOS_API_KEY",
     "GOOGLE_API_KEY"
 )
+$configurationNames = @("KRX_AUTH_KEY_FILE")
 $savedEnvironment = @{}
 
 function Invoke-PythonChecked {
@@ -41,6 +43,12 @@ try {
         $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
         [Environment]::SetEnvironmentVariable($name, $null, "Process")
     }
+    foreach ($name in $configurationNames) {
+        $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
+    }
+    # Prevent a developer's git-ignored KRX key file from changing deterministic
+    # test/status behavior or causing validation to make authenticated calls.
+    [Environment]::SetEnvironmentVariable("KRX_AUTH_KEY_FILE", "__disabled_for_validation__", "Process")
     $savedEnvironment["PYTHONDONTWRITEBYTECODE"] = [Environment]::GetEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "Process")
     $savedEnvironment["PYTHONUTF8"] = [Environment]::GetEnvironmentVariable("PYTHONUTF8", "Process")
     [Environment]::SetEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1", "Process")

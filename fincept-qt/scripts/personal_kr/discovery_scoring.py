@@ -82,9 +82,12 @@ def score_universe_entries(
     items = list(entries)
     if not items:
         return []
-    for entry in items:
-        if entry.as_of != analysis_date:
-            raise ValueError("universe entry date must match discovery analysis_date")
+    resolved_dates = {entry.as_of for entry in items}
+    if len(resolved_dates) != 1:
+        raise ValueError("universe entries must share one resolved market date")
+    resolved_date = next(iter(resolved_dates))
+    if resolved_date > analysis_date:
+        raise ValueError("universe entry date cannot be later than discovery analysis_date")
 
     raw: list[dict[str, float | None]] = []
     for entry in items:

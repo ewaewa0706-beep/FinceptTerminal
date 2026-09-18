@@ -81,6 +81,7 @@ logs/
 .env
 .env.local
 .env.*.local
+fincept-qt/scripts/KRX_KEY.local.txt
 *.key
 *.pub
 # NOTE: *.pub is repo-wide and matches PUBLIC keys too. If the auto-updater
