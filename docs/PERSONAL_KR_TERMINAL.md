@@ -255,6 +255,12 @@ declare `execution_mode=paper_only`. Paper execution is never inferred from an
 AI signal and is never triggered by discovery, research, outcome evaluation or
 paper-summary refresh.
 
+An ambiguous paper request also survives decision-row selection changes. The UI
+does not mint a replacement idempotency key merely because the selected row
+changed. **PAPER TRADES** reconciles the retained `client_trade_id` against the
+immutable ledger: if that exact row is present, the pending state is cleared; if
+not, the UI keeps the key and requires an exact-value retry.
+
 **PAPER TRADES** is the read-only ledger companion. It lists recent immutable
 paper rows newest-first with `client_trade_id`, `decision_id`, ticker/company,
 side, quantity, price, fees/tax, strategy and frozen research signal. CLI and MCP

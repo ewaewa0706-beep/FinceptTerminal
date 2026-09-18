@@ -472,7 +472,6 @@ QFrame* EquityAnalysisTab::build_kr_history_panel_() {
     kr_history_table_->setSelectionMode(QAbstractItemView::SingleSelection);
     kr_history_table_->setMinimumHeight(220);
     connect(kr_history_table_, &QTableWidget::itemSelectionChanged, this, [this]() {
-        kr_history_pending_paper_trade_ = {};
         const bool selected = !selected_kr_decision_id_().isEmpty();
         if (kr_history_evaluate_btn_)
             kr_history_evaluate_btn_->setEnabled(selected && !kr_history_busy_);
@@ -773,7 +772,20 @@ void EquityAnalysisTab::on_kr_history_paper_trades_clicked() {
                 return;
             }
             const QJsonArray trades = data.value("trades").toArray();
-            self->kr_history_status_->setText(self->tr("Loaded %1 paper-only trade(s)").arg(trades.size()));
+            QString status = self->tr("Loaded %1 paper-only trade(s)").arg(trades.size());
+            const QString pending_id = self->kr_history_pending_paper_trade_.value("client_trade_id").toString();
+            if (!pending_id.isEmpty()) {
+                const bool committed = std::any_of(trades.cbegin(), trades.cend(), [&pending_id](const QJsonValue& value) {
+                    return value.toObject().value("client_trade_id").toString() == pending_id;
+                });
+                if (committed) {
+                    self->kr_history_pending_paper_trade_ = {};
+                    status += self->tr(" · pending request confirmed in ledger");
+                } else {
+                    status += self->tr(" · pending request not found; retry the exact same trade values");
+                }
+            }
+            self->kr_history_status_->setText(status);
             self->kr_history_result_->setPlainText(
                 QString::fromUtf8(QJsonDocument(trades).toJson(QJsonDocument::Indented)));
         });

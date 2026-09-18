@@ -84,6 +84,10 @@ class CppWiringTests(unittest.TestCase):
         self.assertIn("QUuid::createUuid()", cpp)
         self.assertIn("Confirm paper-only trade", cpp)
         self.assertIn("No live brokerage order will be sent", cpp)
+        self.assertIn("pending request confirmed in ledger", cpp)
+        self.assertIn("pending request not found; retry the exact same trade values", cpp)
+        selection_handler = cpp.split("&QTableWidget::itemSelectionChanged", 1)[1].split("});", 1)[0]
+        self.assertNotIn("kr_history_pending_paper_trade_ = {}", selection_handler)
         self.assertIn('QLatin1String("paper_only")', cpp)
         self.assertIn("kr_history_busy_ = busy", cpp)
         self.assertIn("selected && !kr_history_busy_", cpp)
