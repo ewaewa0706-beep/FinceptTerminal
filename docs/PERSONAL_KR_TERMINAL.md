@@ -92,6 +92,7 @@ Run from `fincept-qt/scripts`.
 python personal_kr_terminal.py status
 python personal_kr_terminal.py llm-smoke
 python personal_kr_terminal.py discover --limit 20 --min-trading-value-krw 1000000000
+python personal_kr_terminal.py quant-rank --prefilter-limit 30 --limit 10 --profile balanced
 ```
 
 Without stdin, `llm-smoke` uses the headless `GOOGLE_API_KEY` fallback. The
@@ -139,6 +140,26 @@ stored as a backdated snapshot: `ranking_mode=historical_reconstruction`,
 `ranking_generated_at` / `reconstructed_at` preserve the actual later retrieval
 time. Without either an exact snapshot or KRX access, historical discovery fails
 closed rather than substituting current market membership.
+
+`quant-rank` is the bounded feature-ranking stage between broad discovery and
+deep research. It takes at most 50 names from the cheap whole-market prefilter,
+then uses KIS daily bars and per-stock investor flow only for that slice. When
+`DART_API_KEY` is configured it also adds PIT-safe financial-statement factors
+(operating margin, net margin and equity ratio). The v1 score cross-sectionally
+combines momentum (20/60-session returns), foreign and institution flow relative
+to aligned share volume, DART fundamentals, 20-session trading-value liquidity,
+and inverse 20-session annualized volatility. Profiles are `balanced`, `momentum`,
+`flow`, and `defensive`; missing optional flow or DART data is omitted and the
+remaining weights are renormalized. Raw feature metrics are frozen into a
+separate SHA-256 audit hash, while the selected Top-N rows use the normal batch
+ranking hash/provenance contract. This stage never calls an LLM and never places
+an order.
+
+Quant Ranking v1 is intentionally current-date only. The KIS per-stock investor
+flow quote used here does not accept an arbitrary historical date, so an old
+analysis date is rejected rather than treating today's response as historical
+PIT evidence. Historical whole-market work remains on exact snapshot replay or
+the explicitly labeled KRX reconstruction path described above.
 
 External Quant Ranking → Top N selection uses JSON over stdin:
 

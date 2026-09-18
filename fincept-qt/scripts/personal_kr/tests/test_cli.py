@@ -21,6 +21,9 @@ ENTRYPOINT = SCRIPTS_DIR / "personal_kr_terminal.py"
 
 def run_cli(*args: str, input_data: dict | None = None, data_dir: str | None = None):
     env = os.environ.copy()
+    # Never let developer-local KRX credentials leak into integration tests.
+    env.pop("KRX_AUTH_KEY", None)
+    env["KRX_AUTH_KEY_FILE"] = str(SCRIPTS_DIR / "__test_no_krx_key__.txt")
     if data_dir:
         env["FINCEPT_DATA_DIR"] = data_dir
     proc = subprocess.run(

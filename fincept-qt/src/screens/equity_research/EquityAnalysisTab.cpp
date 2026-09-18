@@ -320,7 +320,8 @@ QFrame* EquityAnalysisTab::build_kr_discovery_panel_() {
 
     auto* description = new QLabel(
         tr("PIT-safe KOSPI/KOSDAQ Top-N discovery. Uses the keyless KIS public master and, when configured, "
-           "current KIS trading-value rank. Discovery is research-only and does not run the LLM or submit orders."));
+           "current KIS trading-value rank. The optional KIS Quant stage refines today's bounded prefilter with "
+           "price momentum, foreign/institution flow, DART fundamentals, liquidity and risk. Neither stage runs the LLM or submits orders."));
     description->setWordWrap(true);
     vl->addWidget(description);
 
@@ -397,6 +398,33 @@ QFrame* EquityAnalysisTab::build_kr_discovery_panel_() {
     hl->addWidget(kr_discovery_status_, 1);
     vl->addWidget(controls);
 
+    auto* quant_controls = new QWidget(nullptr);
+    auto* qh = new QHBoxLayout(quant_controls);
+    qh->setContentsMargins(0, 0, 0, 0);
+    qh->setSpacing(10);
+    qh->addWidget(new QLabel(tr("KIS Quant Profile")));
+    kr_quant_profile_ = new QComboBox;
+    kr_quant_profile_->addItem(tr("Balanced"), "balanced");
+    kr_quant_profile_->addItem(tr("Momentum"), "momentum");
+    kr_quant_profile_->addItem(tr("Flow"), "flow");
+    kr_quant_profile_->addItem(tr("Defensive"), "defensive");
+    qh->addWidget(kr_quant_profile_);
+    qh->addWidget(new QLabel(tr("Prefilter")));
+    kr_quant_prefilter_limit_ = new QSpinBox;
+    kr_quant_prefilter_limit_->setRange(10, 50);
+    kr_quant_prefilter_limit_->setValue(30);
+    kr_quant_prefilter_limit_->setToolTip(
+        tr("Maximum discovery names receiving per-symbol KIS price and investor-flow requests"));
+    qh->addWidget(kr_quant_prefilter_limit_);
+    kr_quant_rank_btn_ = new QPushButton(tr("RUN KIS QUANT RANK"));
+    kr_quant_rank_btn_->setCursor(Qt::PointingHandCursor);
+    kr_quant_rank_btn_->setToolTip(
+        tr("Current date only · refines up to 50 prefiltered names · returns at most Top 10 for research"));
+    connect(kr_quant_rank_btn_, &QPushButton::clicked, this, &EquityAnalysisTab::on_kr_quant_rank_clicked);
+    qh->addWidget(kr_quant_rank_btn_);
+    qh->addStretch(1);
+    vl->addWidget(quant_controls);
+
     kr_discovery_table_ = new QTableWidget(0, 8);
     kr_discovery_table_->setHorizontalHeaderLabels(
         {tr("Rank"), tr("Ticker"), tr("Company"), tr("Market"), tr("Score"),
@@ -412,7 +440,7 @@ QFrame* EquityAnalysisTab::build_kr_discovery_panel_() {
     kr_discovery_result_ = new QPlainTextEdit;
     kr_discovery_result_->setReadOnly(true);
     kr_discovery_result_->setPlaceholderText(
-        tr("Select a discovered stock and press RESEARCH SELECTED to run one explicit research_only deep analysis."));
+        tr("Run discovery or KIS Quant Ranking, then select a stock for one explicit research_only deep analysis."));
     kr_discovery_result_->setMinimumHeight(180);
     vl->addWidget(kr_discovery_result_);
     return panel;
@@ -925,6 +953,8 @@ void EquityAnalysisTab::on_kr_discover_clicked() {
                                              ? static_cast<qint64>(kr_discovery_min_value_->value() * 100000000.0)
                                              : 0;
     kr_discover_btn_->setEnabled(false);
+    if (kr_quant_rank_btn_)
+        kr_quant_rank_btn_->setEnabled(false);
     if (kr_discovery_research_btn_)
         kr_discovery_research_btn_->setEnabled(false);
     if (kr_discovery_batch_btn_)
@@ -933,6 +963,7 @@ void EquityAnalysisTab::on_kr_discover_clicked() {
     kr_discovery_table_->setRowCount(0);
     kr_discovery_candidates_ = {};
     kr_discovery_ranking_ = {};
+    kr_discovery_quant_mode_ = false;
     if (kr_discovery_result_)
         kr_discovery_result_->clear();
 
@@ -954,6 +985,8 @@ void EquityAnalysisTab::on_kr_discover_clicked() {
                 return;
             if (self->kr_discover_btn_)
                 self->kr_discover_btn_->setEnabled(true);
+            if (self->kr_quant_rank_btn_)
+                self->kr_quant_rank_btn_->setEnabled(true);
             if (!result.success) {
                 if (self->kr_discovery_status_)
                     self->kr_discovery_status_->setText(self->tr("KR market discovery unavailable: %1").arg(result.error));
@@ -973,6 +1006,9 @@ void EquityAnalysisTab::on_kr_discover_clicked() {
             self->kr_discovery_candidates_ = candidates;
             self->kr_discovery_ranking_ = data.value("ranking").toObject();
             self->kr_discovery_table_->setRowCount(candidates.size());
+            self->kr_discovery_table_->setHorizontalHeaderLabels(
+                {self->tr("Rank"), self->tr("Ticker"), self->tr("Company"), self->tr("Market"), self->tr("Score"),
+                 self->tr("Liquidity"), self->tr("Size"), self->tr("Turnover")});
             for (int row = 0; row < candidates.size(); ++row) {
                 const QJsonObject candidate = candidates.at(row).toObject();
                 const QJsonObject instrument = candidate.value("instrument").toObject();
@@ -1028,6 +1064,147 @@ void EquityAnalysisTab::on_kr_discover_clicked() {
         });
 }
 
+void EquityAnalysisTab::on_kr_quant_rank_clicked() {
+    if (!kr_quant_rank_btn_ || !kr_discovery_table_ || !kr_discovery_limit_)
+        return;
+
+    const QDate korea_today = QDateTime::currentDateTimeUtc().toOffsetFromUtc(9 * 60 * 60).date();
+    if (kr_discovery_date_)
+        kr_discovery_date_->setMaximumDate(korea_today);
+    const QDate analysis_date = kr_discovery_date_ ? kr_discovery_date_->date() : korea_today;
+    if (analysis_date != korea_today) {
+        if (kr_discovery_status_)
+            kr_discovery_status_->setText(
+                tr("KIS Quant Ranking v1 is current-date only. Use discovery/KRX reconstruction for historical dates."));
+        return;
+    }
+
+    int limit = kr_discovery_limit_->value();
+    if (limit > 10)
+        limit = 10;
+    int prefilter_limit = kr_quant_prefilter_limit_ ? kr_quant_prefilter_limit_->value() : 30;
+    if (prefilter_limit < limit)
+        prefilter_limit = limit;
+    const QString quant_profile = kr_quant_profile_ ? kr_quant_profile_->currentData().toString()
+                                                    : QStringLiteral("balanced");
+    const QString discovery_profile = kr_discovery_profile_ ? kr_discovery_profile_->currentData().toString()
+                                                             : QStringLiteral("balanced");
+    const QString market = kr_discovery_market_ ? kr_discovery_market_->currentData().toString()
+                                                : QStringLiteral("ALL");
+    const qint64 min_trading_value_krw = kr_discovery_min_value_
+                                             ? static_cast<qint64>(kr_discovery_min_value_->value() * 100000000.0)
+                                             : 0;
+
+    kr_quant_rank_btn_->setEnabled(false);
+    if (kr_discover_btn_)
+        kr_discover_btn_->setEnabled(false);
+    if (kr_discovery_research_btn_)
+        kr_discovery_research_btn_->setEnabled(false);
+    if (kr_discovery_batch_btn_)
+        kr_discovery_batch_btn_->setEnabled(false);
+    if (kr_discovery_status_)
+        kr_discovery_status_->setText(tr("Running bounded KIS Quant Ranking…"));
+    kr_discovery_table_->setRowCount(0);
+    kr_discovery_candidates_ = {};
+    kr_discovery_ranking_ = {};
+    kr_discovery_quant_mode_ = true;
+    if (kr_discovery_result_)
+        kr_discovery_result_->clear();
+
+    python::PythonRunner::RunOptions run_opts;
+    run_opts.timeout_ms = 5 * 60 * 1000;
+    QStringList script_args{
+        "quant-rank",
+        "--limit", QString::number(limit),
+        "--prefilter-limit", QString::number(prefilter_limit),
+        "--lookback-days", "120",
+        "--analysis-date", analysis_date.toString(Qt::ISODate),
+        "--profile", quant_profile,
+        "--discovery-profile", discovery_profile,
+        "--min-trading-value-krw", QString::number(min_trading_value_krw),
+    };
+    if (market != QLatin1String("ALL"))
+        script_args << "--market" << market;
+
+    QPointer<EquityAnalysisTab> self(this);
+    python::PythonRunner::instance().run_with_options(
+        "personal_kr_terminal.py", script_args, run_opts,
+        [self](python::PythonResult result) {
+            if (!self)
+                return;
+            if (self->kr_quant_rank_btn_)
+                self->kr_quant_rank_btn_->setEnabled(true);
+            if (self->kr_discover_btn_)
+                self->kr_discover_btn_->setEnabled(true);
+            if (!result.success) {
+                if (self->kr_discovery_status_)
+                    self->kr_discovery_status_->setText(self->tr("KIS Quant Ranking unavailable: %1").arg(result.error));
+                return;
+            }
+
+            const QJsonDocument doc = QJsonDocument::fromJson(python::extract_json(result.output).toUtf8());
+            if (!doc.isObject() || !doc.object().value("success").toBool(false)) {
+                const QString error = doc.isObject() ? doc.object().value("error").toString() : result.output;
+                if (self->kr_discovery_status_)
+                    self->kr_discovery_status_->setText(self->tr("KIS Quant Ranking unavailable: %1").arg(error));
+                return;
+            }
+
+            const QJsonObject data = doc.object().value("data").toObject();
+            if (data.value("execution_mode").toString() != QLatin1String("research_only")) {
+                if (self->kr_discovery_status_)
+                    self->kr_discovery_status_->setText(self->tr("Unexpected KIS Quant execution mode"));
+                return;
+            }
+            const QJsonArray candidates = data.value("candidates").toArray();
+            self->kr_discovery_candidates_ = candidates;
+            self->kr_discovery_ranking_ = data.value("ranking").toObject();
+            self->kr_discovery_quant_mode_ = true;
+            self->kr_discovery_table_->setRowCount(candidates.size());
+            self->kr_discovery_table_->setHorizontalHeaderLabels(
+                {self->tr("Rank"), self->tr("Ticker"), self->tr("Company"), self->tr("Market"), self->tr("Score"),
+                 self->tr("Momentum"), self->tr("Flow"), self->tr("Fundamental")});
+            for (int row = 0; row < candidates.size(); ++row) {
+                const QJsonObject candidate = candidates.at(row).toObject();
+                const QJsonObject instrument = candidate.value("instrument").toObject();
+                const QJsonObject factors = candidate.value("factors").toObject();
+                const QStringList values{
+                    QString::number(candidate.value("rank").toInt(row + 1)),
+                    instrument.value("ticker").toString(),
+                    instrument.value("name").toString(),
+                    instrument.value("market").toString(),
+                    QString::number(candidate.value("score").toDouble(), 'f', 2),
+                    QString::number(factors.value("momentum_score").toDouble(), 'f', 1),
+                    QString::number(factors.value("flow_score").toDouble(), 'f', 1),
+                    QString::number(factors.value("fundamental_score").toDouble(), 'f', 1),
+                };
+                for (int col = 0; col < values.size(); ++col)
+                    self->kr_discovery_table_->setItem(row, col, new QTableWidgetItem(values.at(col)));
+            }
+            if (!candidates.isEmpty()) {
+                self->kr_discovery_table_->selectRow(0);
+                if (self->kr_discovery_research_btn_)
+                    self->kr_discovery_research_btn_->setEnabled(true);
+                if (self->kr_discovery_batch_btn_ && !self->kr_discovery_ranking_.isEmpty())
+                    self->kr_discovery_batch_btn_->setEnabled(true);
+            }
+            if (self->kr_discovery_status_) {
+                const int market_errors = data.value("market_errors").toObject().size();
+                const int flow_errors = data.value("flow_errors").toObject().size();
+                const int fundamental_errors = data.value("fundamental_errors").toObject().size();
+                self->kr_discovery_status_->setText(
+                    self->tr("Completed KIS Quant | %1 | prefilter %2 | scored %3 | Top %4 | %5 market / %6 flow / %7 DART warning(s) | research_only")
+                        .arg(data.value("scoring_profile").toString("balanced"))
+                        .arg(data.value("prefilter_count").toInt())
+                        .arg(data.value("feature_record_count").toInt())
+                        .arg(candidates.size())
+                        .arg(market_errors)
+                        .arg(flow_errors)
+                        .arg(fundamental_errors));
+            }
+        });
+}
+
 void EquityAnalysisTab::on_kr_discovery_research_clicked() {
     if (!kr_discovery_table_ || !kr_discovery_research_btn_ || !kr_discovery_result_)
         return;
@@ -1042,7 +1219,8 @@ void EquityAnalysisTab::on_kr_discovery_research_clicked() {
         kr_discovery_status_->setText(tr("Selected discovery row has no research payload."));
         return;
     }
-    payload["strategy_id"] = "personal-kr-discovery-ui";
+    payload["strategy_id"] = kr_discovery_quant_mode_ ? "personal-kr-quant-ui"
+                                                       : "personal-kr-discovery-ui";
     const QJsonObject llm = fincept::services::equity::personal_kr_active_llm_config();
     if (!llm.isEmpty())
         payload["llm"] = llm;
@@ -1052,6 +1230,8 @@ void EquityAnalysisTab::on_kr_discovery_research_clicked() {
     const QString name = instrument.value("name").toString();
     kr_discovery_research_btn_->setEnabled(false);
     kr_discover_btn_->setEnabled(false);
+    if (kr_quant_rank_btn_)
+        kr_quant_rank_btn_->setEnabled(false);
     kr_discovery_status_->setText(tr("Running selected KR AI research: %1 %2…").arg(ticker, name));
     kr_discovery_result_->setPlainText(tr("Collecting point-in-time provider data and running the research chain…"));
 
@@ -1066,6 +1246,8 @@ void EquityAnalysisTab::on_kr_discovery_research_clicked() {
                 return;
             if (self->kr_discover_btn_)
                 self->kr_discover_btn_->setEnabled(true);
+            if (self->kr_quant_rank_btn_)
+                self->kr_quant_rank_btn_->setEnabled(true);
             if (self->kr_discovery_research_btn_)
                 self->kr_discovery_research_btn_->setEnabled(!self->kr_discovery_candidates_.isEmpty());
             if (!result.success) {
@@ -1106,13 +1288,16 @@ void EquityAnalysisTab::on_kr_discovery_batch_clicked() {
         return;
 
     QJsonObject payload = kr_discovery_ranking_;
-    payload["strategy_id"] = "personal-kr-discovery-batch-ui";
+    payload["strategy_id"] = kr_discovery_quant_mode_ ? "personal-kr-quant-batch-ui"
+                                                       : "personal-kr-discovery-batch-ui";
     const QJsonObject llm = fincept::services::equity::personal_kr_active_llm_config();
     if (!llm.isEmpty())
         payload["llm"] = llm;
 
     const int requested = payload.value("limit").toInt(5);
     kr_discover_btn_->setEnabled(false);
+    if (kr_quant_rank_btn_)
+        kr_quant_rank_btn_->setEnabled(false);
     if (kr_discovery_research_btn_)
         kr_discovery_research_btn_->setEnabled(false);
     kr_discovery_batch_btn_->setEnabled(false);
@@ -1132,6 +1317,8 @@ void EquityAnalysisTab::on_kr_discovery_batch_clicked() {
                 return;
             if (self->kr_discover_btn_)
                 self->kr_discover_btn_->setEnabled(true);
+            if (self->kr_quant_rank_btn_)
+                self->kr_quant_rank_btn_->setEnabled(true);
             if (self->kr_discovery_research_btn_)
                 self->kr_discovery_research_btn_->setEnabled(!self->kr_discovery_candidates_.isEmpty());
             if (self->kr_discovery_batch_btn_)

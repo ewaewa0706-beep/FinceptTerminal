@@ -23,6 +23,12 @@ from .llm import llm_from_payload
 from .models import KR_DAILY_FINALITY_TIME, Instrument, QuantCandidate, to_jsonable
 from .persistence import DecisionStore
 from .providers import DartClient, EcosClient, KisClient, NaverNewsClient
+from .quant_scoring import (
+    QUANT_PROFILE_NAMES,
+    QuantFeatureRecord,
+    score_quant_records,
+    weights_for_quant_profile,
+)
 from .ranking import candidate_from_mapping, select_top_candidates, select_top_candidates_isolated
 from .discovery_scoring import DISCOVERY_PROFILE_NAMES, score_universe_entries, weights_for_profile
 from .universe import (
@@ -82,6 +88,11 @@ def credential_status(llm_provider: str | None = None) -> dict[str, Any]:
                 else "exact_snapshot_replay_only"
             ),
             "historical_krx_ready": keys["krx"],
+        },
+        "quant_ranking": {
+            "ready": keys["kis"],
+            "mode": "bounded_kis_feature_rank",
+            "historical_mode": "current_date_only",
         },
         "llm": {
             "ready": llm_ready,
@@ -505,6 +516,211 @@ def cmd_discover(args: argparse.Namespace) -> Any:
     }
 
 
+def cmd_quant_rank(args: argparse.Namespace) -> Any:
+    """Bounded KIS feature ranking over the cheap whole-market prefilter.
+
+    v1 is deliberately current-date only. KIS's investor-flow quote does not
+    expose an arbitrary historical date input, so pretending it can reproduce a
+    past cross-section would violate the terminal's PIT contract.
+    """
+
+    analysis_date = date.fromisoformat(args.analysis_date or _korea_today().isoformat())
+    today = _korea_today()
+    if analysis_date != today:
+        raise ValueError(
+            "quant-rank v1 is current-date only because KIS investor flow is not an arbitrary-date historical endpoint"
+        )
+    if not (os.getenv("KIS_APP_KEY") and os.getenv("KIS_APP_SECRET")):
+        raise ValueError("KIS_APP_KEY and KIS_APP_SECRET are required for quant-rank")
+
+    limit = int(args.limit)
+    prefilter_limit = int(args.prefilter_limit)
+    lookback_days = int(args.lookback_days)
+    if limit < 1 or limit > 10:
+        raise ValueError("quant-rank limit must be between 1 and 10")
+    if prefilter_limit < limit or prefilter_limit > 50:
+        raise ValueError("prefilter_limit must be >= limit and <= 50")
+    if lookback_days < 90 or lookback_days > 365:
+        raise ValueError("lookback_days must be between 90 and 365")
+
+    quant_profile = str(args.profile or "balanced")
+    quant_weights = weights_for_quant_profile(quant_profile)
+    discovery_profile = str(args.discovery_profile or "balanced")
+    markets = list(args.market or [])
+    discovery = cmd_discover(
+        argparse.Namespace(
+            analysis_date=analysis_date.isoformat(),
+            market=markets or None,
+            limit=prefilter_limit,
+            min_trading_value_krw=int(args.min_trading_value_krw),
+            profile=discovery_profile,
+        )
+    )
+    upstream_candidates = list(discovery.get("candidates") or [])
+    if not upstream_candidates:
+        raise RuntimeError("whole-market prefilter produced no quant candidates")
+
+    kis = KisClient.from_env()
+    dart = DartClient.from_env() if os.getenv("DART_API_KEY") else None
+    records: list[QuantFeatureRecord] = []
+    market_errors: dict[str, str] = {}
+    flow_errors: dict[str, str] = {}
+    fundamental_errors: dict[str, str] = {}
+    for candidate in upstream_candidates[:prefilter_limit]:
+        instrument = candidate.instrument
+        try:
+            market_snapshot = kis.daily_bars(
+                instrument,
+                analysis_date,
+                lookback_days=lookback_days,
+                price_mode="original",
+            )
+        except Exception as exc:
+            market_errors[instrument.ticker] = _safe_quant_error(exc)
+            continue
+
+        flow_snapshot = None
+        try:
+            flow_snapshot = kis.investor_flow(instrument, analysis_date)
+        except Exception as exc:
+            flow_errors[instrument.ticker] = _safe_quant_error(exc)
+
+        fundamentals_snapshot = None
+        if dart is not None:
+            try:
+                fundamentals_snapshot = dart.fundamentals(instrument, analysis_date)
+            except Exception as exc:
+                fundamental_errors[instrument.ticker] = _safe_quant_error(exc)
+
+        records.append(
+            QuantFeatureRecord(
+                instrument=instrument,
+                analysis_date=analysis_date,
+                market=market_snapshot,
+                flow=flow_snapshot,
+                fundamentals=fundamentals_snapshot,
+            )
+        )
+
+    if not records:
+        raise RuntimeError("quant-rank could not load market features for any prefiltered ticker")
+
+    candidates, feature_rows = score_quant_records(
+        records,
+        analysis_date,
+        limit=limit,
+        weights=quant_weights,
+    )
+    if not candidates:
+        raise RuntimeError("quant-rank produced no scored candidates")
+
+    selected_tickers = {candidate.instrument.ticker for candidate in candidates}
+    selected_feature_rows = [
+        row for row in feature_rows if str(row.get("ticker") or "") in selected_tickers
+    ]
+    feature_payload_hash = hashlib.sha256(
+        json.dumps(
+            feature_rows,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    generated_at = _korea_now()
+    # The ranking itself is an observed current-date artifact. Individual feature
+    # vintages are frozen per row as market/flow/fundamental_data_as_of.
+    ranking_data_as_of = analysis_date
+    ranking_source = (
+        f"fincept-kis-feature-quant-v1/{quant_profile}"
+        f";upstream_sha256={discovery['ranking_payload_hash']}"
+        f";features_sha256={feature_payload_hash}"
+    )
+    rows_by_ticker = {str(row["ticker"]): row for row in selected_feature_rows}
+    ranking_rows = [
+        {
+            "ticker": candidate.instrument.ticker,
+            "name": candidate.instrument.name,
+            "market": candidate.instrument.market,
+            "score": candidate.score,
+            "rank": candidate.rank,
+            **{
+                key: value
+                for key, value in rows_by_ticker[candidate.instrument.ticker].items()
+                if key not in {"ticker", "name", "market", "score"}
+            },
+        }
+        for candidate in candidates
+    ]
+    ranking_payload = {
+        "analysis_date": analysis_date.isoformat(),
+        "ranking_source": ranking_source,
+        "ranking_generated_at": generated_at.isoformat(),
+        "ranking_mode": "observed",
+        "ranking_data_as_of": ranking_data_as_of.isoformat(),
+        "limit": limit,
+        "rows": ranking_rows,
+    }
+    (
+        frozen_source,
+        frozen_generated_at,
+        ranking_hash,
+        frozen_mode,
+        frozen_data_as_of,
+    ) = _ranking_provenance(ranking_payload, analysis_date)
+    candidates = [
+        replace(
+            candidate,
+            ranking_source=frozen_source,
+            ranking_generated_at=frozen_generated_at,
+            ranking_payload_hash=ranking_hash,
+            analysis_cutoff_at=frozen_generated_at,
+            analysis_cutoff_mode="external",
+            ranking_mode=frozen_mode,
+            ranking_data_as_of=frozen_data_as_of,
+        )
+        for candidate in candidates
+    ]
+    return {
+        "analysis_date": analysis_date,
+        "source": "KIS bounded per-symbol feature ranking",
+        "scoring_model": "kis-feature-quant-v1",
+        "scoring_profile": quant_profile,
+        "scoring_weights": quant_weights.normalized(),
+        "lookback_days": lookback_days,
+        "prefilter_limit": prefilter_limit,
+        "prefilter_count": len(upstream_candidates),
+        "feature_record_count": len(records),
+        "market_errors": market_errors,
+        "flow_errors": flow_errors,
+        "fundamental_errors": fundamental_errors,
+        "dart_enrichment": dart is not None,
+        "upstream_discovery_source": discovery["ranking_source"],
+        "upstream_discovery_hash": discovery["ranking_payload_hash"],
+        "feature_payload_hash": feature_payload_hash,
+        "ranking_source": frozen_source,
+        "ranking_generated_at": frozen_generated_at,
+        "ranking_payload_hash": ranking_hash,
+        "ranking_mode": frozen_mode,
+        "ranking_data_as_of": frozen_data_as_of,
+        "candidates": candidates,
+        "ranking": ranking_payload,
+        "execution_mode": "research_only",
+    }
+
+
+def _safe_quant_error(exc: Exception) -> str:
+    """Bound diagnostics without ever serializing provider credentials or URLs."""
+
+    label = type(exc).__name__
+    message = " ".join(str(exc).split())
+    lowered = message.lower()
+    if any(token in lowered for token in ("appsecret", "app_secret", "api_key", "access_token", "http://", "https://")):
+        return label
+    if len(message) > 180:
+        message = message[:177] + "..."
+    return f"{label}: {message}" if message else label
+
+
 def cmd_analyze() -> Any:
     payload = _input_json()
     result = _engine(payload.get("llm")).analyze(_candidate_from_payload(payload))
@@ -779,6 +995,15 @@ def build_parser() -> argparse.ArgumentParser:
     discover.add_argument("--limit", type=int, default=20)
     discover.add_argument("--min-trading-value-krw", type=int, default=0)
     discover.add_argument("--profile", choices=DISCOVERY_PROFILE_NAMES, default="balanced")
+    quant_rank = sub.add_parser("quant-rank")
+    quant_rank.add_argument("--analysis-date")
+    quant_rank.add_argument("--market", action="append", choices=("KOSPI", "KOSDAQ"))
+    quant_rank.add_argument("--limit", type=int, default=10)
+    quant_rank.add_argument("--prefilter-limit", type=int, default=30)
+    quant_rank.add_argument("--lookback-days", type=int, default=120)
+    quant_rank.add_argument("--min-trading-value-krw", type=int, default=0)
+    quant_rank.add_argument("--profile", choices=QUANT_PROFILE_NAMES, default="balanced")
+    quant_rank.add_argument("--discovery-profile", choices=DISCOVERY_PROFILE_NAMES, default="balanced")
     for name in ("providers-only", "full"):
         p = sub.add_parser(name)
         p.add_argument("--ticker", default="005930")
@@ -821,6 +1046,8 @@ def main(argv: list[str] | None = None) -> int:
             _print(cmd_llm_smoke())
         elif args.command == "discover":
             _print(cmd_discover(args))
+        elif args.command == "quant-rank":
+            _print(cmd_quant_rank(args))
         elif args.command == "providers-only":
             _print(cmd_providers_only(args))
         elif args.command == "full":

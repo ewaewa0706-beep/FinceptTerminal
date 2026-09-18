@@ -178,6 +178,67 @@ std::vector<ToolDef> get_personal_kr_research_tools() {
         tools.push_back(std::move(t));
     }
 
+    // ── kr_quant_rank ───────────────────────────────────────────────────
+    {
+        ToolDef t;
+        t.name = "kr_quant_rank";
+        t.description = "Build a current-date, batch-ready Korean Quant Ranking without an LLM. It first uses the "
+                        "PIT-safe whole-market discovery layer as a bounded prefilter, then fetches KIS daily bars "
+                        "and per-stock foreign/institution flow only for that slice, with optional PIT-safe DART fundamentals. "
+                        "Scores combine momentum, flow, fundamentals, liquidity and inverse volatility. Historical dates are rejected because the "
+                        "KIS investor-flow quote is not an arbitrary-date historical endpoint.";
+        t.category = "equity-research";
+        t.input_schema =
+            ToolSchemaBuilder()
+                .string("analysis_date", "Optional Korean analysis date YYYY-MM-DD; quant-rank v1 requires today")
+                .pattern("^\\d{4}-\\d{2}-\\d{2}$")
+                .integer("limit", "Maximum batch-ready Quant candidates")
+                .default_int(10)
+                .between(1, 10)
+                .integer("prefilter_limit", "Maximum whole-market discovery names receiving per-symbol KIS feature calls")
+                .default_int(30)
+                .between(1, 50)
+                .integer("lookback_days", "KIS daily-price calendar lookback")
+                .default_int(120)
+                .between(90, 365)
+                .integer("min_trading_value_krw", "Minimum discovery-stage trading value in KRW")
+                .default_int(0)
+                .between(0, 2000000000000000LL)
+                .string("profile", "Quant feature scoring profile")
+                .default_str("balanced")
+                .enums({"balanced", "momentum", "flow", "defensive"})
+                .string("discovery_profile", "Upstream whole-market prefilter profile")
+                .default_str("balanced")
+                .enums({"balanced", "liquidity", "large_cap", "active"})
+                .string("market", "Market scope")
+                .default_str("ALL")
+                .enums({"ALL", "KOSPI", "KOSDAQ"})
+                .build();
+        t.default_timeout_ms = kProviderTimeoutMs;
+        t.supports_async = true;
+        t.async_handler = [](const QJsonObject& args, ToolContext ctx,
+                             std::shared_ptr<QPromise<ToolResult>> promise) {
+            QStringList script_args{
+                "quant-rank",
+                "--limit", QString::number(args.value("limit").toInt(10)),
+                "--prefilter-limit", QString::number(args.value("prefilter_limit").toInt(30)),
+                "--lookback-days", QString::number(args.value("lookback_days").toInt(120)),
+                "--min-trading-value-krw",
+                QString::number(args.value("min_trading_value_krw").toInteger(0)),
+                "--profile", args.value("profile").toString("balanced"),
+                "--discovery-profile", args.value("discovery_profile").toString("balanced"),
+            };
+            const QString market = args.value("market").toString("ALL");
+            if (market != QLatin1String("ALL"))
+                script_args << "--market" << market;
+            const QString analysis_date = args.value("analysis_date").toString();
+            if (!analysis_date.isEmpty())
+                script_args << "--analysis-date" << analysis_date;
+            run_kr_tool(script_args, {}, ctx, promise);
+        };
+        tools.push_back(std::move(t));
+    }
+
     // ── kr_llm_smoke ───────────────────────────────────────────────────
     {
         ToolDef t;

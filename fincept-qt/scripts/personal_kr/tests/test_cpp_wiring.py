@@ -19,6 +19,7 @@ class CppWiringTests(unittest.TestCase):
         for name in (
             "kr_research_status",
             "kr_discover_market",
+            "kr_quant_rank",
             "kr_llm_smoke",
             "kr_select_top_candidates",
             "kr_research_batch",
@@ -56,6 +57,7 @@ class CppWiringTests(unittest.TestCase):
         cpp = (QT_ROOT / "src/screens/equity_research/EquityAnalysisTab.cpp").read_text(encoding="utf-8")
         self.assertIn("RUN KR AI DEEP RESEARCH", cpp)
         self.assertIn("DISCOVER KR TOP-N", cpp)
+        self.assertIn("RUN KIS QUANT RANK", cpp)
         self.assertIn("RESEARCH SELECTED", cpp)
         self.assertIn("RESEARCH TOP-N (MAX 10)", cpp)
         self.assertIn('addItem(tr("Balanced"), "balanced")', cpp)
@@ -96,9 +98,15 @@ class CppWiringTests(unittest.TestCase):
         self.assertIn('tr("Size")', cpp)
         self.assertIn('tr("Turnover")', cpp)
         self.assertIn('"discover", "--limit"', cpp)
+        self.assertIn('"quant-rank"', cpp)
+        self.assertIn('"--prefilter-limit"', cpp)
+        self.assertIn('"--discovery-profile"', cpp)
         self.assertIn("kr_discovery_table_", cpp)
-        self.assertIn('payload["strategy_id"] = "personal-kr-discovery-ui"', cpp)
-        self.assertIn('payload["strategy_id"] = "personal-kr-discovery-batch-ui"', cpp)
+        self.assertIn('payload["strategy_id"] = kr_discovery_quant_mode_', cpp)
+        self.assertIn('"personal-kr-discovery-ui"', cpp)
+        self.assertIn('"personal-kr-discovery-batch-ui"', cpp)
+        self.assertIn('"personal-kr-quant-ui"', cpp)
+        self.assertIn('"personal-kr-quant-batch-ui"', cpp)
         self.assertIn('"personal_kr_terminal.py", {"analyze"}', cpp)
         self.assertIn('"personal_kr_terminal.py", {"batch"}', cpp)
         self.assertIn("run_opts.timeout_ms = 60 * 60 * 1000", cpp)
@@ -141,6 +149,19 @@ class CppWiringTests(unittest.TestCase):
         self.assertIn("cross-sectional v2", section)
         self.assertIn('enums({"balanced", "liquidity", "large_cap", "active"})', section)
         self.assertIn('enums({"ALL", "KOSPI", "KOSDAQ"})', section)
+        self.assertNotIn('payload["llm"]', section)
+        self.assertNotIn("paper", section.lower())
+
+    def test_quant_rank_is_bounded_current_only_and_llm_free(self):
+        tools = (QT_ROOT / "src/mcp/tools/PersonalKrResearchTools.cpp").read_text(encoding="utf-8")
+        section = tools.split('t.name = "kr_quant_rank"', 1)[1].split('t.name = "kr_llm_smoke"', 1)[0]
+        self.assertIn('"quant-rank"', section)
+        self.assertIn("current-date", section)
+        self.assertIn("investor-flow", section)
+        self.assertIn('enums({"balanced", "momentum", "flow", "defensive"})', section)
+        self.assertIn('"--prefilter-limit"', section)
+        self.assertIn('"--lookback-days"', section)
+        self.assertIn(".between(1, 50)", section)
         self.assertNotIn('payload["llm"]', section)
         self.assertNotIn("paper", section.lower())
 

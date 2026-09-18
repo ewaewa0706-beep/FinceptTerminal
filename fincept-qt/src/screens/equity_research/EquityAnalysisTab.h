@@ -44,6 +44,7 @@ class EquityAnalysisTab : public QWidget {
   private slots:
     void on_info_loaded(services::equity::StockInfo info);
     void on_kr_discover_clicked();
+    void on_kr_quant_rank_clicked();
     void on_kr_discovery_research_clicked();
     void on_kr_discovery_batch_clicked();
     void on_kr_history_refresh_clicked();
@@ -137,18 +138,22 @@ class EquityAnalysisTab : public QWidget {
     // it invokes the Python research engine and never routes to the order ticket.
     QFrame* kr_discovery_panel_ = nullptr;
     QPushButton* kr_discover_btn_ = nullptr;
+    QPushButton* kr_quant_rank_btn_ = nullptr;
     QPushButton* kr_discovery_research_btn_ = nullptr;
     QPushButton* kr_discovery_batch_btn_ = nullptr;
     QComboBox* kr_discovery_profile_ = nullptr;
+    QComboBox* kr_quant_profile_ = nullptr;
     QComboBox* kr_discovery_market_ = nullptr;
     QDateEdit* kr_discovery_date_ = nullptr;
     QDoubleSpinBox* kr_discovery_min_value_ = nullptr;
     QSpinBox* kr_discovery_limit_ = nullptr;
+    QSpinBox* kr_quant_prefilter_limit_ = nullptr;
     QLabel* kr_discovery_status_ = nullptr;
     QTableWidget* kr_discovery_table_ = nullptr;
     QPlainTextEdit* kr_discovery_result_ = nullptr;
     QJsonArray kr_discovery_candidates_;
     QJsonObject kr_discovery_ranking_;
+    bool kr_discovery_quant_mode_ = false;
 
     QFrame* kr_history_panel_ = nullptr;
     QPushButton* kr_history_refresh_btn_ = nullptr;

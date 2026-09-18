@@ -239,6 +239,48 @@ class ProviderContractTests(unittest.TestCase):
         self.assertEqual(flow.foreign_net_buy, 1200)
         self.assertEqual(flow.institution_net_buy, 900)
 
+    def test_kis_investor_flow_preserves_zero_quantity_and_never_substitutes_amount(self):
+        class ZeroQuantityHttp(KisHttp):
+            def get_json(self, url, **kwargs):
+                if "inquire-investor" in url:
+                    self.get_calls.append((url, kwargs))
+                    return {
+                        "rt_cd": "0",
+                        "output": [{
+                            "stck_bsop_date": "20260916",
+                            "frgn_ntby_qty": "0",
+                            "frgn_ntby_tr_pbmn": "987654321",
+                            "orgn_ntby_qty": "0",
+                            "orgn_ntby_tr_pbmn": "123456789",
+                        }],
+                    }
+                return super().get_json(url, **kwargs)
+
+        client = KisClient("app", "secret", http=ZeroQuantityHttp(), base_url="https://kis.test")
+        flow = client.investor_flow(self.instrument, date(2026, 9, 16))
+        self.assertEqual(flow.foreign_net_buy, 0.0)
+        self.assertEqual(flow.institution_net_buy, 0.0)
+
+    def test_kis_investor_flow_does_not_treat_amount_only_rows_as_share_quantity(self):
+        class AmountOnlyHttp(KisHttp):
+            def get_json(self, url, **kwargs):
+                if "inquire-investor" in url:
+                    self.get_calls.append((url, kwargs))
+                    return {
+                        "rt_cd": "0",
+                        "output": [{
+                            "stck_bsop_date": "20260916",
+                            "frgn_ntby_tr_pbmn": "987654321",
+                            "orgn_ntby_tr_pbmn": "123456789",
+                        }],
+                    }
+                return super().get_json(url, **kwargs)
+
+        client = KisClient("app", "secret", http=AmountOnlyHttp(), base_url="https://kis.test")
+        flow = client.investor_flow(self.instrument, date(2026, 9, 16))
+        self.assertIsNone(flow.foreign_net_buy)
+        self.assertIsNone(flow.institution_net_buy)
+
     def test_kis_200_expired_envelope_refreshes_token_once(self):
         http = KisHttp(first_expired_envelope=True)
         client = KisClient("app", "secret", http=http, base_url="https://kis.test")

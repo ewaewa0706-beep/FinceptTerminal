@@ -42,6 +42,17 @@ def _float(value: Any) -> float | None:
     return parsed if math.isfinite(parsed) else None
 
 
+def _first_numeric_field(row: dict[str, Any], *keys: str) -> float | None:
+    """Return the first present finite numeric field, preserving zero values."""
+    for key in keys:
+        if key not in row:
+            continue
+        value = _float(row.get(key))
+        if value is not None:
+            return value
+    return None
+
+
 def _clean_html(text: str) -> str:
     return unescape(re.sub(r"<[^>]+>", "", text or "")).strip()
 
@@ -373,16 +384,10 @@ class KisClient:
                 selected_date = row_date
         if selected is None or selected_date is None:
             raise RuntimeError(f"KIS returned no investor flow for {instrument.ticker}")
-        foreign = _float(
-            selected.get("frgn_ntby_qty")
-            or selected.get("frgn_ntby_tr_pbmn")
-            or selected.get("frgn_ntby_qty_icdc")
-        )
-        institution = _float(
-            selected.get("orgn_ntby_qty")
-            or selected.get("orgn_ntby_tr_pbmn")
-            or selected.get("orgn_ntby_qty_icdc")
-        )
+        # Keep this snapshot in share-quantity units. A legitimate zero must
+        # not fall through to the KRW trading-amount field.
+        foreign = _first_numeric_field(selected, "frgn_ntby_qty", "frgn_ntby_qty_icdc")
+        institution = _first_numeric_field(selected, "orgn_ntby_qty", "orgn_ntby_qty_icdc")
         return InvestorFlowSnapshot(selected_date, "KIS", foreign, institution)
 
     def volume_rank(self, market: str) -> list[dict[str, Any]]:
