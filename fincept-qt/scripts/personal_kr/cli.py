@@ -24,6 +24,7 @@ from .models import KR_DAILY_FINALITY_TIME, Instrument, QuantCandidate, to_jsona
 from .persistence import DecisionStore
 from .providers import DartClient, EcosClient, KisClient, NaverNewsClient
 from .ranking import candidate_from_mapping, select_top_candidates, select_top_candidates_isolated
+from .universe import KisPublicMasterUniverseProvider, SnapshotAwareUniverseProvider, liquidity_candidates
 
 
 _KST = timezone(timedelta(hours=9))
@@ -63,6 +64,11 @@ def credential_status(llm_provider: str | None = None) -> dict[str, Any]:
         "refresh_mode": "on_demand",
         "execution_mode": "research_only",
         "credentials": keys,
+        "universe": {
+            "current_ready": True,
+            "source": "KIS public master (keyless current snapshot)",
+            "historical_mode": "exact_snapshot_replay_only",
+        },
         "llm": {
             "ready": llm_ready,
             "provider": active_provider or None,
@@ -226,6 +232,88 @@ def cmd_select() -> Any:
     if analysis_date > _korea_today():
         raise ValueError("analysis_date cannot be in the future")
     return select_top_candidates(payload["rows"], analysis_date, int(payload.get("limit", 5)))
+
+
+def cmd_discover(args: argparse.Namespace) -> Any:
+    """Keyless whole-market discovery with immutable exact-date snapshot replay."""
+
+    as_of = date.fromisoformat(args.analysis_date or _korea_today().isoformat())
+    if as_of > _korea_today():
+        raise ValueError("analysis_date cannot be in the future")
+    limit = int(args.limit)
+    if limit < 1 or limit > 200:
+        raise ValueError("discovery limit must be between 1 and 200")
+    min_trading_value_krw = int(args.min_trading_value_krw)
+    if min_trading_value_krw < 0:
+        raise ValueError("min_trading_value_krw must be >= 0")
+    markets = tuple(args.market or ("KOSPI", "KOSDAQ"))
+
+    store = _store()
+    rank_client = KisClient.from_env() if os.getenv("KIS_APP_KEY") and os.getenv("KIS_APP_SECRET") else None
+    provider = SnapshotAwareUniverseProvider(
+        KisPublicMasterUniverseProvider(rank_client=rank_client, today_fn=_korea_today),
+        store,
+        today_fn=_korea_today,
+        now_fn=_korea_now,
+    )
+    entries = provider.get_universe(
+        as_of,
+        markets=markets,
+        min_trading_value_krw=min_trading_value_krw,
+    )
+    candidates = liquidity_candidates(entries, as_of, limit=limit)
+    snapshot = store.get_universe_snapshot(as_of, markets=list(dict.fromkeys(markets)))
+    if snapshot is None:
+        raise RuntimeError("universe snapshot missing after discovery")
+    ranking_source = "fincept-kis-public-master-liquidity-v1"
+    ranked_entries = entries[: len(candidates)]
+    flat_rows = [
+        {
+            "ticker": candidate.instrument.ticker,
+            "name": candidate.instrument.name,
+            "market": candidate.instrument.market,
+            "score": candidate.score,
+            "rank": candidate.rank,
+            "liquidity_source": entry.source,
+            **candidate.factors,
+        }
+        for candidate, entry in zip(candidates, ranked_entries, strict=True)
+    ]
+    rank_overlay_count = sum("volume-rank" in entry.source for entry in entries)
+    ranking_payload = {
+        "analysis_date": as_of.isoformat(),
+        "ranking_source": ranking_source,
+        "ranking_generated_at": snapshot.captured_at.isoformat(),
+        "limit": min(limit, 10),
+        "rows": flat_rows,
+    }
+    frozen_source, frozen_generated_at, ranking_hash = _ranking_provenance(ranking_payload, as_of)
+    candidates = [
+        replace(
+            candidate,
+            ranking_source=frozen_source,
+            ranking_generated_at=frozen_generated_at,
+            ranking_payload_hash=ranking_hash,
+            analysis_cutoff_at=frozen_generated_at,
+            analysis_cutoff_mode="external",
+        )
+        for candidate in candidates
+    ]
+    return {
+        "analysis_date": as_of,
+        "snapshot_entry_count": len(snapshot.entries),
+        "eligible_count": len(entries),
+        "snapshot_hash": snapshot.payload_sha256,
+        "captured_at": snapshot.captured_at,
+        "source": "KIS public master current snapshot / exact PIT replay",
+        "rank_overlay_count": rank_overlay_count,
+        "ranking_source": frozen_source,
+        "ranking_generated_at": frozen_generated_at,
+        "ranking_payload_hash": ranking_hash,
+        "candidates": candidates,
+        "ranking": ranking_payload,
+        "execution_mode": "research_only",
+    }
 
 
 def cmd_analyze() -> Any:
@@ -462,6 +550,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("paper-summary")
     sub.add_parser("paper-trade")
     sub.add_parser("llm-smoke")
+    discover = sub.add_parser("discover")
+    discover.add_argument("--analysis-date")
+    discover.add_argument("--market", action="append", choices=("KOSPI", "KOSDAQ"))
+    discover.add_argument("--limit", type=int, default=20)
+    discover.add_argument("--min-trading-value-krw", type=int, default=0)
     for name in ("providers-only", "full"):
         p = sub.add_parser(name)
         p.add_argument("--ticker", default="005930")
@@ -500,6 +593,8 @@ def main(argv: list[str] | None = None) -> int:
             _print(cmd_paper_trade())
         elif args.command == "llm-smoke":
             _print(cmd_llm_smoke())
+        elif args.command == "discover":
+            _print(cmd_discover(args))
         elif args.command == "providers-only":
             _print(cmd_providers_only(args))
         elif args.command == "full":

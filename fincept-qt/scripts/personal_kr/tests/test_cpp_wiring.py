@@ -18,6 +18,7 @@ class CppWiringTests(unittest.TestCase):
         self.assertGreaterEqual(cmake.count("src/mcp/tools/PersonalKrResearchTools.cpp"), 2)
         for name in (
             "kr_research_status",
+            "kr_discover_market",
             "kr_llm_smoke",
             "kr_select_top_candidates",
             "kr_research_batch",
@@ -52,6 +53,9 @@ class CppWiringTests(unittest.TestCase):
     def test_equity_analysis_has_visible_research_only_entry_point(self):
         cpp = (QT_ROOT / "src/screens/equity_research/EquityAnalysisTab.cpp").read_text(encoding="utf-8")
         self.assertIn("RUN KR AI DEEP RESEARCH", cpp)
+        self.assertIn("DISCOVER KR TOP-N", cpp)
+        self.assertIn('"discover", "--limit"', cpp)
+        self.assertIn("kr_discovery_table_", cpp)
         self.assertIn('"personal_kr_terminal.py"', cpp)
         self.assertIn("research_only", cpp)
         self.assertNotIn("pt_place_order", cpp)
@@ -81,6 +85,15 @@ class CppWiringTests(unittest.TestCase):
         self.assertIn("run_opts.timeout_ms = 20 * 60 * 1000", ui)
         self.assertIn("run_with_options", ui)
 
+    def test_market_discovery_is_keyless_pit_snapshot_tool(self):
+        tools = (QT_ROOT / "src/mcp/tools/PersonalKrResearchTools.cpp").read_text(encoding="utf-8")
+        section = tools.split('t.name = "kr_discover_market"', 1)[1].split('t.name = "kr_llm_smoke"', 1)[0]
+        self.assertIn('"discover"', section)
+        self.assertIn("exact snapshot", section)
+        self.assertIn("reference-price", section)
+        self.assertNotIn('payload["llm"]', section)
+        self.assertNotIn("paper", section.lower())
+
     def test_production_batch_is_bounded_to_ten_deep_research_names(self):
         tools = (QT_ROOT / "src/mcp/tools/PersonalKrResearchTools.cpp").read_text(encoding="utf-8")
         batch = tools.split('t.name = "kr_research_batch"', 1)[1].split('t.name = "kr_analyze_stock"', 1)[0]
@@ -95,6 +108,7 @@ class CppWiringTests(unittest.TestCase):
         # contract matrix and the release-style native build. Without the latter,
         # Personal-KR C++/MCP/UI changes can remain uncompiled until merge/release.
         self.assertIn("personal-kr-terminal", python_ci)
+        self.assertIn("EquityAnalysisTab.h", python_ci)
         self.assertIn("branches: [main, personal-kr-terminal]", native_ci)
         for platform in ("windows-2022", "ubuntu-22.04", "macos-15"):
             self.assertIn(platform, native_ci)

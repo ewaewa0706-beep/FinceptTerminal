@@ -129,6 +129,43 @@ std::vector<ToolDef> get_personal_kr_research_tools() {
         tools.push_back(std::move(t));
     }
 
+    // ── kr_discover_market ─────────────────────────────────────────────
+    {
+        ToolDef t;
+        t.name = "kr_discover_market";
+        t.description = "Discover a PIT-safe KOSPI/KOSDAQ Top-N shortlist from the keyless KIS public master. "
+                        "Today's full canonical universe is frozen first-write-wins; historical requests only replay "
+                        "an exact snapshot captured on that date. The liquidity score is a deterministic "
+                        "reference-price × previous-volume proxy, not an LLM market scan.";
+        t.category = "equity-research";
+        t.input_schema =
+            ToolSchemaBuilder()
+                .string("analysis_date", "Optional Korean analysis date YYYY-MM-DD; defaults to today")
+                .pattern("^\\d{4}-\\d{2}-\\d{2}$")
+                .integer("limit", "Maximum discovery candidates returned")
+                .default_int(20)
+                .between(1, 200)
+                .integer("min_trading_value_krw", "Minimum previous-day liquidity proxy in KRW")
+                .default_int(0)
+                .between(0, 2000000000000000LL)
+                .build();
+        t.default_timeout_ms = kProviderTimeoutMs;
+        t.supports_async = true;
+        t.async_handler = [](const QJsonObject& args, ToolContext ctx,
+                             std::shared_ptr<QPromise<ToolResult>> promise) {
+            QStringList script_args{
+                "discover", "--limit", QString::number(args.value("limit").toInt(20)),
+                "--min-trading-value-krw",
+                QString::number(args.value("min_trading_value_krw").toInteger(0)),
+            };
+            const QString analysis_date = args.value("analysis_date").toString();
+            if (!analysis_date.isEmpty())
+                script_args << "--analysis-date" << analysis_date;
+            run_kr_tool(script_args, {}, ctx, promise);
+        };
+        tools.push_back(std::move(t));
+    }
+
     // ── kr_llm_smoke ───────────────────────────────────────────────────
     {
         ToolDef t;

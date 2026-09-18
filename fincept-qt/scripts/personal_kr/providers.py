@@ -64,6 +64,8 @@ def _safe_provider_message(exc: Exception) -> str:
 
 class KisClient:
     BASE = "https://openapi.koreainvestment.com:9443"
+    VOLUME_RANK_PATH = "/uapi/domestic-stock/v1/quotations/volume-rank"
+    VOLUME_RANK_TR_ID = "FHPST01710000"
 
     def __init__(
         self,
@@ -383,6 +385,38 @@ class KisClient:
         )
         return InvestorFlowSnapshot(selected_date, "KIS", foreign, institution)
 
+    def volume_rank(self, market: str) -> list[dict[str, Any]]:
+        """Return KIS's current trading-value rank for KOSPI or KOSDAQ.
+
+        This endpoint is current-only. Historical safety is enforced by the
+        universe layer, which never calls it for a past analysis date.
+        """
+
+        market_code = {"KOSPI": "0001", "KOSDAQ": "1001"}.get(str(market).upper().strip())
+        if market_code is None:
+            raise ValueError("KIS volume rank market must be KOSPI or KOSDAQ")
+        payload = self._get(
+            self.VOLUME_RANK_PATH,
+            self.VOLUME_RANK_TR_ID,
+            {
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_COND_SCR_DIV_CODE": "20171",
+                "FID_INPUT_ISCD": market_code,
+                "FID_DIV_CLS_CODE": "1",
+                "FID_BLNG_CLS_CODE": "3",
+                "FID_TRGT_CLS_CODE": "0",
+                "FID_TRGT_EXLS_CLS_CODE": "0",
+                "FID_INPUT_PRICE_1": "",
+                "FID_INPUT_PRICE_2": "",
+                "FID_VOL_CNT": "",
+                "FID_INPUT_DATE_1": "",
+            },
+        )
+        rows = payload.get("output") or []
+        if not isinstance(rows, list):
+            raise ValueError("KIS volume-rank output is not a list")
+        return rows
+
 
 class DartClient:
     BASE = "https://opendart.fss.or.kr/api"
@@ -693,12 +727,20 @@ class EcosClient:
         "usdkrw": ("731Y001", "D", "0000001"),
     }
 
-    def __init__(self, api_key: str, *, http: RetryHttpClient | None = None, base_url: str | None = None) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        http: RetryHttpClient | None = None,
+        base_url: str | None = None,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
         if not api_key:
             raise ValueError("ECOS_API_KEY is required")
         self.api_key = api_key
         self.http = http or RetryHttpClient()
         self.base_url = (base_url or self.BASE).rstrip("/")
+        self._now = now or (lambda: datetime.now(timezone(timedelta(hours=9))))
 
     @classmethod
     def from_env(cls, **kwargs: Any) -> "EcosClient":
@@ -801,7 +843,7 @@ class EcosClient:
         return best
 
     def macro(self, as_of: date) -> MacroSnapshot:
-        korea_today = datetime.now(timezone(timedelta(hours=9))).date()
+        korea_today = self._now().astimezone(timezone(timedelta(hours=9))).date()
         if as_of < korea_today:
             raise RuntimeError("ECOS historical macro is non-vintage; point-in-time history unavailable")
         if as_of > korea_today:

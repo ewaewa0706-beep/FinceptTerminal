@@ -7,7 +7,7 @@ brokerage orders.
 ## Workflow
 
 ```text
-External Quant Ranking
+KIS Public Master Universe / External Quant Ranking
         ↓
 Deterministic Top N
         ↓
@@ -53,6 +53,14 @@ the command line. KIS and the LLM are required for a full deep-research run.
 DART, Naver and ECOS are enrichment providers and degrade independently when
 unavailable.
 
+Whole-market discovery itself does not require a KIS API credential. The
+current KOSPI/KOSDAQ membership is loaded from KIS public master archives.
+Because those archives are current snapshots rather than historical data,
+Personal-KR freezes the full eligible universe once per Korean calendar date
+before request-specific filtering. Historical discovery is allowed only by an
+exact immutable snapshot captured on that same date; today's master is never
+backfilled into a past analysis date.
+
 KIS access tokens are cached under `FINCEPT_DATA_DIR` with an app-key-derived
 filename, expiry check and a small cross-process issuance lock. The cache is
 never used as a substitute for credential validation; expired/invalid tokens are
@@ -68,6 +76,7 @@ Run from `fincept-qt/scripts`.
 ```powershell
 python personal_kr_terminal.py status
 python personal_kr_terminal.py llm-smoke
+python personal_kr_terminal.py discover --limit 20 --min-trading-value-krw 1000000000
 ```
 
 Without stdin, `llm-smoke` uses the headless `GOOGLE_API_KEY` fallback. The
@@ -75,6 +84,18 @@ desktop/MCP path instead sends the currently active Fincept LLM profile over
 stdin, so OpenAI/Anthropic/Gemini/OpenRouter/Fincept and the other configured
 providers are smoke-tested with the same provider/model used by deep research.
 Credentials are never placed on argv and are not returned in the smoke result.
+
+`discover` returns a deterministic Top-N liquidity shortlist plus a normal
+Fincept ranking envelope (`ranking_source`, timezone-aware
+`ranking_generated_at`, canonical payload hash and flat ranking rows). Without
+KIS credentials the score uses the public master's `reference_price ×
+previous_volume` as a clearly labeled previous-day liquidity proxy. When KIS
+credentials are configured, positive current trading-value-rank values overlay
+matching public-master members; zero pre-market values and rank-endpoint errors
+fall back to the proxy. This is a prefilter/discovery signal, not an LLM
+whole-market scan. The returned ranking envelope can be sent through the
+existing production `batch` path, which applies the same immutable ranking
+provenance and `research_only` safeguards as an external quant ranking.
 
 External Quant Ranking → Top N selection uses JSON over stdin:
 
@@ -169,9 +190,18 @@ For Korean symbols (`005930.KS`, `247540.KQ`, or a six-digit listing code), the
 existing **Equity Research → Analysis** tab shows **RUN KR AI DEEP RESEARCH**.
 The result is displayed in the same tab and remains research-only.
 
+The same Analysis tab also exposes an always-visible **KR MARKET DISCOVERY**
+panel. **DISCOVER KR TOP-N** loads the current KOSPI/KOSDAQ public-master
+universe, freezes/reuses the PIT snapshot, and renders the deterministic Top-N
+shortlist without invoking the LLM or any order path. If KIS credentials are
+configured, positive current trading-value-rank rows are overlaid on the public
+master membership; KIS rank failure or zero pre-market values fall back to the
+previous-day public-master liquidity proxy.
+
 Internal MCP/agent tools:
 
 - `kr_research_status`
+- `kr_discover_market`
 - `kr_llm_smoke`
 - `kr_select_top_candidates`
 - `kr_research_batch`
@@ -195,6 +225,10 @@ than a side effect of research.
   request timestamp as `analysis_cutoff_at`. Immediate requests are tagged
   `analysis_cutoff_mode=live_request`; explicit older/external timestamps are
   treated as strict external PIT cutoffs;
+- keyless whole-market membership is current-only. The full current KIS public
+  master universe is captured first-write-wins before liquidity thresholds or
+  Top-N slicing; historical requests require an exact same-date snapshot and
+  fail closed when none exists;
 - market bars newer than the analysis cutoff are rejected. KIS daily price and
   investor-flow endpoints expose date-level data without a finality timestamp;
   before the conservative 17:00 KST daily-finality boundary the same calendar

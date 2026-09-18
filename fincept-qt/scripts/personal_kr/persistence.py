@@ -13,7 +13,8 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from .evaluation import Outcome
-from .models import KR_DAILY_FINALITY_TIME, ResearchResult, to_jsonable, validate_ticker
+from .models import KR_DAILY_FINALITY_TIME, Instrument, ResearchResult, to_jsonable, validate_ticker
+from .universe import KST, UniverseEntry, UniverseSnapshot
 
 
 class DecisionStore:
@@ -93,6 +94,18 @@ class DecisionStore:
                     payload TEXT NOT NULL,
                     reason TEXT NOT NULL,
                     quarantined_at TEXT NOT NULL
+                    )"""
+                )
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS kr_universe_snapshots(
+                    snapshot_date TEXT NOT NULL,
+                    markets_json TEXT NOT NULL,
+                    common_only INTEGER NOT NULL,
+                    exclude_spac INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    payload_sha256 TEXT NOT NULL,
+                    captured_at TEXT NOT NULL,
+                    PRIMARY KEY(snapshot_date,markets_json,common_only,exclude_spac)
                 )"""
                 )
                 columns = {row[1] for row in conn.execute("PRAGMA table_info(kr_paper_trades)")}
@@ -100,6 +113,99 @@ class DecisionStore:
                     conn.execute("ALTER TABLE kr_paper_trades ADD COLUMN client_trade_id TEXT")
                 self._migrate_outcome_provenance(conn)
                 self._migrate_paper_provenance(conn)
+
+    def record_universe_snapshot(
+        self,
+        *,
+        snapshot_date: date,
+        markets: tuple[str, ...] | list[str],
+        entries: list[UniverseEntry],
+        common_only: bool = True,
+        exclude_spac: bool = True,
+        captured_at: datetime | None = None,
+    ) -> UniverseSnapshot:
+        """Freeze today's canonical universe; an existing first write always wins."""
+
+        market_scope = _normalize_snapshot_markets(markets)
+        if not entries:
+            raise ValueError("universe snapshot entries cannot be empty")
+        if len({entry.instrument.ticker for entry in entries}) != len(entries):
+            raise ValueError("universe snapshot contains duplicate tickers")
+        if {entry.instrument.market for entry in entries} != set(market_scope):
+            raise ValueError("universe snapshot entries must cover exactly the requested market scope")
+        if {entry.as_of for entry in entries} != {snapshot_date}:
+            raise ValueError("universe snapshot entries must match snapshot_date exactly")
+
+        captured = captured_at or datetime.now(KST)
+        if captured.tzinfo is None or captured.utcoffset() is None:
+            raise ValueError("universe snapshot captured_at must be timezone-aware")
+        if captured.astimezone(KST).date() != snapshot_date:
+            raise ValueError("universe snapshots can only be captured on the matching Korean calendar date")
+
+        markets_json = _canonical_json(list(market_scope))
+        envelope = {
+            "snapshot_date": snapshot_date.isoformat(),
+            "markets": list(market_scope),
+            "common_only": bool(common_only),
+            "exclude_spac": bool(exclude_spac),
+            "entries": to_jsonable(entries),
+        }
+        payload = _canonical_json(envelope)
+        payload_sha256 = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        captured_utc = captured.astimezone(timezone.utc).isoformat()
+
+        with closing(self._connect()) as conn:
+            with conn:
+                conn.execute("BEGIN IMMEDIATE")
+                existing = conn.execute(
+                    """SELECT * FROM kr_universe_snapshots
+                    WHERE snapshot_date=? AND markets_json=? AND common_only=? AND exclude_spac=?""",
+                    (snapshot_date.isoformat(), markets_json, int(common_only), int(exclude_spac)),
+                ).fetchone()
+                if existing is not None:
+                    return _universe_snapshot_from_row(existing)
+                conn.execute(
+                    """INSERT INTO kr_universe_snapshots(
+                    snapshot_date,markets_json,common_only,exclude_spac,payload,payload_sha256,captured_at
+                    ) VALUES(?,?,?,?,?,?,?)""",
+                    (
+                        snapshot_date.isoformat(),
+                        markets_json,
+                        int(common_only),
+                        int(exclude_spac),
+                        payload,
+                        payload_sha256,
+                        captured_utc,
+                    ),
+                )
+                row = conn.execute(
+                    """SELECT * FROM kr_universe_snapshots
+                    WHERE snapshot_date=? AND markets_json=? AND common_only=? AND exclude_spac=?""",
+                    (snapshot_date.isoformat(), markets_json, int(common_only), int(exclude_spac)),
+                ).fetchone()
+        if row is None:
+            raise RuntimeError("universe snapshot was not readable after creation")
+        return _universe_snapshot_from_row(row)
+
+    def get_universe_snapshot(
+        self,
+        snapshot_date: date,
+        *,
+        markets: tuple[str, ...] | list[str],
+        common_only: bool = True,
+        exclude_spac: bool = True,
+    ) -> UniverseSnapshot | None:
+        """Read only an exact captured date/scope; nearest-date fallback is forbidden."""
+
+        market_scope = _normalize_snapshot_markets(markets)
+        markets_json = _canonical_json(list(market_scope))
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """SELECT * FROM kr_universe_snapshots
+                WHERE snapshot_date=? AND markets_json=? AND common_only=? AND exclude_spac=?""",
+                (snapshot_date.isoformat(), markets_json, int(common_only), int(exclude_spac)),
+            ).fetchone()
+        return _universe_snapshot_from_row(row) if row is not None else None
 
     def _migrate_outcome_provenance(self, conn: sqlite3.Connection) -> None:
         """Quarantine legacy outcomes that cannot satisfy the immutable provenance contract.
@@ -771,6 +877,83 @@ def _is_sha256(value: str | None) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _normalize_snapshot_markets(markets: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    requested = set(str(market).upper().strip() for market in markets)
+    if not requested:
+        raise ValueError("universe snapshot markets cannot be empty")
+    unsupported = sorted(market for market in requested if market not in {"KOSPI", "KOSDAQ"})
+    if unsupported:
+        raise ValueError(f"unsupported universe snapshot markets: {unsupported}")
+    return tuple(market for market in ("KOSPI", "KOSDAQ") if market in requested)
+
+
+def _universe_snapshot_from_row(row: sqlite3.Row) -> UniverseSnapshot:
+    payload_text = str(row["payload"])
+    expected_hash = str(row["payload_sha256"])
+    actual_hash = hashlib.sha256(payload_text.encode("utf-8")).hexdigest()
+    if actual_hash != expected_hash:
+        raise ValueError("universe snapshot payload hash mismatch")
+    try:
+        payload = json.loads(payload_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("invalid universe snapshot payload") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("entries"), list):
+        raise ValueError("invalid universe snapshot payload")
+    snapshot_date = date.fromisoformat(str(payload["snapshot_date"]))
+    markets = _normalize_snapshot_markets(list(payload.get("markets") or []))
+    if snapshot_date.isoformat() != row["snapshot_date"]:
+        raise ValueError("universe snapshot date does not match row key")
+    if _canonical_json(list(markets)) != row["markets_json"]:
+        raise ValueError("universe snapshot market scope does not match row key")
+    if bool(payload.get("common_only")) != bool(row["common_only"]):
+        raise ValueError("universe snapshot common_only does not match row key")
+    if bool(payload.get("exclude_spac")) != bool(row["exclude_spac"]):
+        raise ValueError("universe snapshot exclude_spac does not match row key")
+
+    entries: list[UniverseEntry] = []
+    for item in payload["entries"]:
+        if not isinstance(item, dict) or not isinstance(item.get("instrument"), dict):
+            raise ValueError("invalid universe snapshot entry")
+        instrument = item["instrument"]
+        entries.append(
+            UniverseEntry(
+                instrument=Instrument(
+                    instrument["ticker"],
+                    instrument["name"],
+                    instrument["market"],
+                    instrument.get("currency", "KRW"),
+                ),
+                as_of=date.fromisoformat(item["as_of"]),
+                listed_on=date.fromisoformat(item["listed_on"]) if item.get("listed_on") else None,
+                listed_shares=item.get("listed_shares"),
+                volume=item.get("volume"),
+                trading_value_krw=item.get("trading_value_krw"),
+                market_cap_krw=item.get("market_cap_krw"),
+                source=item.get("source") or "",
+            )
+        )
+    if not entries:
+        raise ValueError("universe snapshot contains no entries")
+    if {entry.as_of for entry in entries} != {snapshot_date}:
+        raise ValueError("universe snapshot entry dates do not match snapshot_date")
+    captured_at = datetime.fromisoformat(str(row["captured_at"]))
+    if captured_at.tzinfo is None:
+        raise ValueError("universe snapshot captured_at must be timezone-aware")
+    return UniverseSnapshot(
+        snapshot_date=snapshot_date,
+        markets=markets,
+        common_only=bool(row["common_only"]),
+        exclude_spac=bool(row["exclude_spac"]),
+        entries=tuple(entries),
+        payload_sha256=expected_hash,
+        captured_at=captured_at,
+    )
 
 
 def _outcome_finality_error(outcome: Outcome) -> str | None:

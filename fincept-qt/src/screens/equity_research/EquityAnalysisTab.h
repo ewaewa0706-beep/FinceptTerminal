@@ -15,6 +15,8 @@
 class QFrame;
 class QPlainTextEdit;
 class QPushButton;
+class QSpinBox;
+class QTableWidget;
 
 namespace fincept::screens {
 
@@ -36,6 +38,7 @@ class EquityAnalysisTab : public QWidget {
 
   private slots:
     void on_info_loaded(services::equity::StockInfo info);
+    void on_kr_discover_clicked();
     void on_kr_research_clicked();
 
   protected:
@@ -67,6 +70,7 @@ class EquityAnalysisTab : public QWidget {
     // ── Build ───────────────────────────────────────────────────────────────
     void build_ui();
     QFrame* build_hero_();
+    QFrame* build_kr_discovery_panel_();
     QFrame* build_kr_research_panel_();
     VerdictCard build_verdict_card_(QWidget* parent_grid_cell, const char* title_key, const QString& accent);
     void retranslateUi();
@@ -115,6 +119,12 @@ class EquityAnalysisTab : public QWidget {
 
     // Personal Korean-market AI research. This is deliberately research-only:
     // it invokes the Python research engine and never routes to the order ticket.
+    QFrame* kr_discovery_panel_ = nullptr;
+    QPushButton* kr_discover_btn_ = nullptr;
+    QSpinBox* kr_discovery_limit_ = nullptr;
+    QLabel* kr_discovery_status_ = nullptr;
+    QTableWidget* kr_discovery_table_ = nullptr;
+
     QFrame* kr_panel_ = nullptr;
     QPushButton* kr_research_btn_ = nullptr;
     QLabel* kr_status_ = nullptr;

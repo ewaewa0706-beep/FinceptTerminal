@@ -26,7 +26,9 @@
 #include <QFontMetrics>
 #include <QFrame>
 #include <QGridLayout>
+#include <QHeaderView>
 #include <QHBoxLayout>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QPainter>
@@ -35,6 +37,8 @@
 #include <QPolygonF>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QSpinBox>
+#include <QTableWidget>
 #include <QVBoxLayout>
 
 #include <algorithm>
@@ -283,6 +287,12 @@ void EquityAnalysisTab::build_ui() {
 
     root->addWidget(grid_host, 1);
 
+    // Whole-market discovery is independent of the symbol currently loaded in
+    // Equity Research. It is a lightweight, keyless prefilter: no LLM, no paper
+    // trade and no live-order path is invoked by this panel.
+    kr_discovery_panel_ = build_kr_discovery_panel_();
+    root->addWidget(kr_discovery_panel_);
+
     // Korean-market AI research is an explicit, on-demand action. Keeping it
     // inside the existing Analysis tab avoids adding a parallel screen while
     // still giving users a visible path to the new KIS/DART/Naver/ECOS engine.
@@ -294,6 +304,112 @@ void EquityAnalysisTab::build_ui() {
     auto* ol = new QVBoxLayout(this);
     ol->setContentsMargins(0, 0, 0, 0);
     ol->addWidget(scroll);
+}
+
+QFrame* EquityAnalysisTab::build_kr_discovery_panel_() {
+    auto* panel = make_panel_(QT_TR_NOOP("KR MARKET DISCOVERY"), ui::colors::AMBER());
+    auto* vl = static_cast<QVBoxLayout*>(panel->layout());
+
+    auto* description = new QLabel(
+        tr("PIT-safe KOSPI/KOSDAQ Top-N discovery. Uses the keyless KIS public master and, when configured, "
+           "current KIS trading-value rank. Discovery is research-only and does not run the LLM or submit orders."));
+    description->setWordWrap(true);
+    vl->addWidget(description);
+
+    auto* controls = new QWidget(nullptr);
+    auto* hl = new QHBoxLayout(controls);
+    hl->setContentsMargins(0, 0, 0, 0);
+    hl->setSpacing(10);
+
+    auto* limit_label = new QLabel(tr("Top N"));
+    hl->addWidget(limit_label);
+    kr_discovery_limit_ = new QSpinBox;
+    kr_discovery_limit_->setRange(1, 50);
+    kr_discovery_limit_->setValue(20);
+    hl->addWidget(kr_discovery_limit_);
+
+    kr_discover_btn_ = new QPushButton(tr("DISCOVER KR TOP-N"));
+    kr_discover_btn_->setCursor(Qt::PointingHandCursor);
+    connect(kr_discover_btn_, &QPushButton::clicked, this, &EquityAnalysisTab::on_kr_discover_clicked);
+    hl->addWidget(kr_discover_btn_);
+
+    kr_discovery_status_ = new QLabel(tr("Keyless current discovery · exact PIT snapshot replay · research_only"));
+    hl->addWidget(kr_discovery_status_, 1);
+    vl->addWidget(controls);
+
+    kr_discovery_table_ = new QTableWidget(0, 5);
+    kr_discovery_table_->setHorizontalHeaderLabels(
+        {tr("Rank"), tr("Ticker"), tr("Company"), tr("Market"), tr("Score")});
+    kr_discovery_table_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+    kr_discovery_table_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
+    kr_discovery_table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    kr_discovery_table_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    kr_discovery_table_->setAlternatingRowColors(true);
+    kr_discovery_table_->setMinimumHeight(260);
+    vl->addWidget(kr_discovery_table_);
+    return panel;
+}
+
+void EquityAnalysisTab::on_kr_discover_clicked() {
+    if (!kr_discover_btn_ || !kr_discovery_table_ || !kr_discovery_limit_)
+        return;
+
+    const int limit = kr_discovery_limit_->value();
+    kr_discover_btn_->setEnabled(false);
+    kr_discovery_status_->setText(tr("Discovering current KOSPI/KOSDAQ universe…"));
+    kr_discovery_table_->setRowCount(0);
+
+    python::PythonRunner::RunOptions run_opts;
+    run_opts.timeout_ms = 5 * 60 * 1000;
+    QPointer<EquityAnalysisTab> self(this);
+    python::PythonRunner::instance().run_with_options(
+        "personal_kr_terminal.py", {"discover", "--limit", QString::number(limit)}, run_opts,
+        [self](python::PythonResult result) {
+            if (!self)
+                return;
+            if (self->kr_discover_btn_)
+                self->kr_discover_btn_->setEnabled(true);
+            if (!result.success) {
+                if (self->kr_discovery_status_)
+                    self->kr_discovery_status_->setText(self->tr("KR market discovery unavailable: %1").arg(result.error));
+                return;
+            }
+
+            const QJsonDocument doc = QJsonDocument::fromJson(python::extract_json(result.output).toUtf8());
+            if (!doc.isObject() || !doc.object().value("success").toBool(false)) {
+                const QString error = doc.isObject() ? doc.object().value("error").toString() : result.output;
+                if (self->kr_discovery_status_)
+                    self->kr_discovery_status_->setText(self->tr("KR market discovery unavailable: %1").arg(error));
+                return;
+            }
+
+            const QJsonObject data = doc.object().value("data").toObject();
+            const QJsonArray candidates = data.value("candidates").toArray();
+            self->kr_discovery_table_->setRowCount(candidates.size());
+            for (int row = 0; row < candidates.size(); ++row) {
+                const QJsonObject candidate = candidates.at(row).toObject();
+                const QJsonObject instrument = candidate.value("instrument").toObject();
+                const QStringList values{
+                    QString::number(candidate.value("rank").toInt(row + 1)),
+                    instrument.value("ticker").toString(),
+                    instrument.value("name").toString(),
+                    instrument.value("market").toString(),
+                    QString::number(candidate.value("score").toDouble(), 'f', 2),
+                };
+                for (int col = 0; col < values.size(); ++col)
+                    self->kr_discovery_table_->setItem(row, col, new QTableWidgetItem(values.at(col)));
+            }
+
+            if (self->kr_discovery_status_) {
+                const int universe_count = data.value("snapshot_entry_count").toInt();
+                const QString hash = data.value("snapshot_hash").toString().left(12);
+                self->kr_discovery_status_->setText(
+                    self->tr("Completed · %1 eligible universe · Top %2 · snapshot %3 · research_only")
+                        .arg(universe_count)
+                        .arg(candidates.size())
+                        .arg(hash));
+            }
+        });
 }
 
 QFrame* EquityAnalysisTab::build_kr_research_panel_() {

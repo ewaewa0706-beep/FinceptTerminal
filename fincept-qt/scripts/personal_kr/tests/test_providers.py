@@ -263,6 +263,52 @@ class ProviderContractTests(unittest.TestCase):
         self.assertEqual(len(http.get_calls), 2)
         self.assertEqual(sleeps, [0.25])
 
+    def test_kis_volume_rank_contract_uses_current_trading_value_endpoint(self):
+        class RankHttp(KisHttp):
+            def get_json(self, url, **kwargs):
+                self.get_calls.append((url, kwargs))
+                if "volume-rank" in url:
+                    return {
+                        "rt_cd": "0",
+                        "output": [
+                            {
+                                "mksc_shrn_iscd": "005930",
+                                "hts_kor_isnm": "삼성전자",
+                                "data_rank": "1",
+                                "acml_tr_pbmn": "123456789",
+                            }
+                        ],
+                    }
+                return super().get_json(url, **kwargs)
+
+        http = RankHttp()
+        client = KisClient("app", "secret", http=http, base_url="https://kis.test")
+        rows = client.volume_rank("KOSPI")
+
+        self.assertEqual(rows[0]["mksc_shrn_iscd"], "005930")
+        url, kwargs = http.get_calls[-1]
+        self.assertTrue(url.endswith("/uapi/domestic-stock/v1/quotations/volume-rank"))
+        self.assertEqual(kwargs["headers"]["tr_id"], "FHPST01710000")
+        self.assertEqual(
+            kwargs["params"],
+            {
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_COND_SCR_DIV_CODE": "20171",
+                "FID_INPUT_ISCD": "0001",
+                "FID_DIV_CLS_CODE": "1",
+                "FID_BLNG_CLS_CODE": "3",
+                "FID_TRGT_CLS_CODE": "0",
+                "FID_TRGT_EXLS_CLS_CODE": "0",
+                "FID_INPUT_PRICE_1": "",
+                "FID_INPUT_PRICE_2": "",
+                "FID_VOL_CNT": "",
+                "FID_INPUT_DATE_1": "",
+            },
+        )
+
+        client.volume_rank("KOSDAQ")
+        self.assertEqual(http.get_calls[-1][1]["params"]["FID_INPUT_ISCD"], "1001")
+
     def test_kis_token_cache_is_reused_across_client_instances(self):
         with tempfile.TemporaryDirectory() as tmp:
             first_http = KisHttp()
@@ -458,7 +504,7 @@ class ProviderContractTests(unittest.TestCase):
             client.news(self.instrument, date(2026, 9, 17))
 
     def test_ecos_partial_series_failure_does_not_abort_snapshot(self):
-        client = EcosClient("ecos", http=EcosHttp(), base_url="https://ecos.test")
+        client = EcosClient("ecos", http=EcosHttp(), base_url="https://ecos.test", now=lambda: self.now_kst)
         snapshot = client.macro(date(2026, 9, 16))
 
         self.assertEqual(snapshot.indicators["bok_base_rate"], 2.5)
@@ -527,7 +573,7 @@ class ProviderContractTests(unittest.TestCase):
             client._series("731Y001", "D", "0000001", date(2026, 9, 16))
 
     def test_ecos_programming_error_is_not_downgraded_to_partial_series(self):
-        client = EcosClient("ecos", http=EcosHttp(), base_url="https://ecos.test")
+        client = EcosClient("ecos", http=EcosHttp(), base_url="https://ecos.test", now=lambda: self.now_kst)
 
         def buggy_series(stat, cycle, item, as_of):
             if item == "0000001":
@@ -539,12 +585,12 @@ class ProviderContractTests(unittest.TestCase):
             client.macro(date(2026, 9, 16))
 
     def test_ecos_http_200_error_envelope_is_not_false_success(self):
-        client = EcosClient("bad", http=EcosErrorHttp(), base_url="https://ecos.test")
+        client = EcosClient("bad", http=EcosErrorHttp(), base_url="https://ecos.test", now=lambda: self.now_kst)
         with self.assertRaisesRegex(RuntimeError, "ECOS unavailable"):
             client.macro(date(2026, 9, 16))
 
     def test_ecos_backdated_history_fails_closed_without_vintage_data(self):
-        client = EcosClient("ecos", http=EcosHttp(), base_url="https://ecos.test")
+        client = EcosClient("ecos", http=EcosHttp(), base_url="https://ecos.test", now=lambda: self.now_kst)
         with self.assertRaisesRegex(RuntimeError, "non-vintage"):
             client.macro(date(2026, 9, 15))
 

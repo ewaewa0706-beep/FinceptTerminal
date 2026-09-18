@@ -12,6 +12,7 @@ from pathlib import Path
 from personal_kr.models import Instrument, QuantCandidate, ResearchResult
 from personal_kr.persistence import DecisionStore
 from personal_kr.evaluation import Outcome
+from personal_kr.universe import KST, UniverseEntry
 
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[2]
@@ -108,6 +109,63 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertTrue(body["success"])
         self.assertEqual(body["data"][0]["instrument"]["name"], "삼성전자")
         self.assertEqual(body["data"][0]["instrument"]["ticker"], "005930")
+
+    def test_historical_discovery_without_exact_snapshot_fails_before_network(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc, body = run_cli(
+                "discover",
+                "--analysis-date",
+                "2020-01-02",
+                "--limit",
+                "5",
+                data_dir=tmp,
+            )
+        self.assertEqual(proc.returncode, 1)
+        self.assertFalse(body["success"])
+        self.assertIn("exact PIT universe snapshot", body["error"])
+
+    def test_historical_discovery_replays_snapshot_with_batch_provenance(self):
+        snapshot_date = date(2026, 9, 15)
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DecisionStore(Path(tmp) / "personal_kr" / "research.db")
+            store.record_universe_snapshot(
+                snapshot_date=snapshot_date,
+                markets=["KOSPI", "KOSDAQ"],
+                entries=[
+                    UniverseEntry(
+                        Instrument("005930", "삼성전자", "KOSPI"),
+                        snapshot_date,
+                        trading_value_krw=300_000_000,
+                        market_cap_krw=400_000_000_000_000,
+                    ),
+                    UniverseEntry(
+                        Instrument("247540", "에코프로비엠", "KOSDAQ"),
+                        snapshot_date,
+                        trading_value_krw=200_000_000,
+                        market_cap_krw=20_000_000_000_000,
+                    ),
+                ],
+                captured_at=datetime(2026, 9, 15, 14, 30, tzinfo=KST),
+            )
+            proc, body = run_cli(
+                "discover",
+                "--analysis-date",
+                snapshot_date.isoformat(),
+                "--limit",
+                "2",
+                data_dir=tmp,
+            )
+
+        self.assertEqual(proc.returncode, 0)
+        self.assertTrue(body["success"])
+        data = body["data"]
+        self.assertEqual(data["snapshot_entry_count"], 2)
+        self.assertEqual(data["candidates"][0]["instrument"]["ticker"], "005930")
+        self.assertEqual(data["candidates"][0]["ranking_source"], "fincept-kis-public-master-liquidity-v1")
+        self.assertEqual(data["candidates"][0]["analysis_cutoff_mode"], "external")
+        self.assertEqual(len(data["ranking_payload_hash"]), 64)
+        self.assertEqual(data["ranking"]["ranking_source"], data["ranking_source"])
+        self.assertEqual(data["ranking"]["rows"][0]["ticker"], "005930")
 
     def test_paper_trade_wrapper_is_idempotent_and_summary_is_consistent(self):
         with tempfile.TemporaryDirectory() as tmp:
