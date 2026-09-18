@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 import tempfile
 import json
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -415,6 +416,106 @@ class QuantCliTests(unittest.TestCase):
             finally:
                 conn.close()
             self.assertEqual(remaining, 0)
+
+    def test_batch_reuses_matching_immutable_decision_without_engine_calls(self):
+        payload = {
+            "analysis_date": TODAY.isoformat(),
+            "ranking_source": "reuse-quant-v1",
+            "ranking_generated_at": NOW.isoformat(),
+            "ranking_mode": "observed",
+            "ranking_data_as_of": TODAY.isoformat(),
+            "limit": 1,
+            "rows": [{"ticker": "005930", "name": "????", "market": "KOSPI", "score": 91}],
+            "strategy_id": "reuse-test",
+            "llm": {"provider": "openai", "model_id": "gpt-test", "api_key": "secret"},
+        }
+        with patch.object(cli, "_korea_now", return_value=NOW):
+            source, generated, payload_hash, mode, data_as_of = cli._ranking_provenance(payload, TODAY)
+        candidates, errors = cli.select_top_candidates_isolated(payload["rows"], TODAY, 1)
+        self.assertEqual(errors, {})
+        candidate = replace(
+            candidates[0],
+            ranking_source=source,
+            ranking_generated_at=generated,
+            ranking_payload_hash=payload_hash,
+            analysis_cutoff_at=generated,
+            analysis_cutoff_mode="external",
+            ranking_mode=mode,
+            ranking_data_as_of=data_as_of,
+        )
+        existing = ResearchResult(
+            candidate=candidate, signal="Hold", market_report="m", fundamentals_report="f",
+            news_macro_report="n", bull_case="b+", bear_case="b-", research_manager="r",
+            trader="t", risk_manager="risk", portfolio_manager="SIGNAL: HOLD",
+            llm_provider="openai", llm_model_id="gpt-test", workflow_version="personal-kr-v1",
+            decision_id="existing-decision", strategy_id="reuse-test",
+        )
+
+        class ReuseStore:
+            def get_decision_by_key(self, **_kwargs):
+                return existing
+            def record_decision(self, *_args, **_kwargs):
+                raise AssertionError("reused decision must not be recorded again")
+
+        with (
+            patch.object(cli, "_store", return_value=ReuseStore()),
+            patch.object(cli, "_korea_today", return_value=TODAY),
+            patch.object(cli, "_korea_now", return_value=NOW),
+            patch.object(cli, "_engine", side_effect=AssertionError("engine must not be constructed")) as engine,
+        ):
+            result = cli._run_batch_payload(payload)
+
+        engine.assert_not_called()
+        self.assertEqual(result["errors"], {})
+        self.assertEqual(result["reused_count"], 1)
+        self.assertEqual(result["reused_tickers"], ["005930"])
+        self.assertEqual(result["results"][0].decision_id, "existing-decision")
+
+    def test_batch_existing_decision_llm_conflict_fails_before_engine_calls(self):
+        payload = {
+            "analysis_date": TODAY.isoformat(),
+            "ranking_source": "reuse-quant-v1",
+            "ranking_generated_at": NOW.isoformat(),
+            "ranking_mode": "observed",
+            "ranking_data_as_of": TODAY.isoformat(),
+            "limit": 1,
+            "rows": [{"ticker": "005930", "name": "????", "market": "KOSPI", "score": 91}],
+            "strategy_id": "reuse-test",
+            "llm": {"provider": "openai", "model_id": "gpt-new", "api_key": "secret"},
+        }
+        with patch.object(cli, "_korea_now", return_value=NOW):
+            source, generated, payload_hash, mode, data_as_of = cli._ranking_provenance(payload, TODAY)
+        candidates, _ = cli.select_top_candidates_isolated(payload["rows"], TODAY, 1)
+        candidate = replace(
+            candidates[0], ranking_source=source, ranking_generated_at=generated,
+            ranking_payload_hash=payload_hash, analysis_cutoff_at=generated, analysis_cutoff_mode="external",
+            ranking_mode=mode, ranking_data_as_of=data_as_of,
+        )
+        existing = ResearchResult(
+            candidate=candidate, signal="Hold", market_report="m", fundamentals_report="f",
+            news_macro_report="n", bull_case="b+", bear_case="b-", research_manager="r",
+            trader="t", risk_manager="risk", portfolio_manager="SIGNAL: HOLD",
+            llm_provider="openai", llm_model_id="gpt-old", workflow_version="personal-kr-v1",
+        )
+
+        class ConflictStore:
+            def get_decision_by_key(self, **_kwargs):
+                return existing
+            def record_decision(self, *_args, **_kwargs):
+                raise AssertionError("conflicting decision must not be recorded")
+
+        with (
+            patch.object(cli, "_store", return_value=ConflictStore()),
+            patch.object(cli, "_korea_today", return_value=TODAY),
+            patch.object(cli, "_korea_now", return_value=NOW),
+            patch.object(cli, "_engine", side_effect=AssertionError("engine must not be constructed")) as engine,
+        ):
+            result = cli._run_batch_payload(payload)
+
+        engine.assert_not_called()
+        self.assertEqual(result["reused_count"], 0)
+        self.assertIn("005930", result["errors"])
+        self.assertIn("provenance conflict", result["errors"]["005930"])
 
     def test_quant_research_reuses_exact_ranking_envelope_and_batch_contract(self):
         quant = {

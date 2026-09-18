@@ -657,6 +657,22 @@ class DecisionStore:
                 )
                 return frozen
 
+    def get_decision_by_key(
+        self,
+        *,
+        strategy_id: str,
+        ticker: str,
+        analysis_date: date,
+    ) -> ResearchResult | None:
+        """Read the immutable decision occupying one first-write-wins key."""
+
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT payload FROM kr_decisions WHERE strategy_id=? AND ticker=? AND analysis_date=?",
+                (str(strategy_id), validate_ticker(ticker), analysis_date.isoformat()),
+            ).fetchone()
+        return _result_from_payload(json.loads(row["payload"])) if row else None
+
     def get_decision(self, decision_id: str) -> ResearchResult | None:
         with closing(self._connect()) as conn:
             row = conn.execute("SELECT payload FROM kr_decisions WHERE id=?", (decision_id,)).fetchone()

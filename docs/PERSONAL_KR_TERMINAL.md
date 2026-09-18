@@ -185,7 +185,10 @@ match the manual two-step workflow. The desktop exposes this as **RUN QUANT + AI
 TOP-N**, and MCP exposes `kr_quant_research`. Completed candidates are persisted
 one by one; a later candidate failure is returned in `errors` without erasing
 earlier decisions. The pipeline remains `research_only` and never submits an
-order.
+order. Re-running the same strategy/ticker/date with the same candidate ranking
+provenance, explicit LLM provider/model and workflow version reuses the existing
+immutable Decision instead of repeating KIS/DART/Naver/LLM calls. Any provenance
+or LLM mismatch fails as a decision conflict before expensive provider/LLM work.
 
 External Quant Ranking → Top N selection uses JSON over stdin:
 

@@ -974,29 +974,78 @@ def _run_batch_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "results": [],
             "input_errors": input_errors,
             "errors": {},
+            "reused_count": 0,
+            "reused_tickers": [],
             "execution_mode": "research_only",
         }
     store = _store()
-    engine = _engine(payload.get("llm"))
+    llm_config = payload.get("llm")
+    requested_llm = _explicit_llm_identity(llm_config)
+    engine: ResearchEngine | None = None
     strategy_id = str(payload.get("strategy_id") or "personal-kr-quant")
     stored = []
     errors: dict[str, str] = {}
+    reused_tickers: list[str] = []
     # Analyze and freeze one candidate at a time. If a later candidate stalls,
     # fails, or the outer subprocess watchdog fires, earlier completed decisions
     # have already been checkpointed in SQLite instead of being lost in memory.
+    # When the exact immutable decision key already exists, an explicit matching
+    # LLM profile lets us prove that rerunning providers/LLM cannot change the
+    # stored outcome. Reuse it instead of paying for duplicate research.
     for candidate in candidates:
+        ticker = candidate.instrument.ticker
         try:
+            decision_lookup = getattr(store, "get_decision_by_key", None)
+            existing = (
+                decision_lookup(
+                    strategy_id=strategy_id,
+                    ticker=ticker,
+                    analysis_date=candidate.analysis_date,
+                )
+                if requested_llm is not None and callable(decision_lookup)
+                else None
+            )
+            if existing is not None:
+                existing_llm = (existing.llm_provider.strip().lower(), existing.llm_model_id.strip())
+                if (
+                    existing.candidate != candidate
+                    or existing_llm != requested_llm
+                    or existing.workflow_version != "personal-kr-v1"
+                ):
+                    raise ValueError(
+                        "decision provenance conflict: an immutable decision already exists for different research inputs"
+                    )
+                stored.append(existing)
+                reused_tickers.append(ticker)
+                continue
+
+            if engine is None:
+                engine = _engine(llm_config)
             result = engine.analyze(candidate)
             stored.append(store.record_decision(result, strategy_id=strategy_id))
         except Exception as exc:
-            errors[candidate.instrument.ticker] = str(exc)
+            errors[ticker] = str(exc)
     return {
         "selected": candidates,
         "results": stored,
         "input_errors": input_errors,
         "errors": errors,
+        "reused_count": len(reused_tickers),
+        "reused_tickers": reused_tickers,
         "execution_mode": "research_only",
     }
+
+
+def _explicit_llm_identity(config: Any) -> tuple[str, str] | None:
+    """Return the explicit provider/model pair that can safely key decision reuse."""
+
+    if not isinstance(config, dict):
+        return None
+    provider = str(config.get("provider") or "").strip().lower()
+    model = str(config.get("model_id") or config.get("model") or "").strip()
+    if not provider or (not model and provider != "fincept"):
+        return None
+    return provider, model
 
 
 def cmd_quant_research(args: argparse.Namespace) -> dict[str, Any]:
@@ -1039,6 +1088,8 @@ def cmd_quant_research(args: argparse.Namespace) -> dict[str, Any]:
         "results": batch["results"],
         "input_errors": batch["input_errors"],
         "errors": batch["errors"],
+        "reused_count": batch.get("reused_count", 0),
+        "reused_tickers": batch.get("reused_tickers", []),
         "quant_warnings": {
             "market": quant.get("market_errors") or {},
             "flow": quant.get("flow_errors") or {},
