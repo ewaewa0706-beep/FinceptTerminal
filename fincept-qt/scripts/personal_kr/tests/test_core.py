@@ -226,6 +226,44 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(candidate.analysis_cutoff_at, explicit)
         self.assertEqual(candidate.analysis_cutoff_mode, "external")
 
+    def test_direct_discovery_candidate_preserves_and_validates_ranking_provenance(self):
+        kst = timezone(timedelta(hours=9))
+        now = datetime(2026, 9, 16, 10, 15, 30, tzinfo=kst)
+        cutoff = datetime(2026, 9, 16, 9, 30, tzinfo=kst)
+        generated = datetime(2026, 9, 16, 9, 0, tzinfo=kst)
+        payload = {
+            "analysis_date": "2026-09-16",
+            "instrument": {"ticker": "005930", "name": "삼성전자", "market": "KOSPI"},
+            "score": 91.5,
+            "rank": 1,
+            "factors": {"liquidity_score": 99.0, "size_score": 98.0},
+            "ranking_source": "fincept-kis-public-master-cross-sectional-v2/balanced",
+            "ranking_generated_at": generated.isoformat(),
+            "ranking_payload_hash": "a" * 64,
+            "analysis_cutoff_at": cutoff.isoformat(),
+            "analysis_cutoff_mode": "external",
+        }
+        with patch.object(cli, "_korea_now", return_value=now):
+            candidate = cli._candidate_from_payload(payload)
+
+        self.assertEqual(candidate.ranking_source, payload["ranking_source"])
+        self.assertEqual(candidate.ranking_generated_at, generated)
+        self.assertEqual(candidate.ranking_payload_hash, "a" * 64)
+        self.assertEqual(candidate.analysis_cutoff_at, cutoff)
+        self.assertEqual(candidate.analysis_cutoff_mode, "external")
+
+        incomplete = dict(payload)
+        incomplete.pop("ranking_payload_hash")
+        with patch.object(cli, "_korea_now", return_value=now):
+            with self.assertRaisesRegex(ValueError, "must be supplied together"):
+                cli._candidate_from_payload(incomplete)
+
+        after_cutoff = dict(payload)
+        after_cutoff["ranking_generated_at"] = datetime(2026, 9, 16, 9, 45, tzinfo=kst).isoformat()
+        with patch.object(cli, "_korea_now", return_value=now):
+            with self.assertRaisesRegex(ValueError, "analysis_cutoff_at"):
+                cli._candidate_from_payload(after_cutoff)
+
     def test_live_request_cutoff_keeps_observed_current_macro(self):
         kst = timezone(timedelta(hours=9))
         cutoff = datetime(2026, 9, 16, 10, 15, tzinfo=kst)

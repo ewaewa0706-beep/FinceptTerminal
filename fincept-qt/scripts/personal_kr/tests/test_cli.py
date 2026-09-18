@@ -161,11 +161,17 @@ class CliIntegrationTests(unittest.TestCase):
         data = body["data"]
         self.assertEqual(data["snapshot_entry_count"], 2)
         self.assertEqual(data["candidates"][0]["instrument"]["ticker"], "005930")
-        self.assertEqual(data["candidates"][0]["ranking_source"], "fincept-kis-public-master-liquidity-v1")
+        self.assertEqual(
+            data["candidates"][0]["ranking_source"],
+            "fincept-kis-public-master-cross-sectional-v2/balanced",
+        )
         self.assertEqual(data["candidates"][0]["analysis_cutoff_mode"], "external")
         self.assertEqual(len(data["ranking_payload_hash"]), 64)
         self.assertEqual(data["ranking"]["ranking_source"], data["ranking_source"])
         self.assertEqual(data["ranking"]["rows"][0]["ticker"], "005930")
+        self.assertEqual(data["scoring_model"], "cross-sectional-v2")
+        self.assertEqual(data["scoring_profile"], "balanced")
+        self.assertAlmostEqual(sum(data["scoring_weights"].values()), 1.0)
 
     def test_paper_trade_wrapper_is_idempotent_and_summary_is_consistent(self):
         with tempfile.TemporaryDirectory() as tmp:

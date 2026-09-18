@@ -135,8 +135,8 @@ std::vector<ToolDef> get_personal_kr_research_tools() {
         t.name = "kr_discover_market";
         t.description = "Discover a PIT-safe KOSPI/KOSDAQ Top-N shortlist from the keyless KIS public master. "
                         "Today's full canonical universe is frozen first-write-wins; historical requests only replay "
-                        "an exact snapshot captured on that date. The liquidity score is a deterministic "
-                        "reference-price × previous-volume proxy, not an LLM market scan.";
+                        "an exact snapshot captured on that date. Ranking is deterministic cross-sectional v2 over "
+                        "liquidity, market-cap size, turnover and volume; it is not an LLM market scan.";
         t.category = "equity-research";
         t.input_schema =
             ToolSchemaBuilder()
@@ -148,6 +148,12 @@ std::vector<ToolDef> get_personal_kr_research_tools() {
                 .integer("min_trading_value_krw", "Minimum previous-day liquidity proxy in KRW")
                 .default_int(0)
                 .between(0, 2000000000000000LL)
+                .string("profile", "Discovery scoring profile")
+                .default_str("balanced")
+                .enums({"balanced", "liquidity", "large_cap", "active"})
+                .string("market", "Market scope")
+                .default_str("ALL")
+                .enums({"ALL", "KOSPI", "KOSDAQ"})
                 .build();
         t.default_timeout_ms = kProviderTimeoutMs;
         t.supports_async = true;
@@ -157,7 +163,11 @@ std::vector<ToolDef> get_personal_kr_research_tools() {
                 "discover", "--limit", QString::number(args.value("limit").toInt(20)),
                 "--min-trading-value-krw",
                 QString::number(args.value("min_trading_value_krw").toInteger(0)),
+                "--profile", args.value("profile").toString("balanced"),
             };
+            const QString market = args.value("market").toString("ALL");
+            if (market != QLatin1String("ALL"))
+                script_args << "--market" << market;
             const QString analysis_date = args.value("analysis_date").toString();
             if (!analysis_date.isEmpty())
                 script_args << "--analysis-date" << analysis_date;

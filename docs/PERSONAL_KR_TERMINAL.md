@@ -85,17 +85,40 @@ stdin, so OpenAI/Anthropic/Gemini/OpenRouter/Fincept and the other configured
 providers are smoke-tested with the same provider/model used by deep research.
 Credentials are never placed on argv and are not returned in the smoke result.
 
-`discover` returns a deterministic Top-N liquidity shortlist plus a normal
+`discover` returns a deterministic Top-N cross-sectional shortlist plus a normal
 Fincept ranking envelope (`ranking_source`, timezone-aware
 `ranking_generated_at`, canonical payload hash and flat ranking rows). Without
 KIS credentials the score uses the public master's `reference_price ×
 previous_volume` as a clearly labeled previous-day liquidity proxy. When KIS
 credentials are configured, positive current trading-value-rank values overlay
 matching public-master members; zero pre-market values and rank-endpoint errors
-fall back to the proxy. This is a prefilter/discovery signal, not an LLM
-whole-market scan. The returned ranking envelope can be sent through the
-existing production `batch` path, which applies the same immutable ranking
-provenance and `research_only` safeguards as an external quant ranking.
+fall back to the proxy. The v2 scorer then percentile-normalizes four fields over
+the same frozen eligible universe: trading-value liquidity (50%), market-cap
+size (25%), trading-value/market-cap turnover (15%), and share volume (10%).
+Missing factors are omitted and their weights are renormalized instead of being
+treated as zero. This is a deterministic prefilter/discovery signal, not an LLM
+whole-market scan. The returned ranking envelope can be sent through the existing
+production `batch` path, which applies the same immutable ranking provenance and
+`research_only` safeguards as an external quant ranking.
+
+The UI/CLI also expose four deterministic v2 profiles without changing the
+underlying snapshot: `balanced` (50/25/15/10), `liquidity` (70/15/5/10),
+`large_cap` (35/50/5/10), and `active` (35/10/35/20) for
+liquidity/size/turnover/volume respectively. The selected profile is embedded in
+`ranking_source`, so decisions produced from different profiles cannot silently
+share the same ranking provenance.
+
+The Qt/MCP discovery controls can additionally restrict the market to `KOSPI` or
+`KOSDAQ` and apply a minimum trading-value threshold. The desktop expresses the
+threshold in 억원 (KRW 100 million units) while the CLI/MCP contract uses exact
+KRW. These filters are applied only after the canonical daily snapshot is frozen,
+so changing a screen does not rewrite PIT membership or provenance.
+
+The desktop date picker defaults to the current Korean civil date and never
+allows a future date. Selecting an older date invokes the same exact-date replay
+contract as CLI/MCP: only a universe snapshot genuinely captured on that date is
+accepted. Missing historical snapshots fail closed rather than substituting the
+current market membership.
 
 External Quant Ranking → Top N selection uses JSON over stdin:
 
@@ -197,6 +220,20 @@ shortlist without invoking the LLM or any order path. If KIS credentials are
 configured, positive current trading-value-rank rows are overlaid on the public
 master membership; KIS rank failure or zero pre-market values fall back to the
 previous-day public-master liquidity proxy.
+
+After discovery, **RESEARCH SELECTED** is a separate explicit action for one
+selected row. It forwards that candidate's frozen ranking source, generation
+time, payload hash and analysis cutoff into the normal `analyze` path with the
+active Fincept LLM profile. The resulting decision is persisted under the
+`personal-kr-discovery-ui` strategy and remains `research_only`; discovery never
+auto-starts deep research and neither action routes to a live order.
+
+**RESEARCH TOP-N (MAX 10)** is the explicit batch counterpart. It forwards the
+same frozen discovery ranking envelope to the existing production `batch`
+command, preserving the hard maximum of 10 deep-research names, shared KIS
+token/client reuse, per-candidate failure isolation and immediate decision
+checkpointing. The UI uses a finite 60-minute outer watchdog and reports partial
+successes/errors; the batch remains `research_only` and never submits an order.
 
 Internal MCP/agent tools:
 

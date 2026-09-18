@@ -24,7 +24,8 @@ from .models import KR_DAILY_FINALITY_TIME, Instrument, QuantCandidate, to_jsona
 from .persistence import DecisionStore
 from .providers import DartClient, EcosClient, KisClient, NaverNewsClient
 from .ranking import candidate_from_mapping, select_top_candidates, select_top_candidates_isolated
-from .universe import KisPublicMasterUniverseProvider, SnapshotAwareUniverseProvider, liquidity_candidates
+from .discovery_scoring import DISCOVERY_PROFILE_NAMES, score_universe_entries, weights_for_profile
+from .universe import KisPublicMasterUniverseProvider, SnapshotAwareUniverseProvider
 
 
 _KST = timezone(timedelta(hours=9))
@@ -150,6 +151,12 @@ def _candidate_from_payload(payload: dict[str, Any]) -> QuantCandidate:
         # flow row or news item when the same decision is reconstructed.
         analysis_cutoff_at = now_kst
         analysis_cutoff_mode = "live_request"
+    ranking_source, ranking_generated_at, ranking_payload_hash = _candidate_ranking_provenance(
+        payload,
+        analysis_date=analysis_date,
+        analysis_cutoff_at=analysis_cutoff_at,
+        now_kst=now_kst,
+    )
     if "instrument" in payload:
         inst = payload["instrument"]
         return QuantCandidate(
@@ -158,15 +165,58 @@ def _candidate_from_payload(payload: dict[str, Any]) -> QuantCandidate:
             float(payload.get("score", 0)),
             payload.get("rank"),
             {str(k): float(v) for k, v in (payload.get("factors") or {}).items()},
+            ranking_source=ranking_source,
+            ranking_generated_at=ranking_generated_at,
+            ranking_payload_hash=ranking_payload_hash,
             analysis_cutoff_at=analysis_cutoff_at,
             analysis_cutoff_mode=analysis_cutoff_mode,
         )
     candidate = candidate_from_mapping(payload, payload["analysis_date"])
     return replace(
         candidate,
+        ranking_source=ranking_source,
+        ranking_generated_at=ranking_generated_at,
+        ranking_payload_hash=ranking_payload_hash,
         analysis_cutoff_at=analysis_cutoff_at,
         analysis_cutoff_mode=analysis_cutoff_mode,
     )
+
+
+def _candidate_ranking_provenance(
+    payload: dict[str, Any],
+    *,
+    analysis_date: date,
+    analysis_cutoff_at: datetime | None,
+    now_kst: datetime,
+) -> tuple[str, datetime | None, str]:
+    """Validate optional ranking provenance on direct/single-candidate research."""
+
+    source = str(payload.get("ranking_source") or "").strip()
+    raw_generated = str(payload.get("ranking_generated_at") or "").strip()
+    payload_hash = str(payload.get("ranking_payload_hash") or "").strip().lower()
+    present = bool(source or raw_generated or payload_hash)
+    if not present:
+        return "", None, ""
+    if not source or not raw_generated or not payload_hash:
+        raise ValueError(
+            "ranking_source, ranking_generated_at and ranking_payload_hash must be supplied together"
+        )
+    if len(payload_hash) != 64 or any(ch not in "0123456789abcdef" for ch in payload_hash):
+        raise ValueError("ranking_payload_hash must be a 64-character lowercase hex SHA-256")
+    try:
+        generated_at = datetime.fromisoformat(raw_generated.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("ranking_generated_at must be ISO-8601") from exc
+    if generated_at.tzinfo is None:
+        raise ValueError("ranking_generated_at must include a timezone")
+    generated_kst = generated_at.astimezone(_KST)
+    if generated_kst > now_kst:
+        raise ValueError("ranking_generated_at cannot be in the future")
+    if generated_kst.date() > analysis_date:
+        raise ValueError("ranking_generated_at cannot be later than analysis_date")
+    if analysis_cutoff_at is not None and generated_at > analysis_cutoff_at:
+        raise ValueError("ranking_generated_at cannot be later than analysis_cutoff_at")
+    return source, generated_at, payload_hash
 
 
 def _engine(llm_config: dict[str, Any] | None = None) -> ResearchEngine:
@@ -261,12 +311,14 @@ def cmd_discover(args: argparse.Namespace) -> Any:
         markets=markets,
         min_trading_value_krw=min_trading_value_krw,
     )
-    candidates = liquidity_candidates(entries, as_of, limit=limit)
+    discovery_profile = str(args.profile or "balanced")
+    discovery_weights = weights_for_profile(discovery_profile)
+    candidates = score_universe_entries(entries, as_of, limit=limit, weights=discovery_weights)
     snapshot = store.get_universe_snapshot(as_of, markets=list(dict.fromkeys(markets)))
     if snapshot is None:
         raise RuntimeError("universe snapshot missing after discovery")
-    ranking_source = "fincept-kis-public-master-liquidity-v1"
-    ranked_entries = entries[: len(candidates)]
+    ranking_source = f"fincept-kis-public-master-cross-sectional-v2/{discovery_profile}"
+    entries_by_ticker = {entry.instrument.ticker: entry for entry in entries}
     flat_rows = [
         {
             "ticker": candidate.instrument.ticker,
@@ -274,10 +326,10 @@ def cmd_discover(args: argparse.Namespace) -> Any:
             "market": candidate.instrument.market,
             "score": candidate.score,
             "rank": candidate.rank,
-            "liquidity_source": entry.source,
+            "liquidity_source": entries_by_ticker[candidate.instrument.ticker].source,
             **candidate.factors,
         }
-        for candidate, entry in zip(candidates, ranked_entries, strict=True)
+        for candidate in candidates
     ]
     rank_overlay_count = sum("volume-rank" in entry.source for entry in entries)
     ranking_payload = {
@@ -307,6 +359,9 @@ def cmd_discover(args: argparse.Namespace) -> Any:
         "captured_at": snapshot.captured_at,
         "source": "KIS public master current snapshot / exact PIT replay",
         "rank_overlay_count": rank_overlay_count,
+        "scoring_model": "cross-sectional-v2",
+        "scoring_profile": discovery_profile,
+        "scoring_weights": discovery_weights.normalized(),
         "ranking_source": frozen_source,
         "ranking_generated_at": frozen_generated_at,
         "ranking_payload_hash": ranking_hash,
@@ -555,6 +610,7 @@ def build_parser() -> argparse.ArgumentParser:
     discover.add_argument("--market", action="append", choices=("KOSPI", "KOSDAQ"))
     discover.add_argument("--limit", type=int, default=20)
     discover.add_argument("--min-trading-value-krw", type=int, default=0)
+    discover.add_argument("--profile", choices=DISCOVERY_PROFILE_NAMES, default="balanced")
     for name in ("providers-only", "full"):
         p = sub.add_parser(name)
         p.add_argument("--ticker", default="005930")
