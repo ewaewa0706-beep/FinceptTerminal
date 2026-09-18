@@ -50,6 +50,7 @@ class EquityAnalysisTab : public QWidget {
     void on_kr_history_evaluate_clicked();
     void on_kr_history_outcomes_clicked();
     void on_kr_history_paper_summary_clicked();
+    void on_kr_history_paper_trades_clicked();
     void on_kr_history_paper_trade_clicked();
     void on_kr_research_clicked();
 
@@ -154,6 +155,7 @@ class EquityAnalysisTab : public QWidget {
     QPushButton* kr_history_evaluate_btn_ = nullptr;
     QPushButton* kr_history_outcomes_btn_ = nullptr;
     QPushButton* kr_history_paper_btn_ = nullptr;
+    QPushButton* kr_history_paper_trades_btn_ = nullptr;
     QPushButton* kr_history_paper_trade_btn_ = nullptr;
     QComboBox* kr_history_paper_side_ = nullptr;
     QSpinBox* kr_history_paper_quantity_ = nullptr;

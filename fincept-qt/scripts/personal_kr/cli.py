@@ -542,6 +542,11 @@ def cmd_paper_summary() -> Any:
     return {"cash_krw": cash, "positions": positions, "execution_mode": "paper_only"}
 
 
+def cmd_paper_trades(args: argparse.Namespace) -> Any:
+    trades = _store().list_paper_trades(args.limit)
+    return {"trades": trades, "count": len(trades), "execution_mode": "paper_only"}
+
+
 def cmd_paper_trade() -> Any:
     payload = _input_json()
     decision_id = str(payload.get("decision_id") or "").strip()
@@ -617,6 +622,8 @@ def build_parser() -> argparse.ArgumentParser:
     outcomes = sub.add_parser("outcomes")
     outcomes.add_argument("decision_id")
     sub.add_parser("paper-summary")
+    paper_trades = sub.add_parser("paper-trades")
+    paper_trades.add_argument("--limit", type=int, default=100)
     sub.add_parser("paper-trade")
     sub.add_parser("llm-smoke")
     discover = sub.add_parser("discover")
@@ -659,6 +666,8 @@ def main(argv: list[str] | None = None) -> int:
             _print(cmd_outcomes(args))
         elif args.command == "paper-summary":
             _print(cmd_paper_summary())
+        elif args.command == "paper-trades":
+            _print(cmd_paper_trades(args))
         elif args.command == "paper-trade":
             _print(cmd_paper_trade())
         elif args.command == "llm-smoke":

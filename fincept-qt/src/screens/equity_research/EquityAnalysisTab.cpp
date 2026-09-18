@@ -452,6 +452,11 @@ QFrame* EquityAnalysisTab::build_kr_history_panel_() {
             &EquityAnalysisTab::on_kr_history_paper_summary_clicked);
     hl->addWidget(kr_history_paper_btn_);
 
+    kr_history_paper_trades_btn_ = new QPushButton(tr("PAPER TRADES"));
+    connect(kr_history_paper_trades_btn_, &QPushButton::clicked, this,
+            &EquityAnalysisTab::on_kr_history_paper_trades_clicked);
+    hl->addWidget(kr_history_paper_trades_btn_);
+
     kr_history_status_ = new QLabel(tr("Frozen decisions · benchmark alpha · paper_only summary"));
     hl->addWidget(kr_history_status_, 1);
     vl->addWidget(controls);
@@ -549,6 +554,8 @@ void EquityAnalysisTab::set_kr_history_busy_(bool busy) {
         kr_history_refresh_btn_->setEnabled(!busy);
     if (kr_history_paper_btn_)
         kr_history_paper_btn_->setEnabled(!busy);
+    if (kr_history_paper_trades_btn_)
+        kr_history_paper_trades_btn_->setEnabled(!busy);
     const bool selected = !selected_kr_decision_id_().isEmpty();
     if (kr_history_evaluate_btn_)
         kr_history_evaluate_btn_->setEnabled(!busy && selected);
@@ -729,6 +736,46 @@ void EquityAnalysisTab::on_kr_history_paper_summary_clicked() {
             self->kr_history_status_->setText(self->tr("Personal-KR paper portfolio · paper_only"));
             self->kr_history_result_->setPlainText(
                 QString::fromUtf8(QJsonDocument(data).toJson(QJsonDocument::Indented)));
+        });
+}
+
+void EquityAnalysisTab::on_kr_history_paper_trades_clicked() {
+    if (!kr_history_result_ || !kr_history_status_)
+        return;
+    set_kr_history_busy_(true);
+    kr_history_status_->setText(tr("Loading Personal-KR paper ledger…"));
+
+    python::PythonRunner::RunOptions opts;
+    opts.timeout_ms = 60 * 1000;
+    QPointer<EquityAnalysisTab> self(this);
+    python::PythonRunner::instance().run_with_options(
+        "personal_kr_terminal.py", {"paper-trades", "--limit", "100"}, opts,
+        [self](python::PythonResult result) {
+            if (!self)
+                return;
+            self->set_kr_history_busy_(false);
+            if (!result.success) {
+                self->kr_history_status_->setText(self->tr("Paper ledger unavailable"));
+                self->kr_history_result_->setPlainText(result.error);
+                return;
+            }
+            const QJsonDocument doc = QJsonDocument::fromJson(python::extract_json(result.output).toUtf8());
+            if (!doc.isObject() || !doc.object().value("success").toBool(false)) {
+                const QString error = doc.isObject() ? doc.object().value("error").toString() : result.output;
+                self->kr_history_status_->setText(self->tr("Paper ledger unavailable"));
+                self->kr_history_result_->setPlainText(error);
+                return;
+            }
+            const QJsonObject data = doc.object().value("data").toObject();
+            if (data.value("execution_mode").toString() != QLatin1String("paper_only")) {
+                self->kr_history_status_->setText(self->tr("Unexpected paper ledger execution mode"));
+                self->kr_history_result_->setPlainText(result.output);
+                return;
+            }
+            const QJsonArray trades = data.value("trades").toArray();
+            self->kr_history_status_->setText(self->tr("Loaded %1 paper-only trade(s)").arg(trades.size()));
+            self->kr_history_result_->setPlainText(
+                QString::fromUtf8(QJsonDocument(trades).toJson(QJsonDocument::Indented)));
         });
 }
 

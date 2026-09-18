@@ -28,6 +28,7 @@ class CppWiringTests(unittest.TestCase):
             "kr_outcome_log",
             "kr_provider_smoke",
             "kr_paper_summary",
+            "kr_paper_trade_log",
             "kr_paper_trade",
         ):
             self.assertIn(name, tools)
@@ -71,11 +72,13 @@ class CppWiringTests(unittest.TestCase):
         self.assertIn("EVALUATE 1/5/20/60D", cpp)
         self.assertIn("SHOW OUTCOMES", cpp)
         self.assertIn("PAPER SUMMARY", cpp)
+        self.assertIn("PAPER TRADES", cpp)
         self.assertIn("RECORD PAPER TRADE", cpp)
         self.assertIn('"personal_kr_terminal.py", {"decisions", "--limit", "50"}', cpp)
         self.assertIn('"personal_kr_terminal.py", {"evaluate", decision_id', cpp)
         self.assertIn('"personal_kr_terminal.py", {"outcomes", decision_id}', cpp)
         self.assertIn('"personal_kr_terminal.py", {"paper-summary"}', cpp)
+        self.assertIn('"personal_kr_terminal.py", {"paper-trades", "--limit", "100"}', cpp)
         self.assertIn('"personal_kr_terminal.py", {"paper-trade"}', cpp)
         self.assertIn("opts.stdin_data = QJsonDocument(payload).toJson(QJsonDocument::Compact)", cpp)
         self.assertIn("QUuid::createUuid()", cpp)

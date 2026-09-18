@@ -203,9 +203,13 @@ class CliIntegrationTests(unittest.TestCase):
             }
             first_proc, first = run_cli("paper-trade", input_data=payload, data_dir=tmp)
             second_proc, second = run_cli("paper-trade", input_data=payload, data_dir=tmp)
+            trades_proc, trades = run_cli("paper-trades", "--limit", "10", data_dir=tmp)
             summary_proc, summary = run_cli("paper-summary", data_dir=tmp)
 
-            self.assertEqual((first_proc.returncode, second_proc.returncode, summary_proc.returncode), (0, 0, 0))
+            self.assertEqual(
+                (first_proc.returncode, second_proc.returncode, trades_proc.returncode, summary_proc.returncode),
+                (0, 0, 0, 0),
+            )
             self.assertEqual(first["data"]["trade_id"], second["data"]["trade_id"])
             self.assertEqual(first["data"]["client_trade_id"], "cli-replay-1")
             self.assertEqual(first["data"]["decision_id"], decision.decision_id)
@@ -217,6 +221,11 @@ class CliIntegrationTests(unittest.TestCase):
             self.assertEqual(first["data"]["execution_mode"], "paper_only")
             self.assertEqual(first["data"]["cash_krw"], 99_930_000)
             self.assertEqual(second["data"]["cash_krw"], 99_930_000)
+            self.assertEqual(trades["data"]["count"], 1)
+            self.assertEqual(trades["data"]["execution_mode"], "paper_only")
+            self.assertEqual(trades["data"]["trades"][0]["client_trade_id"], "cli-replay-1")
+            self.assertEqual(trades["data"]["trades"][0]["company_name"], "삼성전자")
+            self.assertEqual(trades["data"]["trades"][0]["signal"], "Hold")
             self.assertEqual(summary["data"]["positions"], {"005930": 1})
             self.assertEqual(summary["data"]["execution_mode"], "paper_only")
 

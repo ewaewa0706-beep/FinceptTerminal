@@ -181,6 +181,7 @@ python personal_kr_terminal.py decisions --limit 20
 python personal_kr_terminal.py evaluate <decision-id> --horizons 1 5 20 60
 python personal_kr_terminal.py outcomes <decision-id>
 python personal_kr_terminal.py paper-summary
+python personal_kr_terminal.py paper-trades --limit 100
 ```
 
 Paper trades take JSON over stdin. Both `decision_id` and `client_trade_id` are
@@ -254,6 +255,12 @@ declare `execution_mode=paper_only`. Paper execution is never inferred from an
 AI signal and is never triggered by discovery, research, outcome evaluation or
 paper-summary refresh.
 
+**PAPER TRADES** is the read-only ledger companion. It lists recent immutable
+paper rows newest-first with `client_trade_id`, `decision_id`, ticker/company,
+side, quantity, price, fees/tax, strategy and frozen research signal. CLI and MCP
+expose the same data through `paper-trades` / `kr_paper_trade_log`; neither path
+can submit or alter an order.
+
 Internal MCP/agent tools:
 
 - `kr_research_status`
@@ -267,6 +274,7 @@ Internal MCP/agent tools:
 - `kr_outcome_log`
 - `kr_provider_smoke`
 - `kr_paper_summary`
+- `kr_paper_trade_log`
 - `kr_paper_trade`
 
 `kr_paper_trade` is marked destructive/confirmation-required even though it is

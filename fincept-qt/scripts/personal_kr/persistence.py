@@ -746,6 +746,53 @@ class DecisionStore:
             if owns:
                 connection.close()
 
+    def list_paper_trades(self, limit: int = 100) -> list[dict[str, object]]:
+        """Return the newest immutable paper-ledger rows with decision context."""
+
+        limit = int(limit)
+        if limit <= 0 or limit > 1000:
+            raise ValueError("paper trade limit must be between 1 and 1000")
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT t.*, d.strategy_id, d.signal, d.payload AS decision_payload
+                FROM kr_paper_trades t
+                JOIN kr_decisions d ON d.id=t.decision_id
+                ORDER BY t.id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+        trades: list[dict[str, object]] = []
+        for row in rows:
+            company_name = ""
+            try:
+                decision_payload = json.loads(row["decision_payload"])
+                company_name = str(
+                    decision_payload.get("candidate", {}).get("instrument", {}).get("name", "")
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                company_name = ""
+            trades.append(
+                {
+                    "trade_id": int(row["id"]),
+                    "client_trade_id": str(row["client_trade_id"]),
+                    "decision_id": str(row["decision_id"]),
+                    "trade_date": str(row["trade_date"]),
+                    "ticker": str(row["ticker"]),
+                    "company_name": company_name,
+                    "side": str(row["side"]),
+                    "quantity": int(row["quantity"]),
+                    "price": float(row["price"]),
+                    "fee": float(row["fee"]),
+                    "tax": float(row["tax"]),
+                    "strategy_id": str(row["strategy_id"]),
+                    "signal": str(row["signal"]),
+                }
+            )
+        return trades
+
 
 def _result_from_payload(data: dict) -> ResearchResult:
     from .models import Instrument, QuantCandidate

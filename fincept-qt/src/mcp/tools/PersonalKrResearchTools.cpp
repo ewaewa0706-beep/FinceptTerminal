@@ -459,6 +459,26 @@ std::vector<ToolDef> get_personal_kr_research_tools() {
         tools.push_back(std::move(t));
     }
 
+    // ── kr_paper_trade_log ──────────────────────────────────────────────
+    {
+        ToolDef t;
+        t.name = "kr_paper_trade_log";
+        t.description = "Read recent immutable rows from the isolated personal-KR paper ledger with decision provenance. "
+                        "This is read-only and never routes to a live broker.";
+        t.category = "paper-trading";
+        t.input_schema = ToolSchemaBuilder()
+                             .integer("limit", "Maximum number of recent paper trades to return")
+                             .default_int(100)
+                             .between(1, 1000)
+                             .build();
+        t.default_timeout_ms = kStatusTimeoutMs;
+        t.async_handler = [](const QJsonObject& args, ToolContext ctx,
+                             std::shared_ptr<QPromise<ToolResult>> promise) {
+            run_kr_tool({"paper-trades", "--limit", QString::number(args.value("limit").toInt(100))}, {}, ctx, promise);
+        };
+        tools.push_back(std::move(t));
+    }
+
     // ── kr_paper_trade ──────────────────────────────────────────────────
     {
         ToolDef t;
