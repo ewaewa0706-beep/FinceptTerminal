@@ -54,21 +54,27 @@ the command line. KIS and the LLM are required for a full deep-research run.
 DART, Naver and ECOS are enrichment providers and degrade independently when
 unavailable.
 
-For local/headless development only, KRX also supports the git-ignored file
+KRX follows the same managed-credential path: Settings stores `KRX_AUTH_KEY`
+through `SecureStorage`, and `PythonRunner` injects it into the Personal-KR
+subprocess environment. The status command reports only whether a key is
+configured; it never returns the key value.
+
+For local/headless development, KRX also supports the git-ignored file
 `fincept-qt/scripts/KRX_KEY.local.txt`. Put exactly one authentication-key line
-in that file with no `KRX_AUTH_KEY=` prefix. `KRX_AUTH_KEY` from SecureStorage or
-the process environment takes precedence. `KRX_AUTH_KEY_FILE` can point to an
-alternate local file. The status command reports only whether a key is present;
-it never returns the key value. KRX can still return HTTP 401 when the key exists
-but the requested API service has not been approved for that key.
+in that file with no `KRX_AUTH_KEY=` prefix. A managed/process `KRX_AUTH_KEY`
+takes precedence. `KRX_AUTH_KEY_FILE` can point to an alternate local file.
+Presence does not prove service authorization: KRX may still return HTTP 401
+until the requested API service is approved for that key.
 
 Whole-market discovery itself does not require a KIS API credential. The
 current KOSPI/KOSDAQ membership is loaded from KIS public master archives.
 Because those archives are current snapshots rather than historical data,
 Personal-KR freezes the full eligible universe once per Korean calendar date
-before request-specific filtering. Historical discovery is allowed only by an
-exact immutable snapshot captured on that same date; today's master is never
-backfilled into a past analysis date.
+before request-specific filtering. Historical discovery first replays an exact
+immutable snapshot captured on that date; when no such snapshot exists and KRX
+is configured, it can use the explicitly labeled KRX historical-reconstruction
+path described below. Today's master is never backfilled into a past analysis
+date.
 
 KIS access tokens are cached under `FINCEPT_DATA_DIR` with an app-key-derived
 filename, expiry check and a small cross-process issuance lock. The cache is

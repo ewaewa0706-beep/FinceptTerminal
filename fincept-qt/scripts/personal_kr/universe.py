@@ -90,13 +90,12 @@ class KrxApiError(RuntimeError):
 
 
 def load_krx_auth_key(path: Path | str | None = None) -> str:
-    """Load the KRX auth key without ever echoing secret contents.
+    """Load the KRX auth key from managed env first, then an optional local file.
 
-    SecureStorage/PythonRunner normally supplies ``KRX_AUTH_KEY``.  For local
-    development a git-ignored ``scripts/KRX_KEY.local.txt`` file is also
-    supported.  ``KRX_AUTH_KEY_FILE`` can point at an alternate local file;
-    when that environment variable is present its path is authoritative, which
-    lets tests/validation deliberately disable the default local secret file.
+    Secret contents are never included in error messages.  If
+    ``KRX_AUTH_KEY_FILE`` is present, that path is authoritative instead of the
+    default git-ignored file; validation uses this to disable developer-local
+    credentials deterministically.
     """
 
     env_key = os.getenv("KRX_AUTH_KEY", "").strip()
