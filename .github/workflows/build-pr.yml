@@ -286,6 +286,19 @@ jobs:
           export LD_LIBRARY_PATH="${QT_ROOT_DIR}/lib:${LD_LIBRARY_PATH:-}"
           bash ../.github/scripts/ci_app_checks.sh selftests "$BINARY" ci
 
+      # The Personal-KR development machine intentionally does not carry the
+      # full MSVC/Qt toolchain.  Keep a short-lived copy of the already-tested
+      # Windows runtime so UI changes can be exercised on the actual target PC
+      # instead of stopping at source-level wiring tests.
+      - name: Upload Personal-KR Windows runtime
+        if: runner.os == 'Windows' && github.ref == 'refs/heads/personal-kr-terminal'
+        uses: actions/upload-artifact@v4
+        with:
+          name: FinceptTerminal-Windows-personal-kr
+          path: fincept-qt/build/Release/
+          if-no-files-found: error
+          retention-days: 3
+
       # Self-tests exercise subsystems and the MCP catalog, but they do not walk
       # every Qt screen constructor. Run the existing all-screens smoke path on
       # one native leg so Personal-KR UI wiring (notably EquityAnalysisTab) is
