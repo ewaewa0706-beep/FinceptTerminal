@@ -133,6 +133,10 @@ class DecisionStore:
                     "CREATE INDEX IF NOT EXISTS idx_kr_research_runs_started_at "
                     "ON kr_research_runs(started_at DESC)"
                 )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_kr_research_runs_resume "
+                    "ON kr_research_runs(run_type,strategy_id,analysis_date,status,started_at DESC)"
+                )
                 columns = {row[1] for row in conn.execute("PRAGMA table_info(kr_paper_trades)")}
                 if "client_trade_id" not in columns:
                     conn.execute("ALTER TABLE kr_paper_trades ADD COLUMN client_trade_id TEXT")
@@ -350,6 +354,81 @@ class DecisionStore:
                 )
         return payload
 
+    def checkpoint_research_run(
+        self,
+        run_id: str,
+        *,
+        decision_ids: list[str] | tuple[str, ...] = (),
+        decision_refs: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
+        reused_tickers: list[str] | tuple[str, ...] = (),
+        errors: dict[str, str] | None = None,
+        input_errors: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Checkpoint cumulative progress without finalizing the research run.
+
+        The immutable Decision rows are written candidate-by-candidate. Keeping
+        the orchestration ledger in step with those writes makes an interrupted
+        run auditable before a later resume finalizes it as partial.
+        """
+
+        with closing(self._connect()) as conn:
+            with conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT payload,status FROM kr_research_runs WHERE run_id=?", (str(run_id),)
+                ).fetchone()
+                if row is None:
+                    raise ValueError("research run not found")
+                if str(row["status"]) != "running":
+                    raise ValueError("research run is already finalized")
+                try:
+                    payload = json.loads(str(row["payload"]))
+                except json.JSONDecodeError as exc:
+                    raise ValueError("invalid stored research run payload") from exc
+                if not isinstance(payload, dict):
+                    raise ValueError("invalid stored research run payload")
+
+                existing_ids = [str(item) for item in payload.get("decision_ids") or [] if str(item).strip()]
+                for item in decision_ids:
+                    normalized = str(item).strip()
+                    if normalized and normalized not in existing_ids:
+                        existing_ids.append(normalized)
+
+                existing_refs = [
+                    to_jsonable(dict(item))
+                    for item in (payload.get("decision_refs") or [])
+                    if isinstance(item, dict)
+                ]
+                for item in decision_refs:
+                    normalized = to_jsonable(dict(item))
+                    if normalized not in existing_refs:
+                        existing_refs.append(normalized)
+
+                existing_reused = [validate_ticker(item) for item in payload.get("reused_tickers") or []]
+                for item in reused_tickers:
+                    normalized = validate_ticker(item)
+                    if normalized not in existing_reused:
+                        existing_reused.append(normalized)
+
+                merged_errors = dict(payload.get("errors") or {})
+                merged_errors.update(dict(errors or {}))
+                merged_input_errors = dict(payload.get("input_errors") or {})
+                merged_input_errors.update(dict(input_errors or {}))
+                payload.update(
+                    {
+                        "decision_ids": existing_ids,
+                        "decision_refs": existing_refs,
+                        "reused_tickers": existing_reused,
+                        "errors": merged_errors,
+                        "input_errors": merged_input_errors,
+                    }
+                )
+                conn.execute(
+                    "UPDATE kr_research_runs SET payload=? WHERE run_id=?",
+                    (_canonical_json(payload), str(run_id)),
+                )
+        return payload
+
     def finish_research_run(
         self,
         run_id: str,
@@ -427,6 +506,30 @@ class DecisionStore:
             rows = conn.execute(
                 "SELECT payload FROM kr_research_runs ORDER BY started_at DESC LIMIT ?",
                 (bounded,),
+            ).fetchall()
+        output: list[dict[str, Any]] = []
+        for row in rows:
+            payload = json.loads(str(row["payload"]))
+            if not isinstance(payload, dict):
+                raise ValueError("invalid stored research run payload")
+            output.append(payload)
+        return output
+
+    def list_resumable_research_runs(
+        self,
+        *,
+        run_type: str,
+        strategy_id: str,
+        analysis_date: date,
+    ) -> list[dict[str, Any]]:
+        """Return all running runs for one exact resume identity, newest first."""
+
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """SELECT payload FROM kr_research_runs
+                WHERE run_type=? AND strategy_id=? AND analysis_date=? AND status='running'
+                ORDER BY started_at DESC""",
+                (str(run_type), str(strategy_id), analysis_date.isoformat()),
             ).fetchall()
         output: list[dict[str, Any]] = []
         for row in rows:
@@ -1144,6 +1247,7 @@ def _result_from_payload(data: dict) -> ResearchResult:
         evidence=data.get("evidence") or {},
         llm_provider=data.get("llm_provider") or "",
         llm_model_id=data.get("llm_model_id") or "",
+        llm_execution_fingerprint=data.get("llm_execution_fingerprint") or "",
         workflow_version=data.get("workflow_version") or "personal-kr-v1",
     )
 
@@ -1211,6 +1315,7 @@ def _decision_provenance_tuple(result: ResearchResult) -> tuple[str, ...]:
         evidence_hash,
         result.llm_provider,
         result.llm_model_id,
+        result.llm_execution_fingerprint,
         result.workflow_version,
     )
 

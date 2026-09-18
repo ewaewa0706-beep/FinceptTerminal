@@ -176,7 +176,8 @@ class CppWiringTests(unittest.TestCase):
         self.assertIn("kBatchResearchTimeoutMs", section)
         self.assertIn("personal_kr_active_llm_config()", section)
         self.assertIn('QJsonObject{{"llm", llm}', section)
-        self.assertIn('"personal-kr-quant-research-mcp"', section)
+        self.assertIn('"personal-kr-quant-research"', section)
+        self.assertNotIn('"personal-kr-quant-research-mcp"', section)
         self.assertIn('.boolean("resume"', section)
         self.assertIn('args.value("resume").toBool(false)', section)
         self.assertIn("completed", section)
@@ -201,6 +202,37 @@ class CppWiringTests(unittest.TestCase):
         self.assertIn("Top-N progress %1/%2", section)
         self.assertIn('{"resume", true}', section)
         self.assertIn("resume_found", section)
+        self.assertIn('"personal-kr-quant-research"', section)
+        self.assertNotIn('"personal-kr-quant-research-ui"', section)
+        self.assertIn("resumed frozen rank", section)
+
+    def test_desktop_surfaces_live_personal_kr_readiness(self):
+        ui = (QT_ROOT / "src/screens/equity_research/EquityAnalysisTab.cpp").read_text(encoding="utf-8")
+        header = (QT_ROOT / "src/screens/equity_research/EquityAnalysisTab.h").read_text(encoding="utf-8")
+        self.assertIn("void refresh_kr_readiness_();", header)
+        self.assertIn("refresh_kr_readiness_();", ui)
+        section = ui.split("void EquityAnalysisTab::refresh_kr_readiness_()", 1)[1].split(
+            "void EquityAnalysisTab::set_symbol", 1
+        )[0]
+        self.assertIn('"personal_kr_terminal.py", {"status"}', section)
+        self.assertIn("quant_ranking", section)
+        self.assertIn("historical_krx_ready", section)
+        self.assertIn("LLM %3", section)
+        self.assertIn("research_only", section)
+
+    def test_discovery_and_quant_rank_restore_one_click_button_state(self):
+        ui = (QT_ROOT / "src/screens/equity_research/EquityAnalysisTab.cpp").read_text(encoding="utf-8")
+        discover = ui.split("void EquityAnalysisTab::on_kr_discover_clicked()", 1)[1].split(
+            "void EquityAnalysisTab::on_kr_quant_rank_clicked()", 1
+        )[0]
+        quant_rank = ui.split("void EquityAnalysisTab::on_kr_quant_rank_clicked()", 1)[1].split(
+            "void EquityAnalysisTab::on_kr_quant_research_clicked()", 1
+        )[0]
+        self.assertIn("kr_quant_research_btn_->setEnabled(false)", discover)
+        self.assertIn("self->kr_quant_research_btn_->setEnabled(true)", discover)
+        self.assertIn("kr_quant_research_btn_->setEnabled(false)", quant_rank)
+        self.assertIn("self->kr_quant_research_btn_->setEnabled(true)", quant_rank)
+        self.assertIn('data.value("eligible_count")', discover)
 
     def test_production_batch_is_bounded_to_ten_deep_research_names(self):
         tools = (QT_ROOT / "src/mcp/tools/PersonalKrResearchTools.cpp").read_text(encoding="utf-8")
@@ -218,6 +250,9 @@ class CppWiringTests(unittest.TestCase):
         self.assertIn("personal-kr-terminal", python_ci)
         self.assertIn("EquityAnalysisTab.h", python_ci)
         self.assertIn("branches: [main, personal-kr-terminal]", native_ci)
+        self.assertIn("Upload Personal-KR Windows runtime", native_ci)
+        self.assertIn("FinceptTerminal-Windows-personal-kr", native_ci)
+        self.assertIn("refs/heads/personal-kr-terminal", native_ci)
         for platform in ("windows-2022", "ubuntu-22.04", "macos-15"):
             self.assertIn(platform, native_ci)
         self.assertIn("Run all-screens smoke test (Linux)", native_ci)

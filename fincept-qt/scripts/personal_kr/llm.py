@@ -8,6 +8,8 @@ API keys must never be placed on argv where they are visible in process lists.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from dataclasses import dataclass
 from urllib.parse import urlparse
@@ -72,6 +74,52 @@ def _join_chat_endpoint(base_url: str, provider: str, model: str) -> str:
     return base + "/v1" + suffix
 
 
+def _safe_endpoint_identity(endpoint: str) -> str:
+    """Return routing identity without userinfo, query parameters or fragments."""
+
+    if not endpoint:
+        return ""
+    parsed = urlparse(endpoint)
+    if parsed.scheme not in {"http", "https"}:
+        return "invalid-endpoint"
+    host = (parsed.hostname or "").lower()
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    authority = host + (f":{port}" if port is not None else "")
+    return f"{parsed.scheme.lower()}://{authority}{parsed.path or ''}"
+
+
+def llm_execution_fingerprint(config: "LlmConfig | dict[str, Any]") -> str:
+    """Hash non-secret LLM settings that can change the produced research text.
+
+    Fincept's native request builders currently omit temperature for every
+    provider, so temperature is deliberately excluded.  The first-party
+    ``/research/chat`` route also ignores max_tokens, while the other supported
+    routes send the resolved token cap and therefore include it here.
+    """
+
+    normalized = config if isinstance(config, LlmConfig) else LlmConfig.from_mapping(config)
+    if normalized.endpoint:
+        endpoint = normalized.endpoint
+    elif normalized.base_url:
+        endpoint = _join_chat_endpoint(normalized.base_url, normalized.provider, normalized.model_id)
+    else:
+        template = _DEFAULT_ENDPOINTS.get(normalized.provider, "")
+        endpoint = template.format(model=normalized.model_id) if template else ""
+    payload: dict[str, Any] = {
+        "provider": normalized.provider,
+        "model_id": normalized.model_id,
+        "endpoint": _safe_endpoint_identity(endpoint),
+    }
+    if normalized.provider != "fincept":
+        payload["max_tokens"] = normalized.max_tokens
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 _DEFAULT_ENDPOINTS = {
     "openai": "https://api.openai.com/v1/chat/completions",
     "anthropic": "https://api.anthropic.com/v1/messages",
@@ -109,6 +157,10 @@ class FinceptConfiguredLlm:
     @property
     def model(self) -> str:
         return self.config.model_id
+
+    @property
+    def execution_fingerprint(self) -> str:
+        return llm_execution_fingerprint(self.config)
 
     def _endpoint(self) -> str:
         if self.config.endpoint:
@@ -252,6 +304,12 @@ class GoogleGeminiLlm:
     @property
     def provider(self) -> str:
         return "google"
+
+    @property
+    def execution_fingerprint(self) -> str:
+        return llm_execution_fingerprint(
+            LlmConfig(provider="gemini", model_id=self.model, api_key=self.api_key, max_tokens=4096)
+        )
 
     @classmethod
     def from_env(cls, *, model: str | None = None, **kwargs: Any) -> "GoogleGeminiLlm":

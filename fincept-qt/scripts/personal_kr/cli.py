@@ -19,7 +19,7 @@ from typing import Any
 from .engine import ResearchEngine
 from .benchmark import load_yahoo_benchmark
 from .evaluation import calculate_forward_return
-from .llm import llm_from_payload
+from .llm import llm_execution_fingerprint, llm_from_payload
 from .models import KR_DAILY_FINALITY_TIME, Instrument, QuantCandidate, to_jsonable
 from .persistence import DecisionStore
 from .providers import DartClient, EcosClient, KisClient, NaverNewsClient
@@ -900,6 +900,32 @@ def _hydrate_quant_rank_result(payload: dict[str, Any]) -> dict[str, Any]:
         ):
             raise ValueError("cached quant candidate provenance mismatch")
 
+    ranking_rows = ranking.get("rows")
+    if not isinstance(ranking_rows, list) or not ranking_rows:
+        raise ValueError("invalid cached quant ranking rows")
+    expected_candidates, expected_errors = select_top_candidates_isolated(
+        ranking_rows,
+        analysis_date,
+        int(ranking.get("limit") or len(ranking_rows)),
+    )
+    if expected_errors:
+        raise ValueError("cached quant ranking rows are malformed")
+    expected_candidates = [
+        replace(
+            candidate,
+            ranking_source=source,
+            ranking_generated_at=generated_at,
+            ranking_payload_hash=payload_hash,
+            analysis_cutoff_at=generated_at,
+            analysis_cutoff_mode="external",
+            ranking_mode=mode,
+            ranking_data_as_of=data_as_of,
+        )
+        for candidate in expected_candidates
+    ]
+    if hydrated_candidates != expected_candidates:
+        raise ValueError("cached quant candidates do not match frozen ranking rows")
+
     result["analysis_date"] = analysis_date
     result["ranking_generated_at"] = generated_at
     result["ranking_data_as_of"] = data_as_of
@@ -994,6 +1020,7 @@ def _run_batch_payload(
     store = _store()
     llm_config = payload.get("llm")
     requested_llm = _explicit_llm_identity(llm_config)
+    requested_llm_fingerprint = llm_execution_fingerprint(llm_config) if requested_llm is not None else None
     engine: ResearchEngine | None = None
     strategy_id = str(payload.get("strategy_id") or "personal-kr-quant")
     stored = []
@@ -1017,7 +1044,14 @@ def _run_batch_payload(
             "ranking_mode": ranking_mode,
             "ranking_data_as_of": ranking_data_as_of,
             "limit": limit,
-            "llm": ({"provider": requested_llm[0], "model_id": requested_llm[1]} if requested_llm else None),
+            "llm": (
+                {
+                    "provider": requested_llm[0],
+                    "model_id": requested_llm[1],
+                    "execution_fingerprint": requested_llm_fingerprint,
+                }
+                if requested_llm else None
+            ),
         }
         if run_request_extra:
             run_request.update(dict(run_request_extra))
@@ -1057,6 +1091,22 @@ def _run_batch_payload(
             "batch_started", run_id=run_id, total=len(candidates), reused=0, failed=0,
             resume_of_run_id=resume_of_run_id,
         )
+    checkpoint_run = getattr(store, "checkpoint_research_run", None)
+
+    def checkpoint_progress() -> None:
+        if not run_id or not callable(checkpoint_run):
+            return
+        checkpoint_run(
+            run_id,
+            decision_ids=[item.decision_id or "" for item in stored],
+            decision_refs=[
+                {"ticker": item.candidate.instrument.ticker, "decision_id": item.decision_id or ""}
+                for item in stored
+            ],
+            reused_tickers=reused_tickers,
+            errors=errors,
+            input_errors=input_errors,
+        )
     # Analyze and freeze one candidate at a time. If a later candidate stalls,
     # fails, or the outer subprocess watchdog fires, earlier completed decisions
     # have already been checkpointed in SQLite instead of being lost in memory.
@@ -1075,6 +1125,7 @@ def _run_batch_payload(
                 total=total_candidates,
                 status="checking",
             )
+        candidate_status = "error"
         try:
             decision_lookup = getattr(store, "get_decision_by_key", None)
             existing = (
@@ -1091,6 +1142,7 @@ def _run_batch_payload(
                 if (
                     existing.candidate != candidate
                     or existing_llm != requested_llm
+                    or existing.llm_execution_fingerprint != requested_llm_fingerprint
                     or existing.workflow_version != "personal-kr-v1"
                 ):
                     raise ValueError(
@@ -1098,37 +1150,37 @@ def _run_batch_payload(
                     )
                 stored.append(existing)
                 reused_tickers.append(ticker)
+                candidate_status = "reused"
+            else:
                 if stream_progress:
                     _emit_progress(
                         "candidate_progress",
-                        run_id=run_id, ticker=ticker, position=position, total=total_candidates,
-                        status="reused", completed=len(stored), reused=len(reused_tickers), failed=len(errors),
+                        run_id=run_id, ticker=ticker, position=position, total=total_candidates, status="analyzing",
                     )
-                continue
-
-            if stream_progress:
-                _emit_progress(
-                    "candidate_progress",
-                    run_id=run_id, ticker=ticker, position=position, total=total_candidates, status="analyzing",
-                )
-            if engine is None:
-                engine = _engine(llm_config)
-            result = engine.analyze(candidate)
-            stored.append(store.record_decision(result, strategy_id=strategy_id))
-            if stream_progress:
-                _emit_progress(
-                    "candidate_progress",
-                    run_id=run_id, ticker=ticker, position=position, total=total_candidates,
-                    status="stored", completed=len(stored), reused=len(reused_tickers), failed=len(errors),
-                )
+                if engine is None:
+                    engine = _engine(llm_config)
+                result = engine.analyze(candidate)
+                if requested_llm_fingerprint is not None:
+                    if result.llm_execution_fingerprint and result.llm_execution_fingerprint != requested_llm_fingerprint:
+                        raise ValueError("LLM execution provenance mismatch")
+                    if not result.llm_execution_fingerprint:
+                        result = replace(result, llm_execution_fingerprint=requested_llm_fingerprint)
+                stored.append(store.record_decision(result, strategy_id=strategy_id))
+                candidate_status = "stored"
         except Exception as exc:
             errors[ticker] = str(exc)
-            if stream_progress:
-                _emit_progress(
-                    "candidate_progress",
-                    run_id=run_id, ticker=ticker, position=position, total=total_candidates,
-                    status="error", completed=len(stored), reused=len(reused_tickers), failed=len(errors),
-                )
+            candidate_status = "error"
+
+        # Run-ledger persistence is orchestration state, not a candidate/provider
+        # outcome. Keep it outside the candidate try/except so a checkpoint
+        # failure aborts cleanly instead of being misclassified and retried.
+        checkpoint_progress()
+        if stream_progress:
+            _emit_progress(
+                "candidate_progress",
+                run_id=run_id, ticker=ticker, position=position, total=total_candidates,
+                status=candidate_status, completed=len(stored), reused=len(reused_tickers), failed=len(errors),
+            )
     run_status = "completed" if not errors and not input_errors else ("partial" if stored else "failed")
     finish_run = getattr(store, "finish_research_run", None)
     if run_id and callable(finish_run):
@@ -1185,6 +1237,7 @@ def _quant_research_request_context(
     analysis_date: date,
     strategy_id: str,
     llm_identity: tuple[str, str] | None,
+    llm_execution_fingerprint_value: str | None,
 ) -> dict[str, Any]:
     requested_markets = {str(item).upper().strip() for item in (args.market or [])}
     markets = [
@@ -1202,8 +1255,14 @@ def _quant_research_request_context(
         "profile": str(args.profile or "balanced"),
         "discovery_profile": str(args.discovery_profile or "balanced"),
         "dart_enabled": bool(os.getenv("DART_API_KEY")),
+        "naver_enabled": bool(os.getenv("NAVER_CLIENT_ID") and os.getenv("NAVER_CLIENT_SECRET")),
+        "ecos_enabled": bool(os.getenv("ECOS_API_KEY")),
         "llm": (
-            {"provider": llm_identity[0], "model_id": llm_identity[1]}
+            {
+                "provider": llm_identity[0],
+                "model_id": llm_identity[1],
+                "execution_fingerprint": llm_execution_fingerprint_value,
+            }
             if llm_identity is not None else None
         ),
     }
@@ -1222,10 +1281,19 @@ def _find_resumable_quant_run(
     analysis_date: date,
     request_fingerprint: str,
 ) -> dict[str, Any] | None:
-    list_runs = getattr(store, "list_research_runs", None)
-    if not callable(list_runs):
-        return None
-    for run in list_runs(100):
+    list_matching = getattr(store, "list_resumable_research_runs", None)
+    if callable(list_matching):
+        runs = list_matching(
+            run_type="quant-research",
+            strategy_id=strategy_id,
+            analysis_date=analysis_date,
+        )
+    else:
+        list_runs = getattr(store, "list_research_runs", None)
+        if not callable(list_runs):
+            return None
+        runs = list_runs(100)
+    for run in runs:
         if (
             str(run.get("status") or "") != "running"
             or str(run.get("run_type") or "") != "quant-research"
@@ -1257,8 +1325,13 @@ def cmd_quant_research(args: argparse.Namespace) -> dict[str, Any]:
 
     analysis_date = date.fromisoformat(args.analysis_date or _korea_today().isoformat())
     llm_identity = _explicit_llm_identity(llm_config)
+    llm_fingerprint = llm_execution_fingerprint(llm_config) if llm_identity is not None else None
     request_context = _quant_research_request_context(
-        args, analysis_date=analysis_date, strategy_id=strategy_id, llm_identity=llm_identity
+        args,
+        analysis_date=analysis_date,
+        strategy_id=strategy_id,
+        llm_identity=llm_identity,
+        llm_execution_fingerprint_value=llm_fingerprint,
     )
     request_fingerprint = _quant_research_request_fingerprint(request_context)
     resume_requested = bool(request.get("resume", False)) and not bool(getattr(args, "refresh", False))

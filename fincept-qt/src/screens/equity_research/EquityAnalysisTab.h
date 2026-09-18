@@ -117,6 +117,7 @@ class EquityAnalysisTab : public QWidget {
     QString kr_market_() const;
     QString selected_kr_decision_id_() const;
     void set_kr_history_busy_(bool busy);
+    void refresh_kr_readiness_();
 
     // ── State ──────────────────────────────────────────────────────────────────
     QHash<QLabel*, const char*> i18n_labels_; ///< static label → English source key

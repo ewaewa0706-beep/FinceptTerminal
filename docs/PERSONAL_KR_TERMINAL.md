@@ -167,7 +167,9 @@ whether DART enrichment is enabled. A cache hit reuses the original ranking
 envelope and its original `ranking_generated_at`/hash rather than pretending the
 cache-read time is new PIT evidence. Use `--refresh` to bypass the read cache, or
 `--cache-ttl-seconds 0` to disable caching. Expired or malformed cache rows are
-discarded automatically and fresh provider calls are made.
+discarded automatically and fresh provider calls are made. Cache hydration also
+rebuilds selected candidates from the frozen ranking rows and rejects the entry
+if the duplicated display candidates disagree with that ranking.
 
 Quant Ranking v1 is intentionally current-date only. The KIS per-stock investor
 flow quote used here does not accept an arbitrary historical date, so an old
@@ -186,14 +188,23 @@ TOP-N**, and MCP exposes `kr_quant_research`. Completed candidates are persisted
 one by one; a later candidate failure is returned in `errors` without erasing
 earlier decisions. The pipeline remains `research_only` and never submits an
 order. Re-running the same strategy/ticker/date with the same candidate ranking
-provenance, explicit LLM provider/model and workflow version reuses the existing
+provenance, explicit LLM provider/model/execution fingerprint and workflow version reuses the existing
 immutable Decision instead of repeating KIS/DART/Naver/LLM calls. Any provenance
 or LLM mismatch fails as a decision conflict before expensive provider/LLM work.
+The execution fingerprint hashes only non-secret behavior/routing identity
+(provider, model, sanitized endpoint and the effective token cap where that
+provider sends one); API keys, session tokens, URL credentials and query strings
+are never persisted in the fingerprint input record.
 Each one-click execution also receives a fresh `run_id` in the SQLite
 `kr_research_runs` ledger. The run record stores only non-secret orchestration
 metadata, the frozen ranking reference, selected tickers, resulting decision ids,
 reused tickers and isolated errors. If the outer process is interrupted, decisions
-already checkpointed remain immutable. The desktop sends `resume=true`; when the
+already checkpointed remain immutable. The run ledger is checkpointed after every
+reused, stored or failed candidate as well, so an interrupted execution preserves
+the latest completed decision refs and errors before a later resume marks the old
+run partial. The desktop sends `resume=true`; when the
+resume lookup runs, SQLite filters directly by run type, strategy, analysis date
+and running status instead of scanning only the latest global run list. The
 latest interrupted run has the same strategy/date/market/limits/scoring profiles,
 DART mode and LLM provider/model fingerprint, its exact frozen ranking envelope is
 reused even if the short Quant cache has already expired. A new audit run is then
@@ -204,6 +215,14 @@ to avoid treating a concurrently running process as interrupted. The desktop con
 `FINCEPT_KR_PROGRESS` stderr events and shows Quant preparation plus each Top-N
 `n/N` checking/analyzing/reused/checkpointed/error state while the final stdout
 remains the single authoritative JSON result.
+The desktop and MCP one-click entry points use the same
+`personal-kr-quant-research` strategy identity, so immutable Decision reuse and
+interrupted-run resume remain consistent when the same workflow is continued
+from either surface. A resumed result is labeled as a resumed frozen ranking in
+the desktop instead of being reported as a newly generated ranking.
+When the Analysis tab opens, the desktop also calls the lightweight `status`
+command and surfaces current KIS Quant, KRX historical reconstruction and active
+LLM readiness directly in the KR discovery panel.
 
 External Quant Ranking → Top N selection uses JSON over stdin:
 

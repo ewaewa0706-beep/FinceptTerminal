@@ -217,6 +217,7 @@ class ResearchEngine:
         signal = _parse_signal(portfolio_manager)
         llm_provider = str(getattr(self.llm, "provider", self.llm.__class__.__name__)).lower()
         llm_model = str(getattr(self.llm, "model", ""))
+        llm_execution_fingerprint = str(getattr(self.llm, "execution_fingerprint", ""))
         return ResearchResult(
             candidate=candidate,
             signal=signal,
@@ -235,6 +236,7 @@ class ResearchEngine:
             evidence=to_jsonable(packet),
             llm_provider=llm_provider,
             llm_model_id=llm_model,
+            llm_execution_fingerprint=llm_execution_fingerprint,
             workflow_version="personal-kr-v1",
         )
 

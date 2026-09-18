@@ -313,7 +313,7 @@ std::vector<ToolDef> get_personal_kr_research_tools() {
                 script_args << "--analysis-date" << analysis_date;
             run_kr_tool(script_args,
                         QJsonObject{{"llm", llm},
-                                    {"strategy_id", "personal-kr-quant-research-mcp"},
+                                    {"strategy_id", "personal-kr-quant-research"},
                                     {"resume", args.value("resume").toBool(false)}},
                         ctx, promise);
         };

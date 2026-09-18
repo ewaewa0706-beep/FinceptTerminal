@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from personal_kr.llm import FinceptConfiguredLlm, LlmConfig
+from personal_kr.llm import FinceptConfiguredLlm, LlmConfig, llm_execution_fingerprint
 
 
 class FakeHttp:
@@ -16,6 +16,30 @@ class FakeHttp:
 
 
 class LlmContractTests(unittest.TestCase):
+    def test_execution_fingerprint_tracks_routing_and_token_cap_without_secrets(self):
+        base = {
+            "provider": "openai",
+            "model_id": "gpt-5",
+            "api_key": "secret-a",
+            "session_token": "session-a",
+            "endpoint": "https://user:password@api.example.com/v1/chat/completions?token=secret-query#frag",
+            "max_tokens": 4096,
+            "temperature": 0.1,
+        }
+        same_execution = dict(base, api_key="secret-b", session_token="session-b", temperature=0.9)
+        different_endpoint = dict(base, endpoint="https://api2.example.com/v1/chat/completions", temperature=0.1)
+        different_tokens = dict(base, max_tokens=2048)
+
+        fingerprint = llm_execution_fingerprint(base)
+        self.assertEqual(len(fingerprint), 64)
+        self.assertEqual(fingerprint, llm_execution_fingerprint(same_execution))
+        self.assertNotEqual(fingerprint, llm_execution_fingerprint(different_endpoint))
+        self.assertNotEqual(fingerprint, llm_execution_fingerprint(different_tokens))
+
+        fincept_a = dict(base, provider="fincept", model_id="MiniMax-M2.7", max_tokens=1024)
+        fincept_b = dict(fincept_a, max_tokens=8192)
+        self.assertEqual(llm_execution_fingerprint(fincept_a), llm_execution_fingerprint(fincept_b))
+
     def test_gemini_matches_fincept_native_request_contract(self):
         http = FakeHttp(
             {"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}

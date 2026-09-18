@@ -213,6 +213,7 @@ QFrame* EquityAnalysisTab::make_panel_(const char* title_key, const QString& acc
 
 EquityAnalysisTab::EquityAnalysisTab(QWidget* parent) : QWidget(parent) {
     build_ui();
+    refresh_kr_readiness_();
     auto& svc = services::equity::EquityResearchService::instance();
     connect(&svc, &services::equity::EquityResearchService::info_loaded, this, &EquityAnalysisTab::on_info_loaded);
     // The overlay was only ever hidden on the success path, so a failed "Info"
@@ -222,6 +223,47 @@ EquityAnalysisTab::EquityAnalysisTab(QWidget* parent) : QWidget(parent) {
                 if (ctx == QLatin1String("Info") && loading_overlay_)
                     loading_overlay_->hide_loading();
             });
+}
+
+void EquityAnalysisTab::refresh_kr_readiness_() {
+    if (!kr_discovery_status_)
+        return;
+
+    kr_discovery_status_->setText(tr("Checking Personal-KR provider readiness…"));
+    python::PythonRunner::RunOptions run_opts;
+    run_opts.timeout_ms = 10 * 1000;
+    QPointer<EquityAnalysisTab> self(this);
+    python::PythonRunner::instance().run_with_options(
+        "personal_kr_terminal.py", {"status"}, run_opts,
+        [self](python::PythonResult result) {
+            if (!self || !self->kr_discovery_status_)
+                return;
+            if (!result.success) {
+                self->kr_discovery_status_->setText(
+                    self->tr("Personal-KR status unavailable · discovery remains keyless · research_only"));
+                return;
+            }
+            const QJsonDocument doc = QJsonDocument::fromJson(python::extract_json(result.output).toUtf8());
+            if (!doc.isObject() || !doc.object().value("success").toBool(false)) {
+                self->kr_discovery_status_->setText(
+                    self->tr("Personal-KR status unavailable · discovery remains keyless · research_only"));
+                return;
+            }
+            const QJsonObject data = doc.object().value("data").toObject();
+            const bool quant_ready = data.value("quant_ranking").toObject().value("ready").toBool(false);
+            const bool krx_ready = data.value("universe").toObject().value("historical_krx_ready").toBool(false);
+            const QJsonObject llm = data.value("llm").toObject();
+            const bool llm_ready = llm.value("ready").toBool(false);
+            const QString llm_provider = llm.value("provider").toString();
+            const QString llm_state = llm_ready
+                                          ? (llm_provider.isEmpty() ? self->tr("ready") : llm_provider)
+                                          : self->tr("not configured");
+            self->kr_discovery_status_->setText(
+                self->tr("Personal-KR ready · KIS Quant %1 · KRX history %2 · LLM %3 · research_only")
+                    .arg(quant_ready ? self->tr("ready") : self->tr("needs credentials"))
+                    .arg(krx_ready ? self->tr("ready") : self->tr("snapshot replay only"))
+                    .arg(llm_state));
+        });
 }
 
 void EquityAnalysisTab::set_symbol(const QString& symbol) {
@@ -995,6 +1037,8 @@ void EquityAnalysisTab::on_kr_discover_clicked() {
                 self->kr_discover_btn_->setEnabled(true);
             if (self->kr_quant_rank_btn_)
                 self->kr_quant_rank_btn_->setEnabled(true);
+            if (self->kr_quant_research_btn_)
+                self->kr_quant_research_btn_->setEnabled(true);
             if (!result.success) {
                 if (self->kr_discovery_status_)
                     self->kr_discovery_status_->setText(self->tr("KR market discovery unavailable: %1").arg(result.error));
@@ -1057,13 +1101,13 @@ void EquityAnalysisTab::on_kr_discover_clicked() {
                             .arg(candidates.size())
                             .arg(resolved));
                 } else {
-                    const int universe_count = data.value("snapshot_entry_count").toInt();
+                    const int eligible_count = data.value("eligible_count").toInt();
                     const QString hash = data.value("snapshot_hash").toString().left(12);
                     self->kr_discovery_status_->setText(
                         self->tr("Completed · %1 · %2 · %3 eligible · Top %4 · KIS overlay %5 · snapshot %6 · research_only")
                             .arg(analysis_date)
                             .arg(profile)
-                            .arg(universe_count)
+                            .arg(eligible_count)
                             .arg(candidates.size())
                             .arg(overlay_count)
                             .arg(hash));
@@ -1106,6 +1150,8 @@ void EquityAnalysisTab::on_kr_quant_rank_clicked() {
     kr_quant_rank_btn_->setEnabled(false);
     if (kr_discover_btn_)
         kr_discover_btn_->setEnabled(false);
+    if (kr_quant_research_btn_)
+        kr_quant_research_btn_->setEnabled(false);
     if (kr_discovery_research_btn_)
         kr_discovery_research_btn_->setEnabled(false);
     if (kr_discovery_batch_btn_)
@@ -1144,6 +1190,8 @@ void EquityAnalysisTab::on_kr_quant_rank_clicked() {
                 self->kr_quant_rank_btn_->setEnabled(true);
             if (self->kr_discover_btn_)
                 self->kr_discover_btn_->setEnabled(true);
+            if (self->kr_quant_research_btn_)
+                self->kr_quant_research_btn_->setEnabled(true);
             if (!result.success) {
                 if (self->kr_discovery_status_)
                     self->kr_discovery_status_->setText(self->tr("KIS Quant Ranking unavailable: %1").arg(result.error));
@@ -1247,7 +1295,7 @@ void EquityAnalysisTab::on_kr_quant_research_clicked() {
                                              ? static_cast<qint64>(kr_discovery_min_value_->value() * 100000000.0)
                                              : 0;
 
-    QJsonObject input{{"strategy_id", "personal-kr-quant-research-ui"}, {"resume", true}};
+    QJsonObject input{{"strategy_id", "personal-kr-quant-research"}, {"resume", true}};
     const QJsonObject llm = fincept::services::equity::personal_kr_active_llm_config();
     if (!llm.isEmpty())
         input["llm"] = llm;
@@ -1357,9 +1405,12 @@ void EquityAnalysisTab::on_kr_quant_research_clicked() {
             const int failed = data.value("failed_count").toInt(
                 data.value("errors").toObject().size() + data.value("input_errors").toObject().size());
             const int reused = data.value("reused_count").toInt();
-            const QString cache_state = data.value("cache_hit").toBool(false)
-                                            ? self->tr("cached rank")
-                                            : self->tr("fresh rank");
+            const QString resumed_from = data.value("resumed_from_run_id").toString();
+            const QString cache_state = !resumed_from.isEmpty()
+                                            ? self->tr("resumed frozen rank")
+                                            : (data.value("cache_hit").toBool(false)
+                                                   ? self->tr("cached rank")
+                                                   : self->tr("fresh rank"));
             if (self->kr_discovery_status_)
                 self->kr_discovery_status_->setText(
                     self->tr("Completed Quant + AI | %1 | %2/%3 decisions | reused %4 | %5 error(s) | research_only")
@@ -1394,9 +1445,11 @@ void EquityAnalysisTab::on_kr_quant_research_clicked() {
                 return;
             }
             if (event_name == QLatin1String("quant_ready")) {
-                const QString cache_state = event.value("cache_hit").toBool(false)
-                                                ? self->tr("cache reused")
-                                                : self->tr("fresh");
+                const QString cache_state = event.value("resumed").toBool(false)
+                                                ? self->tr("resumed frozen rank")
+                                                : (event.value("cache_hit").toBool(false)
+                                                       ? self->tr("cache reused")
+                                                       : self->tr("fresh"));
                 self->kr_discovery_status_->setText(
                     self->tr("Quant ready | %1 | Top %2 | starting AI research...")
                         .arg(cache_state)

@@ -7,7 +7,7 @@ from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import personal_kr.cli as cli
 from personal_kr.models import (
@@ -353,6 +353,46 @@ class QuantCliTests(unittest.TestCase):
         self.assertEqual(discover.call_count, 2)
         self.assertEqual(kis_factory.call_count, 2)
 
+    def test_quant_rank_cache_candidate_content_must_match_frozen_ranking_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DecisionStore(Path(tmp) / "research.db")
+            args = self.args(limit=1, prefilter_limit=2, cache_ttl_seconds=300)
+            with (
+                patch.dict(
+                    "os.environ",
+                    {"KIS_APP_KEY": "key", "KIS_APP_SECRET": "secret", "DART_API_KEY": ""},
+                    clear=False,
+                ),
+                patch.object(cli, "_store", return_value=store),
+                patch.object(cli, "_korea_today", return_value=TODAY),
+                patch.object(cli, "_korea_now", return_value=NOW),
+                patch.object(cli, "cmd_discover", return_value=self.discovery()) as discover,
+                patch.object(cli.KisClient, "from_env", return_value=FakeKis()) as kis_factory,
+            ):
+                first = cli.cmd_quant_rank(args)
+                conn = store._connect()
+                try:
+                    row = conn.execute(
+                        "SELECT payload FROM kr_quant_rank_cache WHERE cache_key=?",
+                        (first["cache_key"],),
+                    ).fetchone()
+                    tampered = json.loads(row[0])
+                    tampered["candidates"][0]["score"] = float(tampered["candidates"][0]["score"]) - 17.0
+                    with conn:
+                        conn.execute(
+                            "UPDATE kr_quant_rank_cache SET payload=? WHERE cache_key=?",
+                            (json.dumps(tampered, ensure_ascii=False), first["cache_key"]),
+                        )
+                finally:
+                    conn.close()
+
+                rebuilt = cli.cmd_quant_rank(args)
+
+        self.assertFalse(rebuilt["cache_hit"])
+        self.assertEqual(rebuilt["ranking_payload_hash"], first["ranking_payload_hash"])
+        self.assertEqual(discover.call_count, 2)
+        self.assertEqual(kis_factory.call_count, 2)
+
     def test_quant_rank_cache_key_isolated_by_profile_and_refresh_bypasses_hit(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = DecisionStore(Path(tmp) / "research.db")
@@ -447,7 +487,9 @@ class QuantCliTests(unittest.TestCase):
             candidate=candidate, signal="Hold", market_report="m", fundamentals_report="f",
             news_macro_report="n", bull_case="b+", bear_case="b-", research_manager="r",
             trader="t", risk_manager="risk", portfolio_manager="SIGNAL: HOLD",
-            llm_provider="openai", llm_model_id="gpt-test", workflow_version="personal-kr-v1",
+            llm_provider="openai", llm_model_id="gpt-test",
+            llm_execution_fingerprint=cli.llm_execution_fingerprint(payload["llm"]),
+            workflow_version="personal-kr-v1",
             decision_id="existing-decision", strategy_id="reuse-test",
         )
 
@@ -470,6 +512,66 @@ class QuantCliTests(unittest.TestCase):
         self.assertEqual(result["reused_count"], 1)
         self.assertEqual(result["reused_tickers"], ["005930"])
         self.assertEqual(result["results"][0].decision_id, "existing-decision")
+
+    def test_batch_rejects_same_model_with_different_llm_execution_settings_before_engine(self):
+        payload = {
+            "analysis_date": TODAY.isoformat(),
+            "ranking_source": "reuse-execution-v1",
+            "ranking_generated_at": NOW.isoformat(),
+            "ranking_mode": "observed",
+            "ranking_data_as_of": TODAY.isoformat(),
+            "limit": 1,
+            "rows": [{"ticker": "005930", "name": "Samsung", "market": "KOSPI", "score": 91}],
+            "strategy_id": "reuse-execution-test",
+            "llm": {
+                "provider": "openai",
+                "model_id": "gpt-test",
+                "endpoint": "https://new.example.com/v1/chat/completions",
+                "max_tokens": 2048,
+                "api_key": "new-secret",
+            },
+        }
+        with patch.object(cli, "_korea_now", return_value=NOW):
+            source, generated, payload_hash, mode, data_as_of = cli._ranking_provenance(payload, TODAY)
+        candidate = replace(
+            cli.select_top_candidates_isolated(payload["rows"], TODAY, 1)[0][0],
+            ranking_source=source, ranking_generated_at=generated, ranking_payload_hash=payload_hash,
+            analysis_cutoff_at=generated, analysis_cutoff_mode="external",
+            ranking_mode=mode, ranking_data_as_of=data_as_of,
+        )
+        old_llm = {
+            "provider": "openai",
+            "model_id": "gpt-test",
+            "endpoint": "https://old.example.com/v1/chat/completions",
+            "max_tokens": 4096,
+            "api_key": "old-secret",
+        }
+        existing = ResearchResult(
+            candidate=candidate, signal="Hold", market_report="m", fundamentals_report="f",
+            news_macro_report="n", bull_case="b+", bear_case="b-", research_manager="r",
+            trader="t", risk_manager="risk", portfolio_manager="SIGNAL: HOLD",
+            llm_provider="openai", llm_model_id="gpt-test",
+            llm_execution_fingerprint=cli.llm_execution_fingerprint(old_llm),
+            workflow_version="personal-kr-v1",
+        )
+
+        class Store:
+            def get_decision_by_key(self, **_kwargs):
+                return existing
+            def record_decision(self, *_args, **_kwargs):
+                raise AssertionError("conflicting decision must not be recorded")
+
+        with (
+            patch.object(cli, "_store", return_value=Store()),
+            patch.object(cli, "_korea_today", return_value=TODAY),
+            patch.object(cli, "_korea_now", return_value=NOW),
+            patch.object(cli, "_engine", side_effect=AssertionError("engine must not be constructed")) as engine,
+        ):
+            result = cli._run_batch_payload(payload)
+
+        engine.assert_not_called()
+        self.assertEqual(result["reused_count"], 0)
+        self.assertIn("provenance conflict", result["errors"]["005930"])
 
     def test_batch_existing_decision_llm_conflict_fails_before_engine_calls(self):
         payload = {
@@ -617,6 +719,23 @@ class QuantCliTests(unittest.TestCase):
             self.assertEqual(started["selected_tickers"], ["005930"])
             self.assertEqual(started["ranking"]["analysis_date"], TODAY.isoformat())
             self.assertNotIn("api_key", str(started))
+            checkpointed = store.checkpoint_research_run(
+                started["run_id"],
+                decision_ids=["decision-1"],
+                decision_refs=[{"ticker": "005930", "decision_id": "decision-1"}],
+                reused_tickers=["005930"],
+                errors={"000660": "provider failed"},
+            )
+            self.assertEqual(checkpointed["status"], "running")
+            self.assertEqual(checkpointed["decision_ids"], ["decision-1"])
+            self.assertEqual(checkpointed["reused_tickers"], ["005930"])
+            self.assertEqual(store.get_research_run(started["run_id"])["errors"], {"000660": "provider failed"})
+            matching = store.list_resumable_research_runs(
+                run_type="quant-research",
+                strategy_id="resume-test",
+                analysis_date=TODAY,
+            )
+            self.assertEqual([item["run_id"] for item in matching], [started["run_id"]])
             with self.assertRaisesRegex(ValueError, "must not contain credentials"):
                 store.start_research_run(
                     run_type="quant-research",
@@ -652,6 +771,130 @@ class QuantCliTests(unittest.TestCase):
             self.assertEqual(store.list_research_runs(1)[0]["run_id"], started["run_id"])
             with self.assertRaisesRegex(ValueError, "already finalized"):
                 store.finish_research_run(started["run_id"], status="completed")
+            with self.assertRaisesRegex(ValueError, "already finalized"):
+                store.checkpoint_research_run(started["run_id"], decision_ids=["decision-2"])
+
+    def test_batch_checkpoints_run_progress_after_each_candidate(self):
+        payload = {
+            "analysis_date": TODAY.isoformat(),
+            "ranking_source": "checkpoint-progress-v1",
+            "ranking_generated_at": NOW.isoformat(),
+            "ranking_mode": "observed",
+            "ranking_data_as_of": TODAY.isoformat(),
+            "limit": 2,
+            "rows": [
+                {"ticker": "005930", "name": "Samsung", "market": "KOSPI", "score": 91},
+                {"ticker": "000660", "name": "SK Hynix", "market": "KOSPI", "score": 90},
+            ],
+            "strategy_id": "checkpoint-progress",
+            "llm": {"provider": "openai", "model_id": "gpt-test"},
+        }
+
+        class Store:
+            def __init__(self):
+                self.checkpoints = []
+            def start_research_run(self, **_kwargs):
+                return {"run_id": "run-checkpoint"}
+            def get_decision_by_key(self, **_kwargs):
+                return None
+            def record_decision(self, result, **_kwargs):
+                return replace(result, decision_id=f"decision-{result.candidate.instrument.ticker}")
+            def checkpoint_research_run(self, run_id, **kwargs):
+                self.checkpoints.append((run_id, kwargs))
+                return {"run_id": run_id, "status": "running"}
+            def finish_research_run(self, run_id, **kwargs):
+                return {"run_id": run_id, **kwargs}
+
+        store = Store()
+        engine = Mock()
+        engine.analyze.side_effect = [
+            ResearchResult(
+                candidate=replace(
+                    cli.select_top_candidates_isolated(payload["rows"], TODAY, 2)[0][0],
+                    ranking_source="checkpoint-progress-v1",
+                    ranking_generated_at=NOW,
+                    ranking_payload_hash="a" * 64,
+                    analysis_cutoff_at=NOW,
+                    analysis_cutoff_mode="external",
+                    ranking_mode="observed",
+                    ranking_data_as_of=TODAY,
+                ),
+                signal="Hold", market_report="m", fundamentals_report="f", news_macro_report="n",
+                bull_case="b+", bear_case="b-", research_manager="r", trader="t",
+                risk_manager="risk", portfolio_manager="SIGNAL: HOLD",
+                llm_provider="openai", llm_model_id="gpt-test", workflow_version="personal-kr-v1",
+            ),
+            RuntimeError("isolated failure"),
+        ]
+        with (
+            patch.object(cli, "_store", return_value=store),
+            patch.object(cli, "_engine", return_value=engine),
+            patch.object(cli, "_korea_today", return_value=TODAY),
+            patch.object(cli, "_korea_now", return_value=NOW),
+        ):
+            result = cli._run_batch_payload(payload, run_type="quant-research")
+
+        self.assertEqual(result["run_status"], "partial")
+        self.assertGreaterEqual(len(store.checkpoints), 2)
+        self.assertEqual(store.checkpoints[0][1]["decision_ids"], ["decision-005930"])
+        self.assertEqual(store.checkpoints[-1][1]["errors"], {"000660": "isolated failure"})
+        self.assertEqual(store.checkpoints[-1][1]["decision_ids"], ["decision-005930"])
+
+    def test_batch_checkpoint_failure_is_not_reclassified_as_candidate_error(self):
+        payload = {
+            "analysis_date": TODAY.isoformat(),
+            "ranking_source": "checkpoint-failure-v1",
+            "ranking_generated_at": NOW.isoformat(),
+            "ranking_mode": "observed",
+            "ranking_data_as_of": TODAY.isoformat(),
+            "limit": 1,
+            "rows": [{"ticker": "005930", "name": "Samsung", "market": "KOSPI", "score": 91}],
+            "strategy_id": "checkpoint-failure",
+            "llm": {"provider": "openai", "model_id": "gpt-test"},
+        }
+
+        class Store:
+            def __init__(self):
+                self.checkpoint_calls = 0
+            def start_research_run(self, **_kwargs):
+                return {"run_id": "run-checkpoint-failure"}
+            def get_decision_by_key(self, **_kwargs):
+                return None
+            def record_decision(self, result, **_kwargs):
+                return replace(result, decision_id="decision-005930")
+            def checkpoint_research_run(self, _run_id, **_kwargs):
+                self.checkpoint_calls += 1
+                raise ValueError("research run is already finalized")
+
+        store = Store()
+        candidate = replace(
+            cli.select_top_candidates_isolated(payload["rows"], TODAY, 1)[0][0],
+            ranking_source="checkpoint-failure-v1",
+            ranking_generated_at=NOW,
+            ranking_payload_hash="a" * 64,
+            analysis_cutoff_at=NOW,
+            analysis_cutoff_mode="external",
+            ranking_mode="observed",
+            ranking_data_as_of=TODAY,
+        )
+        engine = Mock()
+        engine.analyze.return_value = ResearchResult(
+            candidate=candidate, signal="Hold", market_report="m", fundamentals_report="f", news_macro_report="n",
+            bull_case="b+", bear_case="b-", research_manager="r", trader="t", risk_manager="risk",
+            portfolio_manager="SIGNAL: HOLD", llm_provider="openai", llm_model_id="gpt-test",
+            workflow_version="personal-kr-v1",
+        )
+
+        with (
+            patch.object(cli, "_store", return_value=store),
+            patch.object(cli, "_engine", return_value=engine),
+            patch.object(cli, "_korea_today", return_value=TODAY),
+            patch.object(cli, "_korea_now", return_value=NOW),
+        ):
+            with self.assertRaisesRegex(ValueError, "already finalized"):
+                cli._run_batch_payload(payload, run_type="quant-research")
+
+        self.assertEqual(store.checkpoint_calls, 1)
 
     def test_batch_progress_marks_reused_decision_without_constructing_engine(self):
         payload = {
@@ -677,7 +920,9 @@ class QuantCliTests(unittest.TestCase):
             candidate=candidate, signal="Hold", market_report="m", fundamentals_report="f",
             news_macro_report="n", bull_case="b+", bear_case="b-", research_manager="r",
             trader="t", risk_manager="risk", portfolio_manager="SIGNAL: HOLD",
-            llm_provider="openai", llm_model_id="gpt-test", workflow_version="personal-kr-v1",
+            llm_provider="openai", llm_model_id="gpt-test",
+            llm_execution_fingerprint=cli.llm_execution_fingerprint(payload["llm"]),
+            workflow_version="personal-kr-v1",
             decision_id="decision-existing", strategy_id="progress-reuse",
         )
 
@@ -713,6 +958,7 @@ class QuantCliTests(unittest.TestCase):
             analysis_date=TODAY,
             strategy_id="quant-e2e",
             llm_identity=("openai", "gpt-test"),
+            llm_execution_fingerprint_value=cli.llm_execution_fingerprint(llm),
         )
         fingerprint = cli._quant_research_request_fingerprint(context)
         ranking = {
@@ -747,8 +993,11 @@ class QuantCliTests(unittest.TestCase):
         }
 
         class ResumeStore:
-            def list_research_runs(self, _limit):
+            def list_resumable_research_runs(self, **kwargs):
+                self.query = kwargs
                 return [interrupted]
+            def list_research_runs(self, _limit):
+                raise AssertionError("targeted resume lookup should be preferred")
 
         captured = {}
         def fake_batch(payload, **kwargs):

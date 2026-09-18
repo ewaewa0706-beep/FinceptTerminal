@@ -285,6 +285,7 @@ class ResearchResult:
     evidence: dict[str, Any] = field(default_factory=dict)
     llm_provider: str = ""
     llm_model_id: str = ""
+    llm_execution_fingerprint: str = ""
     workflow_version: str = "personal-kr-v1"
 
     def __post_init__(self) -> None:
