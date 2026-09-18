@@ -93,6 +93,7 @@ def credential_status(llm_provider: str | None = None) -> dict[str, Any]:
             "ready": keys["kis"],
             "mode": "bounded_kis_feature_rank",
             "historical_mode": "current_date_only",
+            "default_cache_ttl_seconds": 300,
         },
         "llm": {
             "ready": llm_ready,
@@ -547,6 +548,37 @@ def cmd_quant_rank(args: argparse.Namespace) -> Any:
     quant_weights = weights_for_quant_profile(quant_profile)
     discovery_profile = str(args.discovery_profile or "balanced")
     markets = list(args.market or [])
+    cache_ttl_seconds = int(getattr(args, "cache_ttl_seconds", 0) or 0)
+    if cache_ttl_seconds < 0 or cache_ttl_seconds > 3600:
+        raise ValueError("cache_ttl_seconds must be between 0 and 3600")
+    force_refresh = bool(getattr(args, "refresh", False))
+    cache_key = _quant_rank_cache_key(
+        analysis_date=analysis_date,
+        markets=markets,
+        limit=limit,
+        prefilter_limit=prefilter_limit,
+        lookback_days=lookback_days,
+        min_trading_value_krw=int(args.min_trading_value_krw),
+        quant_profile=quant_profile,
+        discovery_profile=discovery_profile,
+        dart_enabled=bool(os.getenv("DART_API_KEY")),
+    )
+    cache_store = _store() if cache_ttl_seconds > 0 else None
+    if cache_store is not None and not force_refresh:
+        cached = cache_store.get_quant_rank_cache(cache_key, now=_korea_now())
+        if cached is not None:
+            result = _hydrate_quant_rank_result(cached["payload"])
+            result.update(
+                {
+                    "cache_enabled": True,
+                    "cache_hit": True,
+                    "cache_key": cache_key,
+                    "cache_created_at": cached["created_at"],
+                    "cache_expires_at": cached["expires_at"],
+                    "cache_ttl_seconds": cache_ttl_seconds,
+                }
+            )
+            return result
     discovery = cmd_discover(
         argparse.Namespace(
             analysis_date=analysis_date.isoformat(),
@@ -719,7 +751,7 @@ def cmd_quant_rank(args: argparse.Namespace) -> Any:
         )
         for candidate in candidates
     ]
-    return {
+    result = {
         "analysis_date": analysis_date,
         "source": "KIS bounded per-symbol feature ranking",
         "scoring_model": "kis-feature-quant-v1",
@@ -749,6 +781,84 @@ def cmd_quant_rank(args: argparse.Namespace) -> Any:
         "ranking": ranking_payload,
         "execution_mode": "research_only",
     }
+    if cache_store is not None:
+        cached = cache_store.put_quant_rank_cache(
+            cache_key,
+            result,
+            ttl_seconds=cache_ttl_seconds,
+            created_at=frozen_generated_at,
+        )
+        result.update(
+            {
+                "cache_enabled": True,
+                "cache_hit": False,
+                "cache_key": cache_key,
+                "cache_created_at": cached["created_at"],
+                "cache_expires_at": cached["expires_at"],
+                "cache_ttl_seconds": cache_ttl_seconds,
+            }
+        )
+    else:
+        result.update(
+            {
+                "cache_enabled": False,
+                "cache_hit": False,
+                "cache_key": cache_key,
+                "cache_created_at": None,
+                "cache_expires_at": None,
+                "cache_ttl_seconds": 0,
+            }
+        )
+    return result
+
+
+def _quant_rank_cache_key(
+    *,
+    analysis_date: date,
+    markets: list[str],
+    limit: int,
+    prefilter_limit: int,
+    lookback_days: int,
+    min_trading_value_krw: int,
+    quant_profile: str,
+    discovery_profile: str,
+    dart_enabled: bool,
+) -> str:
+    requested = {str(market).upper().strip() for market in markets}
+    canonical_markets = [
+        market for market in ("KOSPI", "KOSDAQ") if not requested or market in requested
+    ]
+    payload = {
+        "schema": "personal-kr-quant-cache-v1",
+        "analysis_date": analysis_date.isoformat(),
+        "markets": canonical_markets,
+        "limit": int(limit),
+        "prefilter_limit": int(prefilter_limit),
+        "lookback_days": int(lookback_days),
+        "min_trading_value_krw": int(min_trading_value_krw),
+        "quant_profile": str(quant_profile),
+        "discovery_profile": str(discovery_profile),
+        "dart_enabled": bool(dart_enabled),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _hydrate_quant_rank_result(payload: dict[str, Any]) -> dict[str, Any]:
+    """Restore dataclass/date objects so a cache hit matches a fresh CLI result."""
+
+    result = dict(payload)
+    result["analysis_date"] = date.fromisoformat(str(result["analysis_date"]))
+    result["ranking_generated_at"] = datetime.fromisoformat(
+        str(result["ranking_generated_at"]).replace("Z", "+00:00")
+    )
+    result["ranking_data_as_of"] = date.fromisoformat(str(result["ranking_data_as_of"]))
+    candidates = result.get("candidates") or []
+    if not isinstance(candidates, list):
+        raise ValueError("invalid cached quant candidates")
+    result["candidates"] = [_candidate_from_payload(dict(item)) for item in candidates]
+    return result
 
 
 def _safe_quant_error(exc: Exception) -> str:
@@ -1047,6 +1157,8 @@ def build_parser() -> argparse.ArgumentParser:
     quant_rank.add_argument("--min-trading-value-krw", type=int, default=0)
     quant_rank.add_argument("--profile", choices=QUANT_PROFILE_NAMES, default="balanced")
     quant_rank.add_argument("--discovery-profile", choices=DISCOVERY_PROFILE_NAMES, default="balanced")
+    quant_rank.add_argument("--cache-ttl-seconds", type=int, default=300)
+    quant_rank.add_argument("--refresh", action="store_true")
     for name in ("providers-only", "full"):
         p = sub.add_parser(name)
         p.add_argument("--ticker", default="005930")

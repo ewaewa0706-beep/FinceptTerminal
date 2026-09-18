@@ -185,7 +185,8 @@ std::vector<ToolDef> get_personal_kr_research_tools() {
         t.description = "Build a current-date, batch-ready Korean Quant Ranking without an LLM. It first uses the "
                         "PIT-safe whole-market discovery layer as a bounded prefilter, then fetches KIS daily bars "
                         "and per-stock foreign/institution flow only for that slice, with optional PIT-safe DART fundamentals. "
-                        "Scores combine momentum, flow, fundamentals, liquidity and inverse volatility. Historical dates are rejected because the "
+                        "Scores combine momentum, flow, fundamentals, liquidity and inverse volatility. Identical requests use a short mutable "
+                        "API-call cache while preserving the original ranking timestamp/hash. Historical dates are rejected because the "
                         "KIS investor-flow quote is not an arbitrary-date historical endpoint.";
         t.category = "equity-research";
         t.input_schema =
@@ -201,6 +202,9 @@ std::vector<ToolDef> get_personal_kr_research_tools() {
                 .integer("lookback_days", "KIS daily-price calendar lookback")
                 .default_int(120)
                 .between(90, 365)
+                .integer("cache_ttl_seconds", "Short Quant Ranking API-call cache TTL; 0 disables cache")
+                .default_int(300)
+                .between(0, 3600)
                 .integer("min_trading_value_krw", "Minimum discovery-stage trading value in KRW")
                 .default_int(0)
                 .between(0, 2000000000000000LL)
@@ -223,6 +227,7 @@ std::vector<ToolDef> get_personal_kr_research_tools() {
                 "--limit", QString::number(args.value("limit").toInt(10)),
                 "--prefilter-limit", QString::number(args.value("prefilter_limit").toInt(30)),
                 "--lookback-days", QString::number(args.value("lookback_days").toInt(120)),
+                "--cache-ttl-seconds", QString::number(args.value("cache_ttl_seconds").toInt(300)),
                 "--min-trading-value-krw",
                 QString::number(args.value("min_trading_value_krw").toInteger(0)),
                 "--profile", args.value("profile").toString("balanced"),

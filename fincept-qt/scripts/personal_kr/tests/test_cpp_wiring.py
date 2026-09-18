@@ -161,6 +161,7 @@ class CppWiringTests(unittest.TestCase):
         self.assertIn('enums({"balanced", "momentum", "flow", "defensive"})', section)
         self.assertIn('"--prefilter-limit"', section)
         self.assertIn('"--lookback-days"', section)
+        self.assertIn('"--cache-ttl-seconds"', section)
         self.assertIn(".between(1, 50)", section)
         self.assertNotIn('payload["llm"]', section)
         self.assertNotIn("paper", section.lower())

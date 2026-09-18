@@ -93,6 +93,7 @@ python personal_kr_terminal.py status
 python personal_kr_terminal.py llm-smoke
 python personal_kr_terminal.py discover --limit 20 --min-trading-value-krw 1000000000
 python personal_kr_terminal.py quant-rank --prefilter-limit 30 --limit 10 --profile balanced
+python personal_kr_terminal.py quant-rank --prefilter-limit 30 --limit 10 --refresh
 ```
 
 Without stdin, `llm-smoke` uses the headless `GOOGLE_API_KEY` fallback. The
@@ -157,6 +158,15 @@ separate SHA-256 audit hash, while the selected Top-N rows use the normal batch
 ranking hash/provenance contract. This stage never calls an LLM and never places
 an order. The 15-name DART cap prevents optional enrichment from turning a
 30-50 name market prefilter into an unbounded disclosure-API fan-out.
+
+Repeated identical `quant-rank` requests use a short SQLite cache by default
+(`--cache-ttl-seconds 300`). The cache key includes analysis date, market scope,
+Top-N/prefilter limits, lookback, liquidity floor, Quant/discovery profiles and
+whether DART enrichment is enabled. A cache hit reuses the original ranking
+envelope and its original `ranking_generated_at`/hash rather than pretending the
+cache-read time is new PIT evidence. Use `--refresh` to bypass the read cache, or
+`--cache-ttl-seconds 0` to disable caching. Expired or malformed cache rows are
+discarded automatically and fresh provider calls are made.
 
 Quant Ranking v1 is intentionally current-date only. The KIS per-stock investor
 flow quote used here does not accept an arbitrary historical date, so an old

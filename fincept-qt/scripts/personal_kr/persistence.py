@@ -11,6 +11,7 @@ from contextlib import closing
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 from .evaluation import Outcome
 from .models import KR_DAILY_FINALITY_TIME, Instrument, ResearchResult, to_jsonable, validate_ticker
@@ -106,6 +107,14 @@ class DecisionStore:
                     payload_sha256 TEXT NOT NULL,
                     captured_at TEXT NOT NULL,
                     PRIMARY KEY(snapshot_date,markets_json,common_only,exclude_spac)
+                )"""
+                )
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS kr_quant_rank_cache(
+                    cache_key TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
                 )"""
                 )
                 columns = {row[1] for row in conn.execute("PRAGMA table_info(kr_paper_trades)")}
@@ -206,6 +215,103 @@ class DecisionStore:
                 (snapshot_date.isoformat(), markets_json, int(common_only), int(exclude_spac)),
             ).fetchone()
         return _universe_snapshot_from_row(row) if row is not None else None
+
+    def get_quant_rank_cache(
+        self,
+        cache_key: str,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        """Return one unexpired mutable Quant Ranking cache entry.
+
+        This table is explicitly an API-call cache, not immutable PIT evidence.
+        The cached payload keeps its original ranking_generated_at/provenance;
+        callers must never rewrite those fields to the cache-read time.
+        """
+
+        key = str(cache_key).strip().lower()
+        if not _is_sha256(key):
+            raise ValueError("quant rank cache_key must be a SHA-256 fingerprint")
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None or current.utcoffset() is None:
+            raise ValueError("quant rank cache now must be timezone-aware")
+        current_utc = current.astimezone(timezone.utc)
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT payload,created_at,expires_at FROM kr_quant_rank_cache WHERE cache_key=?",
+                (key,),
+            ).fetchone()
+            if row is None:
+                return None
+            try:
+                expires_at = datetime.fromisoformat(str(row["expires_at"]))
+                created_at = datetime.fromisoformat(str(row["created_at"]))
+                payload = json.loads(str(row["payload"]))
+                valid = (
+                    expires_at.tzinfo is not None
+                    and created_at.tzinfo is not None
+                    and isinstance(payload, dict)
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                valid = False
+                payload = None
+            if not valid:
+                with conn:
+                    conn.execute("DELETE FROM kr_quant_rank_cache WHERE cache_key=?", (key,))
+                return None
+            if expires_at.astimezone(timezone.utc) <= current_utc:
+                with conn:
+                    conn.execute("DELETE FROM kr_quant_rank_cache WHERE cache_key=?", (key,))
+                return None
+        return {
+            "payload": payload,
+            "created_at": created_at,
+            "expires_at": expires_at,
+        }
+
+    def put_quant_rank_cache(
+        self,
+        cache_key: str,
+        payload: dict[str, Any],
+        *,
+        ttl_seconds: int,
+        created_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Upsert a short-lived Quant Ranking cache entry.
+
+        Cache entries are intentionally mutable/replaceable, unlike decisions,
+        outcomes and universe snapshots. The ranking payload itself remains
+        immutable evidence because its original hashes/timestamps are preserved.
+        """
+
+        key = str(cache_key).strip().lower()
+        if not _is_sha256(key):
+            raise ValueError("quant rank cache_key must be a SHA-256 fingerprint")
+        ttl = int(ttl_seconds)
+        if ttl < 1 or ttl > 3600:
+            raise ValueError("quant rank cache ttl_seconds must be between 1 and 3600")
+        created = created_at or datetime.now(timezone.utc)
+        if created.tzinfo is None or created.utcoffset() is None:
+            raise ValueError("quant rank cache created_at must be timezone-aware")
+        created_utc = created.astimezone(timezone.utc)
+        expires_utc = created_utc + timedelta(seconds=ttl)
+        serialized = _canonical_json(to_jsonable(payload))
+        with closing(self._connect()) as conn:
+            with conn:
+                conn.execute(
+                    """INSERT INTO kr_quant_rank_cache(cache_key,payload,created_at,expires_at)
+                    VALUES(?,?,?,?)
+                    ON CONFLICT(cache_key) DO UPDATE SET
+                        payload=excluded.payload,
+                        created_at=excluded.created_at,
+                        expires_at=excluded.expires_at""",
+                    (key, serialized, created_utc.isoformat(), expires_utc.isoformat()),
+                )
+        return {
+            "payload": json.loads(serialized),
+            "created_at": created_utc,
+            "expires_at": expires_utc,
+        }
 
     def _migrate_outcome_provenance(self, conn: sqlite3.Connection) -> None:
         """Quarantine legacy outcomes that cannot satisfy the immutable provenance contract.

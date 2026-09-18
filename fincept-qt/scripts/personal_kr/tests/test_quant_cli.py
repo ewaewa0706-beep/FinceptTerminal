@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import unittest
+import tempfile
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -15,6 +17,7 @@ from personal_kr.models import (
     QuantCandidate,
     ResearchResult,
 )
+from personal_kr.persistence import DecisionStore
 
 
 KST = timezone(timedelta(hours=9))
@@ -57,6 +60,8 @@ class QuantCliTests(unittest.TestCase):
             "min_trading_value_krw": 0,
             "profile": "balanced",
             "discovery_profile": "balanced",
+            "cache_ttl_seconds": 0,
+            "refresh": False,
         }
         values.update(overrides)
         return SimpleNamespace(**values)
@@ -279,6 +284,96 @@ class QuantCliTests(unittest.TestCase):
         self.assertEqual(candidate.analysis_cutoff_mode, "external")
         self.assertEqual(store.saved[0][1], "personal-kr-quant-test")
         self.assertEqual(result["selected"][0].ranking_payload_hash, quant["ranking_payload_hash"])
+
+    def test_quant_rank_cache_hit_skips_discovery_and_provider_fanout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DecisionStore(Path(tmp) / "research.db")
+            args = self.args(limit=1, prefilter_limit=2, cache_ttl_seconds=300)
+            with (
+                patch.dict(
+                    "os.environ",
+                    {"KIS_APP_KEY": "key", "KIS_APP_SECRET": "secret", "DART_API_KEY": ""},
+                    clear=False,
+                ),
+                patch.object(cli, "_store", return_value=store),
+                patch.object(cli, "_korea_today", return_value=TODAY),
+                patch.object(cli, "_korea_now", return_value=NOW),
+                patch.object(cli, "cmd_discover", return_value=self.discovery()) as discover,
+                patch.object(cli.KisClient, "from_env", return_value=FakeKis()) as kis_factory,
+            ):
+                first = cli.cmd_quant_rank(args)
+                second = cli.cmd_quant_rank(args)
+
+        self.assertFalse(first["cache_hit"])
+        self.assertTrue(second["cache_hit"])
+        self.assertEqual(first["ranking_payload_hash"], second["ranking_payload_hash"])
+        self.assertEqual(first["ranking_generated_at"], second["ranking_generated_at"])
+        self.assertEqual(discover.call_count, 1)
+        self.assertEqual(kis_factory.call_count, 1)
+
+    def test_quant_rank_cache_key_isolated_by_profile_and_refresh_bypasses_hit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DecisionStore(Path(tmp) / "research.db")
+            with (
+                patch.dict(
+                    "os.environ",
+                    {"KIS_APP_KEY": "key", "KIS_APP_SECRET": "secret", "DART_API_KEY": ""},
+                    clear=False,
+                ),
+                patch.object(cli, "_store", return_value=store),
+                patch.object(cli, "_korea_today", return_value=TODAY),
+                patch.object(cli, "_korea_now", return_value=NOW),
+                patch.object(cli, "cmd_discover", return_value=self.discovery()) as discover,
+                patch.object(cli.KisClient, "from_env", return_value=FakeKis()),
+            ):
+                balanced = cli.cmd_quant_rank(self.args(limit=1, cache_ttl_seconds=300))
+                momentum = cli.cmd_quant_rank(
+                    self.args(limit=1, cache_ttl_seconds=300, profile="momentum")
+                )
+                refreshed = cli.cmd_quant_rank(
+                    self.args(limit=1, cache_ttl_seconds=300, refresh=True)
+                )
+
+        self.assertNotEqual(balanced["cache_key"], momentum["cache_key"])
+        self.assertFalse(momentum["cache_hit"])
+        self.assertFalse(refreshed["cache_hit"])
+        self.assertEqual(discover.call_count, 3)
+
+    def test_quant_rank_cache_expires_and_corrupt_rows_self_heal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DecisionStore(Path(tmp) / "research.db")
+            key = "c" * 64
+            payload = {"analysis_date": TODAY.isoformat(), "value": 1}
+            stored = store.put_quant_rank_cache(key, payload, ttl_seconds=60, created_at=NOW)
+            self.assertEqual(stored["payload"], payload)
+            hit = store.get_quant_rank_cache(key, now=NOW + timedelta(seconds=59))
+            self.assertIsNotNone(hit)
+            self.assertIsNone(store.get_quant_rank_cache(key, now=NOW + timedelta(seconds=60)))
+
+            conn = store._connect()
+            try:
+                with conn:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO kr_quant_rank_cache(cache_key,payload,created_at,expires_at) "
+                        "VALUES(?,?,?,?)",
+                        (
+                            key,
+                            "{broken-json",
+                            NOW.astimezone(timezone.utc).isoformat(),
+                            (NOW + timedelta(minutes=5)).astimezone(timezone.utc).isoformat(),
+                        ),
+                    )
+            finally:
+                conn.close()
+            self.assertIsNone(store.get_quant_rank_cache(key, now=NOW))
+            conn = store._connect()
+            try:
+                remaining = conn.execute(
+                    "SELECT COUNT(*) FROM kr_quant_rank_cache WHERE cache_key=?", (key,)
+                ).fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(remaining, 0)
 
 
 if __name__ == "__main__":
