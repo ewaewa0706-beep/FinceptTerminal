@@ -567,18 +567,26 @@ def cmd_quant_rank(args: argparse.Namespace) -> Any:
     if cache_store is not None and not force_refresh:
         cached = cache_store.get_quant_rank_cache(cache_key, now=_korea_now())
         if cached is not None:
-            result = _hydrate_quant_rank_result(cached["payload"])
-            result.update(
-                {
-                    "cache_enabled": True,
-                    "cache_hit": True,
-                    "cache_key": cache_key,
-                    "cache_created_at": cached["created_at"],
-                    "cache_expires_at": cached["expires_at"],
-                    "cache_ttl_seconds": cache_ttl_seconds,
-                }
-            )
-            return result
+            try:
+                result = _hydrate_quant_rank_result(cached["payload"])
+            except (KeyError, TypeError, ValueError):
+                # The API cache is mutable acceleration only, never PIT evidence.
+                # A structurally valid JSON row can still be stale/corrupt or
+                # internally inconsistent, so discard it and rebuild from the
+                # providers instead of surfacing mismatched provenance.
+                cache_store.delete_quant_rank_cache(cache_key)
+            else:
+                result.update(
+                    {
+                        "cache_enabled": True,
+                        "cache_hit": True,
+                        "cache_key": cache_key,
+                        "cache_created_at": cached["created_at"],
+                        "cache_expires_at": cached["expires_at"],
+                        "cache_ttl_seconds": cache_ttl_seconds,
+                    }
+                )
+                return result
     discovery = cmd_discover(
         argparse.Namespace(
             analysis_date=analysis_date.isoformat(),
@@ -846,18 +854,50 @@ def _quant_rank_cache_key(
 
 
 def _hydrate_quant_rank_result(payload: dict[str, Any]) -> dict[str, Any]:
-    """Restore dataclass/date objects so a cache hit matches a fresh CLI result."""
+    """Restore and verify one cached Quant Ranking result."""
 
     result = dict(payload)
-    result["analysis_date"] = date.fromisoformat(str(result["analysis_date"]))
-    result["ranking_generated_at"] = datetime.fromisoformat(
+    analysis_date = date.fromisoformat(str(result["analysis_date"]))
+    ranking = result.get("ranking")
+    if not isinstance(ranking, dict):
+        raise ValueError("invalid cached quant ranking envelope")
+    source, generated_at, payload_hash, mode, data_as_of = _ranking_provenance(
+        ranking, analysis_date
+    )
+    if str(result.get("ranking_source") or "") != source:
+        raise ValueError("cached quant ranking_source mismatch")
+    if str(result.get("ranking_payload_hash") or "").lower() != payload_hash:
+        raise ValueError("cached quant ranking_payload_hash mismatch")
+    if str(result.get("ranking_mode") or "observed").lower() != mode:
+        raise ValueError("cached quant ranking_mode mismatch")
+    top_generated = datetime.fromisoformat(
         str(result["ranking_generated_at"]).replace("Z", "+00:00")
     )
-    result["ranking_data_as_of"] = date.fromisoformat(str(result["ranking_data_as_of"]))
+    if top_generated != generated_at:
+        raise ValueError("cached quant ranking_generated_at mismatch")
+    top_data_as_of = date.fromisoformat(str(result["ranking_data_as_of"]))
+    if top_data_as_of != data_as_of:
+        raise ValueError("cached quant ranking_data_as_of mismatch")
+
     candidates = result.get("candidates") or []
     if not isinstance(candidates, list):
         raise ValueError("invalid cached quant candidates")
-    result["candidates"] = [_candidate_from_payload(dict(item)) for item in candidates]
+    hydrated_candidates = [_candidate_from_payload(dict(item)) for item in candidates]
+    for candidate in hydrated_candidates:
+        if (
+            candidate.analysis_date != analysis_date
+            or candidate.ranking_source != source
+            or candidate.ranking_generated_at != generated_at
+            or candidate.ranking_payload_hash != payload_hash
+            or candidate.ranking_mode != mode
+            or candidate.ranking_data_as_of != data_as_of
+        ):
+            raise ValueError("cached quant candidate provenance mismatch")
+
+    result["analysis_date"] = analysis_date
+    result["ranking_generated_at"] = generated_at
+    result["ranking_data_as_of"] = data_as_of
+    result["candidates"] = hydrated_candidates
     return result
 
 

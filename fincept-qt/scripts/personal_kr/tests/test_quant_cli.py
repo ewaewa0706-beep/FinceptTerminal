@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 import tempfile
+import json
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -310,6 +311,46 @@ class QuantCliTests(unittest.TestCase):
         self.assertEqual(first["ranking_generated_at"], second["ranking_generated_at"])
         self.assertEqual(discover.call_count, 1)
         self.assertEqual(kis_factory.call_count, 1)
+
+    def test_quant_rank_parseable_corrupt_cache_self_heals_from_providers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DecisionStore(Path(tmp) / "research.db")
+            args = self.args(limit=1, prefilter_limit=2, cache_ttl_seconds=300)
+            with (
+                patch.dict(
+                    "os.environ",
+                    {"KIS_APP_KEY": "key", "KIS_APP_SECRET": "secret", "DART_API_KEY": ""},
+                    clear=False,
+                ),
+                patch.object(cli, "_store", return_value=store),
+                patch.object(cli, "_korea_today", return_value=TODAY),
+                patch.object(cli, "_korea_now", return_value=NOW),
+                patch.object(cli, "cmd_discover", return_value=self.discovery()) as discover,
+                patch.object(cli.KisClient, "from_env", return_value=FakeKis()) as kis_factory,
+            ):
+                first = cli.cmd_quant_rank(args)
+                conn = store._connect()
+                try:
+                    row = conn.execute(
+                        "SELECT payload FROM kr_quant_rank_cache WHERE cache_key=?",
+                        (first["cache_key"],),
+                    ).fetchone()
+                    tampered = json.loads(row[0])
+                    tampered["ranking_payload_hash"] = "b" * 64
+                    with conn:
+                        conn.execute(
+                            "UPDATE kr_quant_rank_cache SET payload=? WHERE cache_key=?",
+                            (json.dumps(tampered, ensure_ascii=False), first["cache_key"]),
+                        )
+                finally:
+                    conn.close()
+
+                rebuilt = cli.cmd_quant_rank(args)
+
+        self.assertFalse(rebuilt["cache_hit"])
+        self.assertEqual(rebuilt["ranking_payload_hash"], first["ranking_payload_hash"])
+        self.assertEqual(discover.call_count, 2)
+        self.assertEqual(kis_factory.call_count, 2)
 
     def test_quant_rank_cache_key_isolated_by_profile_and_refresh_bypasses_hit(self):
         with tempfile.TemporaryDirectory() as tmp:

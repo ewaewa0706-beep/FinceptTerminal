@@ -269,6 +269,16 @@ class DecisionStore:
             "expires_at": expires_at,
         }
 
+    def delete_quant_rank_cache(self, cache_key: str) -> None:
+        """Delete one mutable Quant Ranking cache entry."""
+
+        key = str(cache_key).strip().lower()
+        if not _is_sha256(key):
+            raise ValueError("quant rank cache_key must be a SHA-256 fingerprint")
+        with closing(self._connect()) as conn:
+            with conn:
+                conn.execute("DELETE FROM kr_quant_rank_cache WHERE cache_key=?", (key,))
+
     def put_quant_rank_cache(
         self,
         cache_key: str,
