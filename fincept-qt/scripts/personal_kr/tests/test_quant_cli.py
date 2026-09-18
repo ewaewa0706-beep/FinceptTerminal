@@ -87,6 +87,16 @@ class QuantCliTests(unittest.TestCase):
         self.assertEqual(result["ranking_generated_at"], NOW)
         self.assertEqual(len(result["ranking_payload_hash"]), 64)
         self.assertEqual(result["upstream_discovery_hash"], "a" * 64)
+        self.assertEqual(len(result["preliminary_feature_payload_hash"]), 64)
+        self.assertEqual(len(result["feature_payload_hash"]), 64)
+        self.assertIn(
+            f"prefilter_features_sha256={result['preliminary_feature_payload_hash']}",
+            result["ranking_source"],
+        )
+        self.assertIn(
+            f"finalist_features_sha256={result['feature_payload_hash']}",
+            result["ranking_source"],
+        )
         self.assertEqual(result["feature_record_count"], 2)
         self.assertIn("000660", result["flow_errors"])
         self.assertNotIn("secret", result["flow_errors"]["000660"])

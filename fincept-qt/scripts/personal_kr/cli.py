@@ -611,6 +611,15 @@ def cmd_quant_rank(args: argparse.Namespace) -> Any:
     if not preliminary_candidates:
         raise RuntimeError("quant-rank produced no scored candidates")
 
+    preliminary_feature_payload_hash = hashlib.sha256(
+        json.dumps(
+            preliminary_rows,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
     candidates = preliminary_candidates[:limit]
     feature_rows = preliminary_rows
     dart_enrichment_count = 0
@@ -662,7 +671,8 @@ def cmd_quant_rank(args: argparse.Namespace) -> Any:
     ranking_source = (
         f"fincept-kis-feature-quant-v1/{quant_profile}"
         f";upstream_sha256={discovery['ranking_payload_hash']}"
-        f";features_sha256={feature_payload_hash}"
+        f";prefilter_features_sha256={preliminary_feature_payload_hash}"
+        f";finalist_features_sha256={feature_payload_hash}"
     )
     rows_by_ticker = {str(row["ticker"]): row for row in selected_feature_rows}
     ranking_rows = [
@@ -728,6 +738,7 @@ def cmd_quant_rank(args: argparse.Namespace) -> Any:
         "dart_enrichment": dart is not None,
         "upstream_discovery_source": discovery["ranking_source"],
         "upstream_discovery_hash": discovery["ranking_payload_hash"],
+        "preliminary_feature_payload_hash": preliminary_feature_payload_hash,
         "feature_payload_hash": feature_payload_hash,
         "ranking_source": frozen_source,
         "ranking_generated_at": frozen_generated_at,
