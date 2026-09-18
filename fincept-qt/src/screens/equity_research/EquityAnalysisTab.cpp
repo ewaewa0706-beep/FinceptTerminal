@@ -1247,7 +1247,7 @@ void EquityAnalysisTab::on_kr_quant_research_clicked() {
                                              ? static_cast<qint64>(kr_discovery_min_value_->value() * 100000000.0)
                                              : 0;
 
-    QJsonObject input{{"strategy_id", "personal-kr-quant-research-ui"}};
+    QJsonObject input{{"strategy_id", "personal-kr-quant-research-ui"}, {"resume", true}};
     const QJsonObject llm = fincept::services::equity::personal_kr_active_llm_config();
     if (!llm.isEmpty())
         input["llm"] = llm;
@@ -1353,21 +1353,89 @@ void EquityAnalysisTab::on_kr_quant_research_clicked() {
                     self->kr_discovery_batch_btn_->setEnabled(true);
             }
 
-            const int completed = data.value("results").toArray().size();
-            const int failed = data.value("errors").toObject().size() + data.value("input_errors").toObject().size();
+            const int completed = data.value("completed_count").toInt(data.value("results").toArray().size());
+            const int failed = data.value("failed_count").toInt(
+                data.value("errors").toObject().size() + data.value("input_errors").toObject().size());
+            const int reused = data.value("reused_count").toInt();
             const QString cache_state = data.value("cache_hit").toBool(false)
                                             ? self->tr("cached rank")
                                             : self->tr("fresh rank");
             if (self->kr_discovery_status_)
                 self->kr_discovery_status_->setText(
-                    self->tr("Completed Quant + AI · %1 · %2/%3 decisions · %4 error(s) · research_only")
+                    self->tr("Completed Quant + AI | %1 | %2/%3 decisions | reused %4 | %5 error(s) | research_only")
                         .arg(cache_state)
                         .arg(completed)
                         .arg(selected.size())
+                        .arg(reused)
                         .arg(failed));
             if (self->kr_discovery_result_)
                 self->kr_discovery_result_->setPlainText(
                     QString::fromUtf8(QJsonDocument(data).toJson(QJsonDocument::Indented)));
+        },
+        [self](QString line, bool is_stderr) {
+            if (!self || !is_stderr || !self->kr_discovery_status_)
+                return;
+            const QString prefix = QStringLiteral("FINCEPT_KR_PROGRESS ");
+            if (!line.startsWith(prefix))
+                return;
+            const QJsonDocument progress_doc = QJsonDocument::fromJson(line.mid(prefix.size()).toUtf8());
+            if (!progress_doc.isObject())
+                return;
+            const QJsonObject event = progress_doc.object();
+            const QString event_name = event.value("event").toString();
+            if (event_name == QLatin1String("resume_found")) {
+                self->kr_discovery_status_->setText(
+                    self->tr("Resuming interrupted run %1 with its frozen Quant Ranking...")
+                        .arg(event.value("run_id").toString().left(8)));
+                return;
+            }
+            if (event_name == QLatin1String("quant_started")) {
+                self->kr_discovery_status_->setText(self->tr("Building bounded Quant Ranking..."));
+                return;
+            }
+            if (event_name == QLatin1String("quant_ready")) {
+                const QString cache_state = event.value("cache_hit").toBool(false)
+                                                ? self->tr("cache reused")
+                                                : self->tr("fresh");
+                self->kr_discovery_status_->setText(
+                    self->tr("Quant ready | %1 | Top %2 | starting AI research...")
+                        .arg(cache_state)
+                        .arg(event.value("candidate_count").toInt()));
+                return;
+            }
+            if (event_name == QLatin1String("candidate_progress")) {
+                const int position = event.value("position").toInt();
+                const int total = event.value("total").toInt();
+                const QString ticker = event.value("ticker").toString();
+                const QString status = event.value("status").toString();
+                QString action;
+                if (status == QLatin1String("checking"))
+                    action = self->tr("checking resume state");
+                else if (status == QLatin1String("analyzing"))
+                    action = self->tr("AI research running");
+                else if (status == QLatin1String("reused"))
+                    action = self->tr("reused saved decision");
+                else if (status == QLatin1String("stored"))
+                    action = self->tr("decision checkpointed");
+                else if (status == QLatin1String("error"))
+                    action = self->tr("failed; continuing next stock");
+                else
+                    action = status;
+                self->kr_discovery_status_->setText(
+                    self->tr("Top-N progress %1/%2 | %3 | %4")
+                        .arg(position)
+                        .arg(total)
+                        .arg(ticker)
+                        .arg(action));
+                return;
+            }
+            if (event_name == QLatin1String("batch_completed")) {
+                self->kr_discovery_status_->setText(
+                    self->tr("Finalizing run | completed %1 | reused %2 | failed %3")
+                        .arg(event.value("completed").toInt())
+                        .arg(event.value("reused").toInt())
+                        .arg(event.value("failed").toInt()));
+            }
         });
 }
 

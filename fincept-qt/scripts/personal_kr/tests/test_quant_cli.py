@@ -551,13 +551,18 @@ class QuantCliTests(unittest.TestCase):
         }
         captured = {}
 
-        def fake_batch(payload):
+        def fake_batch(payload, **kwargs):
             captured.update(payload)
+            captured["_batch_kwargs"] = kwargs
             return {
                 "selected": ["selected"],
                 "results": ["stored"],
                 "input_errors": {},
                 "errors": {"000660": "isolated failure"},
+                "reused_count": 0,
+                "reused_tickers": [],
+                "run_id": "run-test",
+                "run_status": "partial",
                 "execution_mode": "research_only",
             }
 
@@ -566,6 +571,7 @@ class QuantCliTests(unittest.TestCase):
             patch.object(cli, "_optional_input_json", return_value={"llm": llm, "strategy_id": "quant-e2e"}),
             patch.object(cli, "cmd_quant_rank", return_value=quant),
             patch.object(cli, "_run_batch_payload", side_effect=fake_batch) as batch,
+            patch.object(cli, "_emit_progress"),
         ):
             result = cli.cmd_quant_research(self.args(limit=1))
 
@@ -576,13 +582,208 @@ class QuantCliTests(unittest.TestCase):
         self.assertEqual(captured["rows"], quant["ranking"]["rows"])
         self.assertEqual(captured["strategy_id"], "quant-e2e")
         self.assertEqual(captured["llm"], llm)
+        self.assertEqual(captured["_batch_kwargs"]["run_type"], "quant-research")
+        self.assertTrue(captured["_batch_kwargs"]["stream_progress"])
+        self.assertIsNone(captured["_batch_kwargs"]["resume_of_run_id"])
+        self.assertIn("request_fingerprint", captured["_batch_kwargs"]["run_request_extra"])
+        self.assertIn("quant_summary", captured["_batch_kwargs"]["run_request_extra"])
         self.assertEqual(result["ranking_payload_hash"], "d" * 64)
+        self.assertEqual(result["run_id"], "run-test")
+        self.assertEqual(result["run_status"], "partial")
         self.assertEqual(result["ranking"], quant["ranking"])
         self.assertEqual(result["errors"], {"000660": "isolated failure"})
         self.assertEqual(result["completed_count"], 1)
         self.assertEqual(result["failed_count"], 1)
         self.assertEqual(result["failed_tickers"], ["000660"])
         self.assertEqual(result["execution_mode"], "research_only")
+
+
+    def test_research_run_ledger_is_secret_free_and_finalizes_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = DecisionStore(Path(tmp) / "research.db")
+            started = store.start_research_run(
+                run_type="quant-research",
+                strategy_id="resume-test",
+                analysis_date=TODAY,
+                request={
+                    "ranking_payload_hash": "a" * 64,
+                    "llm": {"provider": "openai", "model_id": "gpt-test"},
+                },
+                ranking={"analysis_date": TODAY.isoformat(), "rows": [{"ticker": "005930"}]},
+                selected_tickers=["005930"],
+                started_at=NOW,
+            )
+            self.assertEqual(started["status"], "running")
+            self.assertEqual(started["selected_tickers"], ["005930"])
+            self.assertEqual(started["ranking"]["analysis_date"], TODAY.isoformat())
+            self.assertNotIn("api_key", str(started))
+            with self.assertRaisesRegex(ValueError, "must not contain credentials"):
+                store.start_research_run(
+                    run_type="quant-research",
+                    strategy_id="secret-test",
+                    analysis_date=TODAY,
+                    request={"llm": {"provider": "openai", "api_key": "must-not-persist"}},
+                    started_at=NOW,
+                )
+            with self.assertRaisesRegex(ValueError, "must not contain credentials"):
+                store.start_research_run(
+                    run_type="quant-research",
+                    strategy_id="secret-ranking-test",
+                    analysis_date=TODAY,
+                    request={"safe": True},
+                    ranking={"api_key": "must-not-persist", "rows": []},
+                    started_at=NOW,
+                )
+            finished = store.finish_research_run(
+                started["run_id"],
+                status="partial",
+                ranking={"ranking_payload_hash": "a" * 64},
+                selected_tickers=["005930", "000660"],
+                decision_ids=["decision-1"],
+                decision_refs=[{"ticker": "005930", "decision_id": "decision-1"}],
+                reused_tickers=["005930"],
+                errors={"000660": "provider failed"},
+                completed_at=NOW + timedelta(minutes=2),
+            )
+            self.assertEqual(finished["status"], "partial")
+            self.assertEqual(finished["reused_tickers"], ["005930"])
+            loaded = store.get_research_run(started["run_id"])
+            self.assertEqual(loaded["decision_ids"], ["decision-1"])
+            self.assertEqual(store.list_research_runs(1)[0]["run_id"], started["run_id"])
+            with self.assertRaisesRegex(ValueError, "already finalized"):
+                store.finish_research_run(started["run_id"], status="completed")
+
+    def test_batch_progress_marks_reused_decision_without_constructing_engine(self):
+        payload = {
+            "analysis_date": TODAY.isoformat(),
+            "ranking_source": "reuse-progress-v1",
+            "ranking_generated_at": NOW.isoformat(),
+            "ranking_mode": "observed",
+            "ranking_data_as_of": TODAY.isoformat(),
+            "limit": 1,
+            "rows": [{"ticker": "005930", "name": "Samsung", "market": "KOSPI", "score": 91}],
+            "strategy_id": "progress-reuse",
+            "llm": {"provider": "openai", "model_id": "gpt-test", "api_key": "secret"},
+        }
+        with patch.object(cli, "_korea_now", return_value=NOW):
+            source, generated, payload_hash, mode, data_as_of = cli._ranking_provenance(payload, TODAY)
+        candidate = replace(
+            cli.select_top_candidates_isolated(payload["rows"], TODAY, 1)[0][0],
+            ranking_source=source, ranking_generated_at=generated, ranking_payload_hash=payload_hash,
+            analysis_cutoff_at=generated, analysis_cutoff_mode="external",
+            ranking_mode=mode, ranking_data_as_of=data_as_of,
+        )
+        existing = ResearchResult(
+            candidate=candidate, signal="Hold", market_report="m", fundamentals_report="f",
+            news_macro_report="n", bull_case="b+", bear_case="b-", research_manager="r",
+            trader="t", risk_manager="risk", portfolio_manager="SIGNAL: HOLD",
+            llm_provider="openai", llm_model_id="gpt-test", workflow_version="personal-kr-v1",
+            decision_id="decision-existing", strategy_id="progress-reuse",
+        )
+
+        class Store:
+            def get_decision_by_key(self, **_kwargs):
+                return existing
+            def record_decision(self, *_args, **_kwargs):
+                raise AssertionError("resume must reuse the saved decision")
+
+        events = []
+        with (
+            patch.object(cli, "_store", return_value=Store()),
+            patch.object(cli, "_korea_today", return_value=TODAY),
+            patch.object(cli, "_korea_now", return_value=NOW),
+            patch.object(cli, "_engine", side_effect=AssertionError("engine must not be constructed")),
+            patch.object(cli, "_emit_progress", side_effect=lambda event, **fields: events.append((event, fields))),
+        ):
+            result = cli._run_batch_payload(payload, run_type="quant-research", stream_progress=True)
+
+        self.assertEqual(result["reused_count"], 1)
+        self.assertEqual(result["reused_tickers"], ["005930"])
+        statuses = [fields.get("status") for event, fields in events if event == "candidate_progress"]
+        self.assertIn("checking", statuses)
+        self.assertIn("reused", statuses)
+        self.assertEqual(events[-1][0], "batch_completed")
+
+
+    def test_quant_research_resume_uses_interrupted_frozen_ranking_without_requant(self):
+        args = self.args(limit=1, prefilter_limit=2)
+        llm = {"provider": "openai", "model_id": "gpt-test", "api_key": "secret"}
+        context = cli._quant_research_request_context(
+            args,
+            analysis_date=TODAY,
+            strategy_id="quant-e2e",
+            llm_identity=("openai", "gpt-test"),
+        )
+        fingerprint = cli._quant_research_request_fingerprint(context)
+        ranking = {
+            "analysis_date": TODAY.isoformat(),
+            "ranking_source": "resume-frozen-v1",
+            "ranking_generated_at": NOW.isoformat(),
+            "ranking_mode": "observed",
+            "ranking_data_as_of": TODAY.isoformat(),
+            "limit": 1,
+            "rows": [{"ticker": "005930", "name": "????", "market": "KOSPI", "score": 92.0, "rank": 1}],
+        }
+        interrupted = {
+            "run_id": "interrupted-run",
+            "run_type": "quant-research",
+            "strategy_id": "quant-e2e",
+            "analysis_date": TODAY.isoformat(),
+            "status": "running",
+            "request": {
+                "request_fingerprint": fingerprint,
+                "quant_summary": {
+                    "scoring_profile": "balanced",
+                    "prefilter_count": 2,
+                    "feature_record_count": 2,
+                    "dart_enrichment_count": 0,
+                    "cache_hit": False,
+                    "cache_key": "f" * 64,
+                    "quant_warnings": {"market": {}, "flow": {}, "fundamentals": {}},
+                },
+            },
+            "ranking": ranking,
+            "selected_tickers": ["005930"],
+        }
+
+        class ResumeStore:
+            def list_research_runs(self, _limit):
+                return [interrupted]
+
+        captured = {}
+        def fake_batch(payload, **kwargs):
+            captured["payload"] = dict(payload)
+            captured["kwargs"] = kwargs
+            return {
+                "selected": [], "results": [], "input_errors": {}, "errors": {},
+                "reused_count": 0, "reused_tickers": [],
+                "run_id": "new-run", "run_status": "completed",
+                "resumed_from_run_id": "interrupted-run",
+                "execution_mode": "research_only",
+            }
+
+        events = []
+        with (
+            patch.object(cli, "_optional_input_json", return_value={
+                "llm": llm, "strategy_id": "quant-e2e", "resume": True
+            }),
+            patch.object(cli, "_store", return_value=ResumeStore()),
+            patch.object(cli, "_korea_today", return_value=TODAY),
+            patch.object(cli, "_korea_now", return_value=NOW),
+            patch.object(cli, "cmd_quant_rank", side_effect=AssertionError("resume must not rerun Quant")) as quant_rank,
+            patch.object(cli, "_run_batch_payload", side_effect=fake_batch),
+            patch.object(cli, "_emit_progress", side_effect=lambda event, **fields: events.append((event, fields))),
+        ):
+            result = cli.cmd_quant_research(args)
+
+        quant_rank.assert_not_called()
+        self.assertEqual(captured["kwargs"]["resume_of_run_id"], "interrupted-run")
+        self.assertEqual(captured["payload"]["ranking_source"], "resume-frozen-v1")
+        self.assertEqual(captured["payload"]["llm"], llm)
+        self.assertEqual(result["resumed_from_run_id"], "interrupted-run")
+        self.assertEqual(result["ranking"], ranking)
+        self.assertNotIn("api_key", str(result["ranking"]))
+        self.assertEqual(events[0][0], "resume_found")
 
 
 if __name__ == "__main__":

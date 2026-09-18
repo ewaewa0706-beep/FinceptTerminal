@@ -117,6 +117,22 @@ class DecisionStore:
                     expires_at TEXT NOT NULL
                 )"""
                 )
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS kr_research_runs(
+                    run_id TEXT PRIMARY KEY,
+                    run_type TEXT NOT NULL,
+                    strategy_id TEXT NOT NULL,
+                    analysis_date TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT
+                )"""
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_kr_research_runs_started_at "
+                    "ON kr_research_runs(started_at DESC)"
+                )
                 columns = {row[1] for row in conn.execute("PRAGMA table_info(kr_paper_trades)")}
                 if "client_trade_id" not in columns:
                     conn.execute("ALTER TABLE kr_paper_trades ADD COLUMN client_trade_id TEXT")
@@ -268,6 +284,157 @@ class DecisionStore:
             "created_at": created_at,
             "expires_at": expires_at,
         }
+
+    def start_research_run(
+        self,
+        *,
+        run_type: str,
+        strategy_id: str,
+        analysis_date: date,
+        request: dict[str, Any],
+        ranking: dict[str, Any] | None = None,
+        selected_tickers: list[str] | tuple[str, ...] = (),
+        started_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Create one append-only research execution identity.
+
+        Decisions remain first-write-wins; runs are intentionally different:
+        every user-triggered orchestration receives a fresh run id so retries,
+        cache hits and immutable-decision reuse remain auditable.
+        """
+
+        normalized_type = str(run_type).strip()
+        normalized_strategy = str(strategy_id).strip()
+        if not normalized_type or not normalized_strategy:
+            raise ValueError("research run type and strategy_id are required")
+        _assert_research_run_request_safe(request)
+        if ranking is not None:
+            _assert_research_run_request_safe(ranking)
+        started = started_at or datetime.now(timezone.utc)
+        if started.tzinfo is None or started.utcoffset() is None:
+            raise ValueError("research run started_at must be timezone-aware")
+        run_id = str(uuid.uuid4())
+        payload: dict[str, Any] = {
+            "run_id": run_id,
+            "run_type": normalized_type,
+            "strategy_id": normalized_strategy,
+            "analysis_date": analysis_date.isoformat(),
+            "status": "running",
+            "request": to_jsonable(request),
+            "ranking": to_jsonable(ranking) if ranking is not None else None,
+            "selected_tickers": [validate_ticker(item) for item in selected_tickers],
+            "decision_ids": [],
+            "decision_refs": [],
+            "reused_tickers": [],
+            "errors": {},
+            "input_errors": {},
+            "started_at": started.astimezone(timezone.utc).isoformat(),
+            "completed_at": None,
+        }
+        serialized = _canonical_json(payload)
+        with closing(self._connect()) as conn:
+            with conn:
+                conn.execute(
+                    """INSERT INTO kr_research_runs(
+                    run_id,run_type,strategy_id,analysis_date,status,payload,started_at,completed_at
+                    ) VALUES(?,?,?,?,?,?,?,NULL)""",
+                    (
+                        run_id,
+                        normalized_type,
+                        normalized_strategy,
+                        analysis_date.isoformat(),
+                        "running",
+                        serialized,
+                        payload["started_at"],
+                    ),
+                )
+        return payload
+
+    def finish_research_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        ranking: dict[str, Any] | None = None,
+        selected_tickers: list[str] | tuple[str, ...] = (),
+        decision_ids: list[str] | tuple[str, ...] = (),
+        decision_refs: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
+        reused_tickers: list[str] | tuple[str, ...] = (),
+        errors: dict[str, str] | None = None,
+        input_errors: dict[str, str] | None = None,
+        completed_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Finalize a run exactly once while preserving its original request."""
+
+        normalized_status = str(status).strip().lower()
+        if normalized_status not in {"completed", "partial", "failed"}:
+            raise ValueError("research run status must be completed, partial, or failed")
+        completed = completed_at or datetime.now(timezone.utc)
+        if completed.tzinfo is None or completed.utcoffset() is None:
+            raise ValueError("research run completed_at must be timezone-aware")
+        with closing(self._connect()) as conn:
+            with conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT payload,status FROM kr_research_runs WHERE run_id=?", (str(run_id),)
+                ).fetchone()
+                if row is None:
+                    raise ValueError("research run not found")
+                if str(row["status"]) != "running":
+                    raise ValueError("research run is already finalized")
+                try:
+                    payload = json.loads(str(row["payload"]))
+                except json.JSONDecodeError as exc:
+                    raise ValueError("invalid stored research run payload") from exc
+                if not isinstance(payload, dict):
+                    raise ValueError("invalid stored research run payload")
+                payload.update(
+                    {
+                        "status": normalized_status,
+                        "ranking": to_jsonable(ranking) if ranking is not None else None,
+                        "selected_tickers": [validate_ticker(item) for item in selected_tickers],
+                        "decision_ids": [str(item) for item in decision_ids if str(item).strip()],
+                        "decision_refs": [to_jsonable(dict(item)) for item in decision_refs],
+                        "reused_tickers": [validate_ticker(item) for item in reused_tickers],
+                        "errors": dict(errors or {}),
+                        "input_errors": dict(input_errors or {}),
+                        "completed_at": completed.astimezone(timezone.utc).isoformat(),
+                    }
+                )
+                serialized = _canonical_json(payload)
+                conn.execute(
+                    """UPDATE kr_research_runs
+                    SET status=?,payload=?,completed_at=? WHERE run_id=?""",
+                    (normalized_status, serialized, payload["completed_at"], str(run_id)),
+                )
+        return payload
+
+    def get_research_run(self, run_id: str) -> dict[str, Any] | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT payload FROM kr_research_runs WHERE run_id=?", (str(run_id),)
+            ).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(str(row["payload"]))
+        if not isinstance(payload, dict):
+            raise ValueError("invalid stored research run payload")
+        return payload
+
+    def list_research_runs(self, limit: int = 100) -> list[dict[str, Any]]:
+        bounded = min(max(int(limit), 1), 500)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT payload FROM kr_research_runs ORDER BY started_at DESC LIMIT ?",
+                (bounded,),
+            ).fetchall()
+        output: list[dict[str, Any]] = []
+        for row in rows:
+            payload = json.loads(str(row["payload"]))
+            if not isinstance(payload, dict):
+                raise ValueError("invalid stored research run payload")
+            output.append(payload)
+        return output
 
     def delete_quant_rank_cache(self, cache_key: str) -> None:
         """Delete one mutable Quant Ranking cache entry."""
@@ -1074,6 +1241,28 @@ def _is_sha256(value: str | None) -> bool:
 
 def _canonical_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _assert_research_run_request_safe(value: object) -> None:
+    """Reject secret-bearing metadata before it can enter the research-run ledger."""
+
+    secret_keys = {
+        "api_key", "apikey", "app_secret", "appsecret", "client_secret",
+        "access_token", "refresh_token", "authorization", "password", "secret", "token",
+    }
+
+    def visit(item: object) -> None:
+        if isinstance(item, dict):
+            for key, child in item.items():
+                normalized = str(key).strip().lower()
+                if normalized in secret_keys:
+                    raise ValueError("research run request must not contain credentials")
+                visit(child)
+        elif isinstance(item, (list, tuple)):
+            for child in item:
+                visit(child)
+
+    visit(value)
 
 
 def _normalize_snapshot_markets(markets: tuple[str, ...] | list[str]) -> tuple[str, ...]:

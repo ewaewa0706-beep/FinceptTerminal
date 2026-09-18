@@ -282,6 +282,7 @@ std::vector<ToolDef> get_personal_kr_research_tools() {
                 .string("market", "Market scope")
                 .default_str("ALL")
                 .enums({"ALL", "KOSPI", "KOSDAQ"})
+                .boolean("resume", "Resume the latest interrupted matching run using its exact frozen ranking")
                 .build();
         t.default_timeout_ms = kBatchResearchTimeoutMs;
         t.supports_async = true;
@@ -311,7 +312,9 @@ std::vector<ToolDef> get_personal_kr_research_tools() {
             if (!analysis_date.isEmpty())
                 script_args << "--analysis-date" << analysis_date;
             run_kr_tool(script_args,
-                        QJsonObject{{"llm", llm}, {"strategy_id", "personal-kr-quant-research-mcp"}},
+                        QJsonObject{{"llm", llm},
+                                    {"strategy_id", "personal-kr-quant-research-mcp"},
+                                    {"resume", args.value("resume").toBool(false)}},
                         ctx, promise);
         };
         tools.push_back(std::move(t));

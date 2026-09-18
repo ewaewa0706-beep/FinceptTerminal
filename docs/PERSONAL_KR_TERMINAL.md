@@ -189,6 +189,21 @@ order. Re-running the same strategy/ticker/date with the same candidate ranking
 provenance, explicit LLM provider/model and workflow version reuses the existing
 immutable Decision instead of repeating KIS/DART/Naver/LLM calls. Any provenance
 or LLM mismatch fails as a decision conflict before expensive provider/LLM work.
+Each one-click execution also receives a fresh `run_id` in the SQLite
+`kr_research_runs` ledger. The run record stores only non-secret orchestration
+metadata, the frozen ranking reference, selected tickers, resulting decision ids,
+reused tickers and isolated errors. If the outer process is interrupted, decisions
+already checkpointed remain immutable. The desktop sends `resume=true`; when the
+latest interrupted run has the same strategy/date/market/limits/scoring profiles,
+DART mode and LLM provider/model fingerprint, its exact frozen ranking envelope is
+reused even if the short Quant cache has already expired. A new audit run is then
+created with `resumed_from_run_id`, completed decisions are reused, and only the
+unfinished names consume provider/LLM work. MCP exposes the same behavior through
+an explicit `resume` boolean, while ordinary CLI/MCP calls default to a fresh run
+to avoid treating a concurrently running process as interrupted. The desktop consumes dedicated
+`FINCEPT_KR_PROGRESS` stderr events and shows Quant preparation plus each Top-N
+`n/N` checking/analyzing/reused/checkpointed/error state while the final stdout
+remains the single authoritative JSON result.
 
 External Quant Ranking → Top N selection uses JSON over stdin:
 

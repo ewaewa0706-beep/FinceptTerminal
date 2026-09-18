@@ -177,6 +177,8 @@ class CppWiringTests(unittest.TestCase):
         self.assertIn("personal_kr_active_llm_config()", section)
         self.assertIn('QJsonObject{{"llm", llm}', section)
         self.assertIn('"personal-kr-quant-research-mcp"', section)
+        self.assertIn('.boolean("resume"', section)
+        self.assertIn('args.value("resume").toBool(false)', section)
         self.assertIn("completed", section)
         self.assertIn("No paper or live order", section)
 
@@ -193,6 +195,12 @@ class CppWiringTests(unittest.TestCase):
         self.assertIn("60 * 60 * 1000", section)
         self.assertIn("checkpointed individually", section)
         self.assertIn("research_only", section)
+        self.assertIn("FINCEPT_KR_PROGRESS", section)
+        self.assertIn("candidate_progress", section)
+        self.assertIn("bool is_stderr", section)
+        self.assertIn("Top-N progress %1/%2", section)
+        self.assertIn('{"resume", true}', section)
+        self.assertIn("resume_found", section)
 
     def test_production_batch_is_bounded_to_ten_deep_research_names(self):
         tools = (QT_ROOT / "src/mcp/tools/PersonalKrResearchTools.cpp").read_text(encoding="utf-8")

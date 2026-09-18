@@ -42,6 +42,12 @@ from .universe import (
 
 _KST = timezone(timedelta(hours=9))
 _KRX_RECONSTRUCTION_RANKING_PREFIX = "fincept-krx-openapi-historical-cross-sectional-v2"
+_PROGRESS_PREFIX = "FINCEPT_KR_PROGRESS "
+
+
+def _emit_progress(event: str, **fields: Any) -> None:
+    payload = {"event": str(event), **{str(key): to_jsonable(value) for key, value in fields.items()}}
+    print(_PROGRESS_PREFIX + json.dumps(payload, ensure_ascii=False, separators=(",", ":")), file=sys.stderr, flush=True)
 
 
 def _input_json() -> dict[str, Any]:
@@ -930,10 +936,17 @@ def cmd_batch() -> Any:
     a fresh KIS token for every name.
     """
 
-    return _run_batch_payload(_input_json())
+    return _run_batch_payload(_input_json(), run_type="batch")
 
 
-def _run_batch_payload(payload: dict[str, Any]) -> dict[str, Any]:
+def _run_batch_payload(
+    payload: dict[str, Any],
+    *,
+    run_type: str = "batch",
+    stream_progress: bool = False,
+    run_request_extra: dict[str, Any] | None = None,
+    resume_of_run_id: str | None = None,
+) -> dict[str, Any]:
     """Run the immutable ranking -> bounded deep-research batch contract."""
 
     analysis_date = date.fromisoformat(payload["analysis_date"])
@@ -986,14 +999,82 @@ def _run_batch_payload(payload: dict[str, Any]) -> dict[str, Any]:
     stored = []
     errors: dict[str, str] = {}
     reused_tickers: list[str] = []
+    run_id: str | None = None
+    safe_ranking = {
+        key: payload[key]
+        for key in (
+            "analysis_date", "ranking_source", "ranking_generated_at", "ranking_mode",
+            "ranking_data_as_of", "limit", "rows",
+        )
+        if key in payload
+    }
+    start_run = getattr(store, "start_research_run", None)
+    if callable(start_run):
+        run_request = {
+            "ranking_source": ranking_source,
+            "ranking_payload_hash": ranking_hash,
+            "ranking_generated_at": ranking_generated_at,
+            "ranking_mode": ranking_mode,
+            "ranking_data_as_of": ranking_data_as_of,
+            "limit": limit,
+            "llm": ({"provider": requested_llm[0], "model_id": requested_llm[1]} if requested_llm else None),
+        }
+        if run_request_extra:
+            run_request.update(dict(run_request_extra))
+        run_record = start_run(
+            run_type=run_type,
+            strategy_id=strategy_id,
+            analysis_date=analysis_date,
+            request=run_request,
+            ranking=safe_ranking,
+            selected_tickers=[candidate.instrument.ticker for candidate in candidates],
+            started_at=_korea_now(),
+        )
+        run_id = str(run_record.get("run_id") or "") or None
+        if resume_of_run_id and run_id:
+            get_run = getattr(store, "get_research_run", None)
+            finish_old = getattr(store, "finish_research_run", None)
+            if callable(get_run) and callable(finish_old):
+                previous = get_run(resume_of_run_id)
+                if previous is not None and previous.get("status") == "running":
+                    try:
+                        finish_old(
+                            resume_of_run_id,
+                            status="partial",
+                            ranking=previous.get("ranking"),
+                            selected_tickers=previous.get("selected_tickers") or [],
+                            decision_ids=previous.get("decision_ids") or [],
+                            decision_refs=previous.get("decision_refs") or [],
+                            reused_tickers=previous.get("reused_tickers") or [],
+                            errors={**dict(previous.get("errors") or {}), "__run__": f"resumed by {run_id}"},
+                            input_errors=previous.get("input_errors") or {},
+                            completed_at=_korea_now(),
+                        )
+                    except ValueError:
+                        pass
+    if stream_progress:
+        _emit_progress(
+            "batch_started", run_id=run_id, total=len(candidates), reused=0, failed=0,
+            resume_of_run_id=resume_of_run_id,
+        )
     # Analyze and freeze one candidate at a time. If a later candidate stalls,
     # fails, or the outer subprocess watchdog fires, earlier completed decisions
     # have already been checkpointed in SQLite instead of being lost in memory.
     # When the exact immutable decision key already exists, an explicit matching
     # LLM profile lets us prove that rerunning providers/LLM cannot change the
     # stored outcome. Reuse it instead of paying for duplicate research.
-    for candidate in candidates:
+    total_candidates = len(candidates)
+    for position, candidate in enumerate(candidates, start=1):
         ticker = candidate.instrument.ticker
+        if stream_progress:
+            _emit_progress(
+                "candidate_progress",
+                run_id=run_id,
+                ticker=ticker,
+                position=position,
+                total=total_candidates,
+                status="checking",
+            )
         try:
             decision_lookup = getattr(store, "get_decision_by_key", None)
             existing = (
@@ -1017,14 +1098,61 @@ def _run_batch_payload(payload: dict[str, Any]) -> dict[str, Any]:
                     )
                 stored.append(existing)
                 reused_tickers.append(ticker)
+                if stream_progress:
+                    _emit_progress(
+                        "candidate_progress",
+                        run_id=run_id, ticker=ticker, position=position, total=total_candidates,
+                        status="reused", completed=len(stored), reused=len(reused_tickers), failed=len(errors),
+                    )
                 continue
 
+            if stream_progress:
+                _emit_progress(
+                    "candidate_progress",
+                    run_id=run_id, ticker=ticker, position=position, total=total_candidates, status="analyzing",
+                )
             if engine is None:
                 engine = _engine(llm_config)
             result = engine.analyze(candidate)
             stored.append(store.record_decision(result, strategy_id=strategy_id))
+            if stream_progress:
+                _emit_progress(
+                    "candidate_progress",
+                    run_id=run_id, ticker=ticker, position=position, total=total_candidates,
+                    status="stored", completed=len(stored), reused=len(reused_tickers), failed=len(errors),
+                )
         except Exception as exc:
             errors[ticker] = str(exc)
+            if stream_progress:
+                _emit_progress(
+                    "candidate_progress",
+                    run_id=run_id, ticker=ticker, position=position, total=total_candidates,
+                    status="error", completed=len(stored), reused=len(reused_tickers), failed=len(errors),
+                )
+    run_status = "completed" if not errors and not input_errors else ("partial" if stored else "failed")
+    finish_run = getattr(store, "finish_research_run", None)
+    if run_id and callable(finish_run):
+        finish_run(
+            run_id,
+            status=run_status,
+            ranking=safe_ranking,
+            selected_tickers=[candidate.instrument.ticker for candidate in candidates],
+            decision_ids=[item.decision_id or "" for item in stored],
+            decision_refs=[
+                {"ticker": item.candidate.instrument.ticker, "decision_id": item.decision_id or ""}
+                for item in stored
+            ],
+            reused_tickers=reused_tickers,
+            errors=errors,
+            input_errors=input_errors,
+            completed_at=_korea_now(),
+        )
+    if stream_progress:
+        _emit_progress(
+            "batch_completed",
+            run_id=run_id, total=total_candidates, completed=len(stored),
+            reused=len(reused_tickers), failed=len(errors) + len(input_errors), status=run_status,
+        )
     return {
         "selected": candidates,
         "results": stored,
@@ -1032,6 +1160,9 @@ def _run_batch_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "errors": errors,
         "reused_count": len(reused_tickers),
         "reused_tickers": reused_tickers,
+        "run_id": run_id,
+        "run_status": run_status,
+        "resumed_from_run_id": resume_of_run_id,
         "execution_mode": "research_only",
     }
 
@@ -1048,14 +1179,75 @@ def _explicit_llm_identity(config: Any) -> tuple[str, str] | None:
     return provider, model
 
 
-def cmd_quant_research(args: argparse.Namespace) -> dict[str, Any]:
-    """Current Quant Ranking -> Top-N deep research -> frozen decisions.
+def _quant_research_request_context(
+    args: argparse.Namespace,
+    *,
+    analysis_date: date,
+    strategy_id: str,
+    llm_identity: tuple[str, str] | None,
+) -> dict[str, Any]:
+    requested_markets = {str(item).upper().strip() for item in (args.market or [])}
+    markets = [
+        market for market in ("KOSPI", "KOSDAQ")
+        if not requested_markets or market in requested_markets
+    ]
+    return {
+        "analysis_date": analysis_date.isoformat(),
+        "strategy_id": strategy_id,
+        "markets": markets,
+        "limit": int(args.limit),
+        "prefilter_limit": int(args.prefilter_limit),
+        "lookback_days": int(args.lookback_days),
+        "min_trading_value_krw": int(args.min_trading_value_krw),
+        "profile": str(args.profile or "balanced"),
+        "discovery_profile": str(args.discovery_profile or "balanced"),
+        "dart_enabled": bool(os.getenv("DART_API_KEY")),
+        "llm": (
+            {"provider": llm_identity[0], "model_id": llm_identity[1]}
+            if llm_identity is not None else None
+        ),
+    }
 
-    The ranking is generated and consumed in one Python process. The existing
-    batch implementation remains the sole deep-research/decision boundary, so
-    ranking hashes, cutoff semantics, candidate isolation and first-write-wins
-    persistence cannot diverge between manual two-step and one-click workflows.
-    """
+
+def _quant_research_request_fingerprint(context: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _find_resumable_quant_run(
+    store: Any,
+    *,
+    strategy_id: str,
+    analysis_date: date,
+    request_fingerprint: str,
+) -> dict[str, Any] | None:
+    list_runs = getattr(store, "list_research_runs", None)
+    if not callable(list_runs):
+        return None
+    for run in list_runs(100):
+        if (
+            str(run.get("status") or "") != "running"
+            or str(run.get("run_type") or "") != "quant-research"
+            or str(run.get("strategy_id") or "") != strategy_id
+            or str(run.get("analysis_date") or "") != analysis_date.isoformat()
+        ):
+            continue
+        request = run.get("request")
+        ranking = run.get("ranking")
+        if (
+            isinstance(request, dict)
+            and request.get("request_fingerprint") == request_fingerprint
+            and isinstance(ranking, dict)
+            and isinstance(ranking.get("rows"), list)
+            and ranking.get("rows")
+        ):
+            return run
+    return None
+
+
+def cmd_quant_research(args: argparse.Namespace) -> dict[str, Any]:
+    """Current Quant Ranking -> Top-N deep research -> frozen decisions."""
 
     request = _optional_input_json()
     llm_config = request.get("llm")
@@ -1063,37 +1255,127 @@ def cmd_quant_research(args: argparse.Namespace) -> dict[str, Any]:
     if not strategy_id.strip():
         raise ValueError("strategy_id cannot be blank")
 
-    quant = cmd_quant_rank(args)
-    ranking_payload = dict(quant["ranking"])
+    analysis_date = date.fromisoformat(args.analysis_date or _korea_today().isoformat())
+    llm_identity = _explicit_llm_identity(llm_config)
+    request_context = _quant_research_request_context(
+        args, analysis_date=analysis_date, strategy_id=strategy_id, llm_identity=llm_identity
+    )
+    request_fingerprint = _quant_research_request_fingerprint(request_context)
+    resume_requested = bool(request.get("resume", False)) and not bool(getattr(args, "refresh", False))
+    resume_run: dict[str, Any] | None = None
+    if resume_requested:
+        resume_run = _find_resumable_quant_run(
+            _store(),
+            strategy_id=strategy_id,
+            analysis_date=analysis_date,
+            request_fingerprint=request_fingerprint,
+        )
+
+    resumed_from_run_id: str | None = None
+    if resume_run is not None:
+        resumed_from_run_id = str(resume_run.get("run_id") or "") or None
+        _emit_progress("resume_found", run_id=resumed_from_run_id)
+        ranking_payload = dict(resume_run["ranking"])
+        (
+            ranking_source,
+            ranking_generated_at,
+            ranking_payload_hash,
+            ranking_mode,
+            ranking_data_as_of,
+        ) = _ranking_provenance(ranking_payload, analysis_date)
+        quant_summary = dict((resume_run.get("request") or {}).get("quant_summary") or {})
+        quant_view: dict[str, Any] = {
+            "analysis_date": analysis_date,
+            "ranking_source": ranking_source,
+            "ranking_generated_at": ranking_generated_at,
+            "ranking_payload_hash": ranking_payload_hash,
+            "ranking_mode": ranking_mode,
+            "ranking_data_as_of": ranking_data_as_of,
+            "scoring_profile": quant_summary.get("scoring_profile", request_context["profile"]),
+            "prefilter_count": int(quant_summary.get("prefilter_count", 0)),
+            "feature_record_count": int(quant_summary.get("feature_record_count", 0)),
+            "dart_enrichment_count": int(quant_summary.get("dart_enrichment_count", 0)),
+            "cache_hit": bool(quant_summary.get("cache_hit", False)),
+            "cache_key": quant_summary.get("cache_key"),
+            "ranking": dict(ranking_payload),
+            "market_errors": dict((quant_summary.get("quant_warnings") or {}).get("market") or {}),
+            "flow_errors": dict((quant_summary.get("quant_warnings") or {}).get("flow") or {}),
+            "fundamental_errors": dict((quant_summary.get("quant_warnings") or {}).get("fundamentals") or {}),
+        }
+        _emit_progress(
+            "quant_ready",
+            prefilter_count=quant_view["prefilter_count"],
+            candidate_count=len(ranking_payload.get("rows") or []),
+            cache_hit=quant_view["cache_hit"],
+            resumed=True,
+        )
+    else:
+        _emit_progress("quant_started", analysis_date=analysis_date.isoformat())
+        quant_view = cmd_quant_rank(args)
+        _emit_progress(
+            "quant_ready",
+            prefilter_count=quant_view.get("prefilter_count", 0),
+            candidate_count=len(quant_view.get("candidates") or []),
+            cache_hit=bool(quant_view.get("cache_hit", False)),
+            resumed=False,
+        )
+        ranking_payload = dict(quant_view["ranking"])
+        quant_summary = {
+            "scoring_profile": quant_view.get("scoring_profile"),
+            "prefilter_count": quant_view.get("prefilter_count", 0),
+            "feature_record_count": quant_view.get("feature_record_count", 0),
+            "dart_enrichment_count": quant_view.get("dart_enrichment_count", 0),
+            "cache_hit": bool(quant_view.get("cache_hit", False)),
+            "cache_key": quant_view.get("cache_key"),
+            "quant_warnings": {
+                "market": quant_view.get("market_errors") or {},
+                "flow": quant_view.get("flow_errors") or {},
+                "fundamentals": quant_view.get("fundamental_errors") or {},
+            },
+        }
+
     ranking_payload["strategy_id"] = strategy_id
     if llm_config is not None:
         ranking_payload["llm"] = llm_config
-    batch = _run_batch_payload(ranking_payload)
+    batch = _run_batch_payload(
+        ranking_payload,
+        run_type="quant-research",
+        stream_progress=True,
+        run_request_extra={
+            "request_fingerprint": request_fingerprint,
+            "request_context": request_context,
+            "quant_summary": quant_summary,
+        },
+        resume_of_run_id=resumed_from_run_id,
+    )
     return {
-        "analysis_date": quant["analysis_date"],
+        "analysis_date": quant_view["analysis_date"],
         "strategy_id": strategy_id,
-        "ranking_source": quant["ranking_source"],
-        "ranking_generated_at": quant["ranking_generated_at"],
-        "ranking_payload_hash": quant["ranking_payload_hash"],
-        "ranking_mode": quant["ranking_mode"],
-        "ranking_data_as_of": quant["ranking_data_as_of"],
-        "scoring_profile": quant["scoring_profile"],
-        "prefilter_count": quant["prefilter_count"],
-        "feature_record_count": quant["feature_record_count"],
-        "dart_enrichment_count": quant["dart_enrichment_count"],
-        "cache_hit": quant["cache_hit"],
-        "cache_key": quant["cache_key"],
-        "ranking": quant["ranking"],
+        "ranking_source": quant_view["ranking_source"],
+        "ranking_generated_at": quant_view["ranking_generated_at"],
+        "ranking_payload_hash": quant_view["ranking_payload_hash"],
+        "ranking_mode": quant_view["ranking_mode"],
+        "ranking_data_as_of": quant_view["ranking_data_as_of"],
+        "scoring_profile": quant_view["scoring_profile"],
+        "prefilter_count": quant_view["prefilter_count"],
+        "feature_record_count": quant_view["feature_record_count"],
+        "dart_enrichment_count": quant_view["dart_enrichment_count"],
+        "cache_hit": quant_view["cache_hit"],
+        "cache_key": quant_view.get("cache_key"),
+        "ranking": quant_view["ranking"],
         "selected": batch["selected"],
         "results": batch["results"],
         "input_errors": batch["input_errors"],
         "errors": batch["errors"],
         "reused_count": batch.get("reused_count", 0),
         "reused_tickers": batch.get("reused_tickers", []),
+        "run_id": batch.get("run_id"),
+        "run_status": batch.get("run_status"),
+        "resumed_from_run_id": batch.get("resumed_from_run_id"),
         "quant_warnings": {
-            "market": quant.get("market_errors") or {},
-            "flow": quant.get("flow_errors") or {},
-            "fundamentals": quant.get("fundamental_errors") or {},
+            "market": quant_view.get("market_errors") or {},
+            "flow": quant_view.get("flow_errors") or {},
+            "fundamentals": quant_view.get("fundamental_errors") or {},
         },
         "completed_count": len(batch["results"]),
         "failed_count": len(batch["errors"]) + len(batch["input_errors"]),
