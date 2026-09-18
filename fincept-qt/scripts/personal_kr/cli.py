@@ -566,7 +566,21 @@ def cmd_paper_trade() -> Any:
         tax=float(payload.get("tax", 0.0)),
     )
     cash, positions = store.paper_summary()
-    return {"trade_id": trade_id, "cash_krw": cash, "positions": positions, "execution_mode": "paper_only"}
+    return {
+        "trade_id": trade_id,
+        "client_trade_id": client_trade_id,
+        "decision_id": decision_id,
+        "trade_date": trade_date.isoformat(),
+        "ticker": str(payload["ticker"]),
+        "side": str(payload["side"]).upper(),
+        "quantity": int(payload["quantity"]),
+        "price": float(payload["price"]),
+        "fee": float(payload.get("fee", 0.0)),
+        "tax": float(payload.get("tax", 0.0)),
+        "cash_krw": cash,
+        "positions": positions,
+        "execution_mode": "paper_only",
+    }
 
 
 def cmd_llm_smoke() -> Any:

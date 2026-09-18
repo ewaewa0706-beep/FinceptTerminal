@@ -34,6 +34,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QMessageBox>
 #include <QPainter>
 #include <QPlainTextEdit>
 #include <QPointer>
@@ -42,6 +43,7 @@
 #include <QScrollArea>
 #include <QSpinBox>
 #include <QTableWidget>
+#include <QUuid>
 #include <QVBoxLayout>
 
 #include <algorithm>
@@ -465,13 +467,63 @@ QFrame* EquityAnalysisTab::build_kr_history_panel_() {
     kr_history_table_->setSelectionMode(QAbstractItemView::SingleSelection);
     kr_history_table_->setMinimumHeight(220);
     connect(kr_history_table_, &QTableWidget::itemSelectionChanged, this, [this]() {
+        kr_history_pending_paper_trade_ = {};
         const bool selected = !selected_kr_decision_id_().isEmpty();
         if (kr_history_evaluate_btn_)
             kr_history_evaluate_btn_->setEnabled(selected && !kr_history_busy_);
         if (kr_history_outcomes_btn_)
             kr_history_outcomes_btn_->setEnabled(selected && !kr_history_busy_);
+        if (kr_history_paper_trade_btn_)
+            kr_history_paper_trade_btn_->setEnabled(selected && !kr_history_busy_);
     });
     vl->addWidget(kr_history_table_);
+
+    auto* paper_controls = new QWidget(nullptr);
+    auto* paper_hl = new QHBoxLayout(paper_controls);
+    paper_hl->setContentsMargins(0, 0, 0, 0);
+    paper_hl->setSpacing(8);
+
+    auto* paper_label = new QLabel(tr("Manual paper trade:"));
+    paper_hl->addWidget(paper_label);
+
+    kr_history_paper_side_ = new QComboBox;
+    kr_history_paper_side_->addItem(QStringLiteral("BUY"), QStringLiteral("BUY"));
+    kr_history_paper_side_->addItem(QStringLiteral("SELL"), QStringLiteral("SELL"));
+    paper_hl->addWidget(kr_history_paper_side_);
+
+    kr_history_paper_quantity_ = new QSpinBox;
+    kr_history_paper_quantity_->setRange(1, 100000000);
+    kr_history_paper_quantity_->setValue(1);
+    kr_history_paper_quantity_->setPrefix(tr("Qty "));
+    paper_hl->addWidget(kr_history_paper_quantity_);
+
+    kr_history_paper_price_ = new QDoubleSpinBox;
+    kr_history_paper_price_->setRange(0.0, 1000000000000.0);
+    kr_history_paper_price_->setDecimals(2);
+    kr_history_paper_price_->setSingleStep(100.0);
+    kr_history_paper_price_->setPrefix(tr("Price ₩"));
+    kr_history_paper_price_->setSpecialValueText(tr("Price required"));
+    paper_hl->addWidget(kr_history_paper_price_);
+
+    kr_history_paper_fee_ = new QDoubleSpinBox;
+    kr_history_paper_fee_->setRange(0.0, 1000000000.0);
+    kr_history_paper_fee_->setDecimals(2);
+    kr_history_paper_fee_->setPrefix(tr("Fee ₩"));
+    paper_hl->addWidget(kr_history_paper_fee_);
+
+    kr_history_paper_tax_ = new QDoubleSpinBox;
+    kr_history_paper_tax_->setRange(0.0, 1000000000.0);
+    kr_history_paper_tax_->setDecimals(2);
+    kr_history_paper_tax_->setPrefix(tr("Tax ₩"));
+    paper_hl->addWidget(kr_history_paper_tax_);
+
+    kr_history_paper_trade_btn_ = new QPushButton(tr("RECORD PAPER TRADE"));
+    kr_history_paper_trade_btn_->setEnabled(false);
+    connect(kr_history_paper_trade_btn_, &QPushButton::clicked, this,
+            &EquityAnalysisTab::on_kr_history_paper_trade_clicked);
+    paper_hl->addWidget(kr_history_paper_trade_btn_);
+    paper_hl->addStretch(1);
+    vl->addWidget(paper_controls);
 
     kr_history_result_ = new QPlainTextEdit;
     kr_history_result_->setReadOnly(true);
@@ -502,6 +554,16 @@ void EquityAnalysisTab::set_kr_history_busy_(bool busy) {
         kr_history_evaluate_btn_->setEnabled(!busy && selected);
     if (kr_history_outcomes_btn_)
         kr_history_outcomes_btn_->setEnabled(!busy && selected);
+    if (kr_history_paper_trade_btn_)
+        kr_history_paper_trade_btn_->setEnabled(!busy && selected);
+    for (QWidget* control : {static_cast<QWidget*>(kr_history_paper_side_),
+                             static_cast<QWidget*>(kr_history_paper_quantity_),
+                             static_cast<QWidget*>(kr_history_paper_price_),
+                             static_cast<QWidget*>(kr_history_paper_fee_),
+                             static_cast<QWidget*>(kr_history_paper_tax_)}) {
+        if (control)
+            control->setEnabled(!busy);
+    }
 }
 
 void EquityAnalysisTab::on_kr_history_refresh_clicked() {
@@ -665,6 +727,122 @@ void EquityAnalysisTab::on_kr_history_paper_summary_clicked() {
                 return;
             }
             self->kr_history_status_->setText(self->tr("Personal-KR paper portfolio · paper_only"));
+            self->kr_history_result_->setPlainText(
+                QString::fromUtf8(QJsonDocument(data).toJson(QJsonDocument::Indented)));
+        });
+}
+
+void EquityAnalysisTab::on_kr_history_paper_trade_clicked() {
+    const QString decision_id = selected_kr_decision_id_();
+    const int row = kr_history_table_ ? kr_history_table_->currentRow() : -1;
+    if (decision_id.isEmpty() || row < 0 || row >= kr_history_decisions_.size() || !kr_history_paper_side_ ||
+        !kr_history_paper_quantity_ || !kr_history_paper_price_ || !kr_history_paper_fee_ ||
+        !kr_history_paper_tax_ || !kr_history_result_ || !kr_history_status_)
+        return;
+
+    const QJsonObject decision = kr_history_decisions_.at(row).toObject();
+    const QString ticker = decision.value("candidate").toObject().value("instrument").toObject().value("ticker").toString();
+    const QString side = kr_history_paper_side_->currentData().toString();
+    const int quantity = kr_history_paper_quantity_->value();
+    const double price = kr_history_paper_price_->value();
+    const double fee = kr_history_paper_fee_->value();
+    const double tax = kr_history_paper_tax_->value();
+    if (ticker.isEmpty() || quantity <= 0 || price <= 0.0) {
+        kr_history_status_->setText(tr("Select a frozen decision and enter a positive paper execution price."));
+        return;
+    }
+
+    const QString trade_date = QDateTime::currentDateTimeUtc().toOffsetFromUtc(9 * 60 * 60).date().toString(Qt::ISODate);
+    QJsonObject base_payload{
+        {"decision_id", decision_id},
+        {"trade_date", trade_date},
+        {"ticker", ticker},
+        {"side", side},
+        {"quantity", quantity},
+        {"price", price},
+        {"fee", fee},
+        {"tax", tax},
+    };
+
+    QJsonObject payload = base_payload;
+    bool retrying = false;
+    if (!kr_history_pending_paper_trade_.isEmpty()) {
+        QJsonObject pending_base = kr_history_pending_paper_trade_;
+        pending_base.remove("client_trade_id");
+        if (pending_base != base_payload) {
+            QMessageBox::warning(
+                this, tr("Pending paper-only request"),
+                tr("A previous paper request did not return a definitive process result. Retry the same values first so "
+                   "the existing idempotency key can prevent an accidental duplicate. PAPER SUMMARY can be used to inspect "
+                   "the ledger before retrying."));
+            return;
+        }
+        payload = kr_history_pending_paper_trade_;
+        retrying = true;
+    } else {
+        payload["client_trade_id"] = QStringLiteral("qt-") + QUuid::createUuid().toString(QUuid::WithoutBraces);
+    }
+
+    const QString confirmation =
+        tr("%1 simulated %2 · %3 share(s) @ ₩%4\nFee ₩%5 · Tax ₩%6\n\n"
+           "This writes only to the isolated Personal-KR paper ledger. No live brokerage order will be sent.%7")
+            .arg(trade_date)
+            .arg(side)
+            .arg(quantity)
+            .arg(QString::number(price, 'f', 2))
+            .arg(QString::number(fee, 'f', 2))
+            .arg(QString::number(tax, 'f', 2))
+            .arg(retrying ? tr("\n\nThis retry will reuse the same idempotency key.") : QString());
+    if (QMessageBox::question(this, tr("Confirm paper-only trade"), confirmation, QMessageBox::Yes | QMessageBox::No,
+                              QMessageBox::No) != QMessageBox::Yes)
+        return;
+
+    if (!retrying)
+        kr_history_pending_paper_trade_ = payload;
+
+    set_kr_history_busy_(true);
+    kr_history_status_->setText(retrying ? tr("Retrying idempotent paper-only request…")
+                                         : tr("Recording paper-only trade…"));
+    python::PythonRunner::RunOptions opts;
+    opts.timeout_ms = 60 * 1000;
+    opts.stdin_data = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+    QPointer<EquityAnalysisTab> self(this);
+    python::PythonRunner::instance().run_with_options(
+        "personal_kr_terminal.py", {"paper-trade"}, opts,
+        [self](python::PythonResult result) {
+            if (!self)
+                return;
+            self->set_kr_history_busy_(false);
+            if (!result.success) {
+                self->kr_history_status_->setText(
+                    self->tr("Paper trade process did not confirm completion; retry the same values to reuse its idempotency key."));
+                self->kr_history_result_->setPlainText(result.error);
+                return;
+            }
+
+            const QJsonDocument doc = QJsonDocument::fromJson(python::extract_json(result.output).toUtf8());
+            if (!doc.isObject()) {
+                self->kr_history_status_->setText(
+                    self->tr("Paper trade returned an ambiguous response; retry the same values before starting a new request."));
+                self->kr_history_result_->setPlainText(result.output);
+                return;
+            }
+            if (!doc.object().value("success").toBool(false)) {
+                self->kr_history_pending_paper_trade_ = {};
+                self->kr_history_status_->setText(self->tr("Paper trade rejected"));
+                self->kr_history_result_->setPlainText(doc.object().value("error").toString());
+                return;
+            }
+            const QJsonObject data = doc.object().value("data").toObject();
+            if (data.value("execution_mode").toString() != QLatin1String("paper_only")) {
+                self->kr_history_status_->setText(
+                    self->tr("Unexpected paper execution mode; retry the same values only after inspecting PAPER SUMMARY."));
+                self->kr_history_result_->setPlainText(result.output);
+                return;
+            }
+            self->kr_history_pending_paper_trade_ = {};
+            self->kr_history_status_->setText(
+                self->tr("Recorded paper-only trade #%1 · no live order").arg(data.value("trade_id").toInt()));
             self->kr_history_result_->setPlainText(
                 QString::fromUtf8(QJsonDocument(data).toJson(QJsonDocument::Indented)));
         });

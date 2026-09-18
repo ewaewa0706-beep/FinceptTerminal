@@ -240,8 +240,19 @@ loads the latest frozen Personal-KR decision rows, **EVALUATE 1/5/20/60D** runs
 the existing point-in-time forward-return and benchmark-alpha evaluator for the
 selected decision, and **SHOW OUTCOMES** reads only already frozen outcome rows.
 **PAPER SUMMARY** is read-only and requires the Python response to declare
-`execution_mode=paper_only`. This history panel never routes to live brokerage
-and does not create paper trades implicitly.
+`execution_mode=paper_only`.
+
+The same history panel now has an explicit **RECORD PAPER TRADE** action for the
+selected frozen decision. The user must manually choose BUY/SELL, quantity,
+execution price, fee and tax, then accept a confirmation dialog that states the
+action is paper-only. The request is sent as JSON on stdin to `paper-trade`; no
+order data is routed to Fincept live-broker order code. A generated
+`client_trade_id` is retained across an ambiguous child-process failure so an
+exact retry reuses the same idempotency key instead of creating a duplicate.
+Structured rejections clear that pending key, while successful responses must
+declare `execution_mode=paper_only`. Paper execution is never inferred from an
+AI signal and is never triggered by discovery, research, outcome evaluation or
+paper-summary refresh.
 
 Internal MCP/agent tools:
 

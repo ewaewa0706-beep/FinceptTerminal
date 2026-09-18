@@ -50,6 +50,7 @@ class EquityAnalysisTab : public QWidget {
     void on_kr_history_evaluate_clicked();
     void on_kr_history_outcomes_clicked();
     void on_kr_history_paper_summary_clicked();
+    void on_kr_history_paper_trade_clicked();
     void on_kr_research_clicked();
 
   protected:
@@ -153,10 +154,17 @@ class EquityAnalysisTab : public QWidget {
     QPushButton* kr_history_evaluate_btn_ = nullptr;
     QPushButton* kr_history_outcomes_btn_ = nullptr;
     QPushButton* kr_history_paper_btn_ = nullptr;
+    QPushButton* kr_history_paper_trade_btn_ = nullptr;
+    QComboBox* kr_history_paper_side_ = nullptr;
+    QSpinBox* kr_history_paper_quantity_ = nullptr;
+    QDoubleSpinBox* kr_history_paper_price_ = nullptr;
+    QDoubleSpinBox* kr_history_paper_fee_ = nullptr;
+    QDoubleSpinBox* kr_history_paper_tax_ = nullptr;
     QLabel* kr_history_status_ = nullptr;
     QTableWidget* kr_history_table_ = nullptr;
     QPlainTextEdit* kr_history_result_ = nullptr;
     QJsonArray kr_history_decisions_;
+    QJsonObject kr_history_pending_paper_trade_;
     bool kr_history_busy_ = false;
 
     QFrame* kr_panel_ = nullptr;
