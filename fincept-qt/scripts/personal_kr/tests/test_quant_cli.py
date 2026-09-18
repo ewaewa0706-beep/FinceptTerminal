@@ -137,6 +137,59 @@ class QuantCliTests(unittest.TestCase):
         self.assertEqual(result["ranking_data_as_of"], TODAY)
         self.assertIn("fundamental_data_as_of", result["ranking"]["rows"][0])
 
+    def test_quant_rank_bounds_dart_fanout_to_fifteen_preliminary_candidates(self):
+        class CountingDart:
+            def __init__(self):
+                self.calls = []
+
+            def fundamentals(self, instrument, as_of):
+                self.calls.append(instrument.ticker)
+                return FundamentalSnapshot(
+                    as_of=as_of - timedelta(days=30),
+                    source="DART",
+                    revenue=1_000,
+                    operating_profit=100,
+                    net_income=80,
+                    assets=2_000,
+                    liabilities=800,
+                    equity=1_200,
+                )
+
+        many_candidates = [
+            QuantCandidate(
+                Instrument(f"{index:06d}", f"Stock {index}", "KOSPI"),
+                TODAY,
+                100 - index,
+                index,
+            )
+            for index in range(1, 31)
+        ]
+        discovery = {
+            "candidates": many_candidates,
+            "ranking_source": "fincept-kis-public-master-cross-sectional-v2/balanced",
+            "ranking_payload_hash": "b" * 64,
+        }
+        dart = CountingDart()
+        with (
+            patch.dict(
+                "os.environ",
+                {"KIS_APP_KEY": "key", "KIS_APP_SECRET": "secret", "DART_API_KEY": "dart"},
+                clear=False,
+            ),
+            patch.object(cli, "_korea_today", return_value=TODAY),
+            patch.object(cli, "_korea_now", return_value=NOW),
+            patch.object(cli, "cmd_discover", return_value=discovery),
+            patch.object(cli.KisClient, "from_env", return_value=FakeKis()),
+            patch.object(cli.DartClient, "from_env", return_value=dart),
+        ):
+            result = cli.cmd_quant_rank(self.args(limit=5, prefilter_limit=30))
+
+        self.assertEqual(result["preliminary_candidate_count"], 15)
+        self.assertEqual(result["dart_candidate_limit"], 15)
+        self.assertEqual(result["dart_enrichment_count"], 15)
+        self.assertEqual(len(dart.calls), 15)
+        self.assertEqual(len(result["candidates"]), 5)
+
     def test_quant_rank_rejects_historical_request_before_provider_calls(self):
         with (
             patch.dict("os.environ", {"KIS_APP_KEY": "key", "KIS_APP_SECRET": "secret", "DART_API_KEY": ""}, clear=False),

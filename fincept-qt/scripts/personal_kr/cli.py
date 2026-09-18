@@ -585,34 +585,63 @@ def cmd_quant_rank(args: argparse.Namespace) -> Any:
         except Exception as exc:
             flow_errors[instrument.ticker] = _safe_quant_error(exc)
 
-        fundamentals_snapshot = None
-        if dart is not None:
-            try:
-                fundamentals_snapshot = dart.fundamentals(instrument, analysis_date)
-            except Exception as exc:
-                fundamental_errors[instrument.ticker] = _safe_quant_error(exc)
-
         records.append(
             QuantFeatureRecord(
                 instrument=instrument,
                 analysis_date=analysis_date,
                 market=market_snapshot,
                 flow=flow_snapshot,
-                fundamentals=fundamentals_snapshot,
             )
         )
 
     if not records:
         raise RuntimeError("quant-rank could not load market features for any prefiltered ticker")
 
-    candidates, feature_rows = score_quant_records(
+    # Stage 1: KIS-only ranking across the bounded discovery prefilter. DART can
+    # require multiple HTTP requests per company, so never fan it out across the
+    # entire prefilter. Keep a wider finalist set than the requested Top-N, then
+    # let fundamentals rerank only that bounded slice.
+    preliminary_limit = min(len(records), max(limit, min(prefilter_limit, 15)))
+    preliminary_candidates, preliminary_rows = score_quant_records(
         records,
         analysis_date,
-        limit=limit,
+        limit=preliminary_limit,
         weights=quant_weights,
     )
-    if not candidates:
+    if not preliminary_candidates:
         raise RuntimeError("quant-rank produced no scored candidates")
+
+    candidates = preliminary_candidates[:limit]
+    feature_rows = preliminary_rows
+    dart_enrichment_count = 0
+    if dart is not None:
+        record_by_ticker = {record.instrument.ticker: record for record in records}
+        enriched_records: list[QuantFeatureRecord] = []
+        for candidate in preliminary_candidates:
+            base = record_by_ticker[candidate.instrument.ticker]
+            fundamentals_snapshot = None
+            try:
+                fundamentals_snapshot = dart.fundamentals(candidate.instrument, analysis_date)
+                dart_enrichment_count += 1
+            except Exception as exc:
+                fundamental_errors[candidate.instrument.ticker] = _safe_quant_error(exc)
+            enriched_records.append(
+                QuantFeatureRecord(
+                    instrument=base.instrument,
+                    analysis_date=base.analysis_date,
+                    market=base.market,
+                    flow=base.flow,
+                    fundamentals=fundamentals_snapshot,
+                )
+            )
+        candidates, feature_rows = score_quant_records(
+            enriched_records,
+            analysis_date,
+            limit=limit,
+            weights=quant_weights,
+        )
+        if not candidates:
+            raise RuntimeError("quant-rank produced no candidates after DART finalist enrichment")
 
     selected_tickers = {candidate.instrument.ticker for candidate in candidates}
     selected_feature_rows = [
@@ -690,6 +719,9 @@ def cmd_quant_rank(args: argparse.Namespace) -> Any:
         "prefilter_limit": prefilter_limit,
         "prefilter_count": len(upstream_candidates),
         "feature_record_count": len(records),
+        "preliminary_candidate_count": len(preliminary_candidates),
+        "dart_candidate_limit": preliminary_limit if dart is not None else 0,
+        "dart_enrichment_count": dart_enrichment_count,
         "market_errors": market_errors,
         "flow_errors": flow_errors,
         "fundamental_errors": fundamental_errors,

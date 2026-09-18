@@ -144,8 +144,10 @@ closed rather than substituting current market membership.
 `quant-rank` is the bounded feature-ranking stage between broad discovery and
 deep research. It takes at most 50 names from the cheap whole-market prefilter,
 then uses KIS daily bars and per-stock investor flow only for that slice. When
-`DART_API_KEY` is configured it also adds PIT-safe financial-statement factors
-(operating margin, net margin and equity ratio). The v1 score cross-sectionally
+`DART_API_KEY` is configured, a KIS-only preliminary rank first narrows the set
+to at most 15 finalists and only those names receive DART filing/statement
+requests. DART then adds PIT-safe financial-statement factors (operating margin,
+net margin and equity ratio) before the final Top-N rerank. The v1 score cross-sectionally
 combines momentum (20/60-session returns), foreign and institution flow relative
 to aligned share volume, DART fundamentals, 20-session trading-value liquidity,
 and inverse 20-session annualized volatility. Profiles are `balanced`, `momentum`,
@@ -153,7 +155,8 @@ and inverse 20-session annualized volatility. Profiles are `balanced`, `momentum
 remaining weights are renormalized. Raw feature metrics are frozen into a
 separate SHA-256 audit hash, while the selected Top-N rows use the normal batch
 ranking hash/provenance contract. This stage never calls an LLM and never places
-an order.
+an order. The 15-name DART cap prevents optional enrichment from turning a
+30-50 name market prefilter into an unbounded disclosure-API fan-out.
 
 Quant Ranking v1 is intentionally current-date only. The KIS per-stock investor
 flow quote used here does not accept an arbitrary historical date, so an old

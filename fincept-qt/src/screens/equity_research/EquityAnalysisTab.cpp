@@ -1193,10 +1193,11 @@ void EquityAnalysisTab::on_kr_quant_rank_clicked() {
                 const int flow_errors = data.value("flow_errors").toObject().size();
                 const int fundamental_errors = data.value("fundamental_errors").toObject().size();
                 self->kr_discovery_status_->setText(
-                    self->tr("Completed KIS Quant | %1 | prefilter %2 | scored %3 | Top %4 | %5 market / %6 flow / %7 DART warning(s) | research_only")
+                    self->tr("Completed KIS Quant | %1 | prefilter %2 | scored %3 | DART %4 | Top %5 | %6 market / %7 flow / %8 DART warning(s) | research_only")
                         .arg(data.value("scoring_profile").toString("balanced"))
                         .arg(data.value("prefilter_count").toInt())
                         .arg(data.value("feature_record_count").toInt())
+                        .arg(data.value("dart_enrichment_count").toInt())
                         .arg(candidates.size())
                         .arg(market_errors)
                         .arg(flow_errors)
